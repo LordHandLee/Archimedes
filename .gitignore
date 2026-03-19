@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data files
+*.csv
+*.parquet
+*.duckdb
+*.sqlite
+
+# Data directories
+data/
+
+# Outputs / artifacts
+heatmaps/
+*.png
+dashboard.html
+
+# Logs
+*.log
+
+# Environment
+.env
+venv/
+
+# OS
+.DS_Store
+
+# Misc
+*.pdf
