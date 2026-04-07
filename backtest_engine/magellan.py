@@ -43,7 +43,8 @@ class MagellanClient(QtCore.QObject):
         connected = socket.waitForConnected(timeout_ms)
         if connected:
             socket.disconnectFromServer()
-            socket.waitForDisconnected(50)
+            if socket.state() != QtNetwork.QLocalSocket.LocalSocketState.UnconnectedState:
+                socket.waitForDisconnected(50)
         return connected
 
     def ensure_running(self, timeout_ms: int = 5000) -> bool:
@@ -110,6 +111,12 @@ class MagellanClient(QtCore.QObject):
         if snapshot_path:
             payload["snapshot_path"] = str(snapshot_path)
         self._send_json(payload, timeout_ms=timeout_ms)
+
+    def open_snapshot(self, snapshot_path: str | Path, timeout_ms: int = 1000) -> None:
+        path_text = str(snapshot_path).strip()
+        if not path_text:
+            raise MagellanError("Snapshot path is required.")
+        self._send_message(path_text.encode("utf-8"), timeout_ms=timeout_ms)
 
     def send_live_update(
         self,
@@ -181,7 +188,8 @@ class MagellanClient(QtCore.QObject):
             raise MagellanError(self._last_error)
 
         socket.disconnectFromServer()
-        socket.waitForDisconnected(50)
+        if socket.state() != QtNetwork.QLocalSocket.LocalSocketState.UnconnectedState:
+            socket.waitForDisconnected(50)
 
     def _wait_for_server(self, timeout_ms: int) -> bool:
         deadline = time.monotonic() + max(timeout_ms, 100) / 1000.0

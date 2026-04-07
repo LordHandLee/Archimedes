@@ -12,6 +12,7 @@ from .metrics import PerformanceMetrics
 @dataclass
 class CachedRun:
     run_id: str
+    logical_run_id: str | None
     batch_id: str | None
     strategy: str
     params: str
@@ -24,6 +25,11 @@ class CachedRun:
     run_started_at: str
     run_finished_at: Optional[str]
     status: str
+    requested_execution_mode: str | None
+    resolved_execution_mode: str | None
+    engine_impl: str | None
+    engine_version: str | None
+    fallback_reason: str | None
 
 
 @dataclass
@@ -40,6 +46,28 @@ class BatchRecord:
     finished_at: Optional[str]
 
 
+@dataclass
+class BatchBenchmarkRecord:
+    batch_id: str
+    seq: int
+    dataset_id: str
+    strategy: str
+    timeframe: str
+    requested_execution_mode: str
+    resolved_execution_mode: str
+    engine_impl: str
+    engine_version: str
+    bars: int
+    total_params: int
+    cached_runs: int
+    uncached_runs: int
+    duration_seconds: float
+    chunk_count: int
+    chunk_sizes: tuple[int, ...]
+    effective_param_batch_size: int | None
+    prepared_context_reused: bool
+
+
 class ResultCatalog:
     """Lightweight SQLite-backed cache for backtest runs."""
 
@@ -54,6 +82,7 @@ class ResultCatalog:
                 """
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
+                    logical_run_id TEXT,
                     batch_id TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     strategy TEXT NOT NULL,
@@ -66,16 +95,27 @@ class ResultCatalog:
                     metrics TEXT NOT NULL,
                     run_started_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     run_finished_at TEXT,
-                    status TEXT DEFAULT 'finished'
+                    status TEXT DEFAULT 'finished',
+                    requested_execution_mode TEXT,
+                    resolved_execution_mode TEXT,
+                    engine_impl TEXT,
+                    engine_version TEXT,
+                    fallback_reason TEXT
                 )
                 """
             )
             # Backfill new columns if upgrading an existing DB.
+            self._ensure_column(conn, "runs", "logical_run_id", "TEXT")
             self._ensure_column(conn, "runs", "batch_id", "TEXT")
             self._ensure_column(conn, "runs", "run_started_at", "TEXT")
             self._ensure_column(conn, "runs", "run_finished_at", "TEXT")
             self._ensure_column(conn, "runs", "status", "TEXT", default="'finished'")
             self._ensure_column(conn, "runs", "starting_cash", "REAL")
+            self._ensure_column(conn, "runs", "requested_execution_mode", "TEXT")
+            self._ensure_column(conn, "runs", "resolved_execution_mode", "TEXT")
+            self._ensure_column(conn, "runs", "engine_impl", "TEXT")
+            self._ensure_column(conn, "runs", "engine_version", "TEXT")
+            self._ensure_column(conn, "runs", "fallback_reason", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS heatmaps (
@@ -126,6 +166,31 @@ class ResultCatalog:
             self._ensure_column(conn, "batches", "run_total", "INTEGER")
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS batch_benchmarks (
+                    batch_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    requested_execution_mode TEXT NOT NULL,
+                    resolved_execution_mode TEXT NOT NULL,
+                    engine_impl TEXT NOT NULL,
+                    engine_version TEXT NOT NULL,
+                    bars INTEGER NOT NULL,
+                    total_params INTEGER NOT NULL,
+                    cached_runs INTEGER NOT NULL,
+                    uncached_runs INTEGER NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    chunk_count INTEGER DEFAULT 0,
+                    chunk_sizes TEXT NOT NULL,
+                    effective_param_batch_size INTEGER,
+                    prepared_context_reused INTEGER DEFAULT 0,
+                    PRIMARY KEY (batch_id, seq)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS scheduled_tasks (
                     task_id TEXT PRIMARY KEY,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -165,14 +230,70 @@ class ResultCatalog:
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
                 """
-                SELECT run_id,batch_id,strategy,params,timeframe,start,end,dataset_id,starting_cash,metrics,run_started_at,run_finished_at,status
+                SELECT
+                    run_id,
+                    logical_run_id,
+                    batch_id,
+                    strategy,
+                    params,
+                    timeframe,
+                    start,
+                    end,
+                    dataset_id,
+                    starting_cash,
+                    metrics,
+                    run_started_at,
+                    run_finished_at,
+                    status,
+                    requested_execution_mode,
+                    resolved_execution_mode,
+                    engine_impl,
+                    engine_version,
+                    fallback_reason
                 FROM runs WHERE run_id=?
                 """,
                 (run_id,),
             ).fetchone()
         if not row:
             return None
-        metrics_json = json.loads(row[9]) if row[9] else {}
+        return self._cached_run_from_row(row)
+
+    def load_runs_for_logical_run_id(self, logical_run_id: str) -> list[CachedRun]:
+        if not logical_run_id:
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    run_id,
+                    logical_run_id,
+                    batch_id,
+                    strategy,
+                    params,
+                    timeframe,
+                    start,
+                    end,
+                    dataset_id,
+                    starting_cash,
+                    metrics,
+                    run_started_at,
+                    run_finished_at,
+                    status,
+                    requested_execution_mode,
+                    resolved_execution_mode,
+                    engine_impl,
+                    engine_version,
+                    fallback_reason
+                FROM runs
+                WHERE logical_run_id=?
+                ORDER BY COALESCE(run_finished_at, run_started_at, created_at) DESC, run_id DESC
+                """,
+                (logical_run_id,),
+            ).fetchall()
+        return [self._cached_run_from_row(row) for row in rows]
+
+    def _cached_run_from_row(self, row) -> CachedRun:
+        metrics_json = json.loads(row[10]) if row[10] else {}
         if metrics_json:
             metrics = PerformanceMetrics(
                 total_return=metrics_json.get("total_return", 0.0),
@@ -185,18 +306,24 @@ class ResultCatalog:
             metrics = PerformanceMetrics(0, 0, 0, 0, 0)
         return CachedRun(
             run_id=row[0],
-            batch_id=row[1],
-            strategy=row[2],
-            params=row[3],
-            timeframe=row[4],
-            start=row[5],
-            end=row[6],
-            dataset_id=row[7],
-            starting_cash=row[8],
+            logical_run_id=row[1],
+            batch_id=row[2],
+            strategy=row[3],
+            params=row[4],
+            timeframe=row[5],
+            start=row[6],
+            end=row[7],
+            dataset_id=row[8],
+            starting_cash=row[9],
             metrics=metrics,
-            run_started_at=row[10],
-            run_finished_at=row[11],
-            status=row[12] or "finished",
+            run_started_at=row[11],
+            run_finished_at=row[12],
+            status=row[13] or "finished",
+            requested_execution_mode=row[14],
+            resolved_execution_mode=row[15],
+            engine_impl=row[16],
+            engine_version=row[17],
+            fallback_reason=row[18],
         )
 
     def fetch_batch(self, batch_id: str) -> Optional[BatchRecord]:
@@ -238,6 +365,12 @@ class ResultCatalog:
         run_started_at: Optional[str] = None,
         run_finished_at: Optional[str] = None,
         status: str = "finished",
+        logical_run_id: str | None = None,
+        requested_execution_mode: str | None = None,
+        resolved_execution_mode: str | None = None,
+        engine_impl: str | None = None,
+        engine_version: str | None = None,
+        fallback_reason: str | None = None,
     ) -> None:
         encoded_params = json.dumps(params, sort_keys=True)
         metrics_json = metrics.to_json() if metrics else "{}"
@@ -246,11 +379,32 @@ class ResultCatalog:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO runs
-                (run_id, batch_id, strategy, params, timeframe, start, end, dataset_id, starting_cash, metrics, run_started_at, run_finished_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (
+                    run_id,
+                    logical_run_id,
+                    batch_id,
+                    strategy,
+                    params,
+                    timeframe,
+                    start,
+                    end,
+                    dataset_id,
+                    starting_cash,
+                    metrics,
+                    run_started_at,
+                    run_finished_at,
+                    status,
+                    requested_execution_mode,
+                    resolved_execution_mode,
+                    engine_impl,
+                    engine_version,
+                    fallback_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
+                    logical_run_id,
                     batch_id,
                     strategy,
                     encoded_params,
@@ -263,6 +417,11 @@ class ResultCatalog:
                     run_started_at,
                     run_finished_at,
                     status,
+                    requested_execution_mode,
+                    resolved_execution_mode,
+                    engine_impl,
+                    engine_version,
+                    fallback_reason,
                 ),
             )
 
@@ -436,6 +595,121 @@ class ResultCatalog:
                 """,
                 (batch_id, strategy, dataset_id, encoded_params, encoded_timeframes, encoded_horizons, run_total, status, started_at, finished_at),
             )
+
+    def save_batch_benchmarks(self, batch_id: str, benchmarks: list | tuple) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM batch_benchmarks WHERE batch_id=?", (batch_id,))
+            rows = []
+            for seq, benchmark in enumerate(benchmarks, start=1):
+                requested_mode = getattr(benchmark, "requested_execution_mode", "")
+                resolved_mode = getattr(benchmark, "resolved_execution_mode", "")
+                rows.append(
+                    (
+                        batch_id,
+                        seq,
+                        str(getattr(benchmark, "dataset_id", "")),
+                        str(getattr(benchmark, "strategy", "")),
+                        str(getattr(benchmark, "timeframe", "")),
+                        getattr(requested_mode, "value", str(requested_mode)),
+                        getattr(resolved_mode, "value", str(resolved_mode)),
+                        str(getattr(benchmark, "engine_impl", "")),
+                        str(getattr(benchmark, "engine_version", "")),
+                        int(getattr(benchmark, "bars", 0)),
+                        int(getattr(benchmark, "total_params", 0)),
+                        int(getattr(benchmark, "cached_runs", 0)),
+                        int(getattr(benchmark, "uncached_runs", 0)),
+                        float(getattr(benchmark, "duration_seconds", 0.0)),
+                        int(getattr(benchmark, "chunk_count", 0)),
+                        json.dumps(list(getattr(benchmark, "chunk_sizes", ()))),
+                        (
+                            int(getattr(benchmark, "effective_param_batch_size"))
+                            if getattr(benchmark, "effective_param_batch_size", None) is not None
+                            else None
+                        ),
+                        1 if bool(getattr(benchmark, "prepared_context_reused", False)) else 0,
+                    )
+                )
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO batch_benchmarks
+                    (
+                        batch_id,
+                        seq,
+                        dataset_id,
+                        strategy,
+                        timeframe,
+                        requested_execution_mode,
+                        resolved_execution_mode,
+                        engine_impl,
+                        engine_version,
+                        bars,
+                        total_params,
+                        cached_runs,
+                        uncached_runs,
+                        duration_seconds,
+                        chunk_count,
+                        chunk_sizes,
+                        effective_param_batch_size,
+                        prepared_context_reused
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+    def load_batch_benchmarks(self, batch_id: str) -> list[BatchBenchmarkRecord]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    batch_id,
+                    seq,
+                    dataset_id,
+                    strategy,
+                    timeframe,
+                    requested_execution_mode,
+                    resolved_execution_mode,
+                    engine_impl,
+                    engine_version,
+                    bars,
+                    total_params,
+                    cached_runs,
+                    uncached_runs,
+                    duration_seconds,
+                    chunk_count,
+                    chunk_sizes,
+                    effective_param_batch_size,
+                    prepared_context_reused
+                FROM batch_benchmarks
+                WHERE batch_id=?
+                ORDER BY seq ASC
+                """,
+                (batch_id,),
+            ).fetchall()
+        return [
+            BatchBenchmarkRecord(
+                batch_id=row[0],
+                seq=row[1],
+                dataset_id=row[2],
+                strategy=row[3],
+                timeframe=row[4],
+                requested_execution_mode=row[5],
+                resolved_execution_mode=row[6],
+                engine_impl=row[7],
+                engine_version=row[8],
+                bars=row[9],
+                total_params=row[10],
+                cached_runs=row[11],
+                uncached_runs=row[12],
+                duration_seconds=row[13],
+                chunk_count=row[14] or 0,
+                chunk_sizes=tuple(json.loads(row[15]) if row[15] else []),
+                effective_param_batch_size=row[16],
+                prepared_context_reused=bool(row[17]),
+            )
+            for row in rows
+        ]
 
     def save_heatmap(self, heatmap_id: str, params: Dict, file_path: str, description: str = "") -> None:
         encoded_params = json.dumps(params, sort_keys=True)

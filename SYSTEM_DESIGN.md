@@ -136,6 +136,8 @@ Constraints:
 - we may borrow the performance philosophy, not the library
 - vectorized results must be validated against the reference event-driven engine
 - strategies that require path-dependent or highly stateful execution may remain on the reference engine
+- near-term vectorized support may include same-timeframe runs on resampled higher-timeframe bars
+- full lower-timeframe `base_execution` parity for vectorized runs is still future work and must be tracked as a separate milestone
 
 The long-term design should let the orchestrator choose the engine mode based on strategy compatibility and requested workflow.
 
@@ -162,6 +164,29 @@ The design should distinguish between:
 
 That separation will make it easier to support both simple and complex portfolio definitions without turning the broker into a monolith.
 
+The design must also distinguish between allocation ownership modes:
+
+- `Strategy-Owned Allocation`
+  The strategy decides its own exposure, target weight, or capital usage across its attached assets. The portfolio layer should mainly provide shared-cash accounting, exposure caps, and execution.
+- `Portfolio-Owned Allocation`
+  The strategy provides signals, ranks, or candidate entries, and the portfolio layer decides ranking, sizing, and rebalance behavior across assets and strategies.
+- `Hybrid Allocation`
+  The strategy proposes exposures or weights, and the portfolio layer applies normalization, caps, or risk constraints without replacing the strategy's intent.
+
+Initial portfolio construction modes should stay explicit and simple:
+
+- ranking modes such as `Top N`, `Score Threshold`, and `Top N Over Threshold`
+- weighting modes such as `Preserve Strategy Weights`, `Equal Weight Selected`, and `Score-Proportional`
+- allocation constraints such as `Min Active Weight`, `Max Asset Weight`, and `Cash Reserve Weight`
+- rebalance modes such as `On Change`, `On Change + Periodic`, `On Change + Drift Threshold`, and `On Change + Periodic + Drift Threshold`
+
+Design rule:
+
+- Portfolio ranking or rebalancing must never silently override a strategy that already owns its own allocation logic.
+- Portfolio weighting overrides must never silently replace strategy-owned sizing unless the user explicitly chooses `Portfolio-Owned Allocation`.
+- If a user wants portfolio-level ranking or rebalancing to replace strategy-owned sizing, that must be an explicit mode choice, not an implicit side effect.
+- This distinction is critical for multi-asset strategies whose alpha logic already includes capital-allocation behavior.
+
 ### Charting and Visualization
 
 Magellan, the custom stock chart visualizer written in C++, is the planned primary charting tool for this project.
@@ -186,7 +211,16 @@ Design rules for artifact mode:
 - chart rendering is read-only
 - chart open must not trigger strategy recomputation
 - chart artifacts must work for both single-asset and future portfolio-aware views
+- initial portfolio-aware chart artifacts may use synthetic equity-derived bars with cash and weight panes until richer native portfolio chart layouts exist
+- Magellan remains the primary chart consumer, but the main UI should also provide a built-in fallback viewer for portfolio runs when Magellan is unavailable
 - Matplotlib may remain as a fallback or validation reader, but it is no longer the strategic endpoint
+
+Design rules for portfolio reporting:
+
+- portfolio runs should expose asset-level attribution, not just a single portfolio equity curve
+- initial reporting should include asset weights, target weights, tracking error, realized PnL, turnover, cash weight, and exposure summaries
+- the main UI should expose a built-in portfolio chart/report view even if Magellan is unavailable
+- richer decomposition can come later, but basic attribution must be available once portfolio backtesting exists
 
 Design rules for market mode:
 
@@ -343,9 +377,14 @@ Design rules:
 1. Define a portfolio.
 2. Attach one or more strategies.
 3. Attach one or more assets to each strategy as allowed by the strategy design.
-4. Define allocation and risk rules.
-5. Run the portfolio through the portfolio-aware engine.
-6. Persist portfolio, strategy, and asset attribution outputs.
+4. Choose the allocation ownership mode for the portfolio or strategy block.
+5. Define allocation, ranking, rebalance, and risk rules that are valid for that ownership mode.
+6. Run the portfolio through the portfolio-aware engine.
+7. Persist portfolio, strategy, and asset attribution outputs.
+
+Portfolio rule:
+
+- If a strategy already contains meaningful asset-allocation logic, the default should be `Strategy-Owned Allocation` or `Hybrid Allocation`, not forced portfolio-level ranking or equal weighting.
 
 ### Research Pipeline
 

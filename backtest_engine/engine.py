@@ -1,7 +1,4 @@
 from __future__ import annotations
-
-import hashlib
-import json
 from dataclasses import dataclass
 from typing import Dict, Optional, Type
 
@@ -10,6 +7,7 @@ import pandas as pd
 from .broker import Broker, Trade
 from .catalog import ResultCatalog
 from .metrics import PerformanceMetrics, compute_metrics, sharpe_diagnostics
+from .run_ids import compute_logical_run_id
 from .strategy import Strategy
 
 
@@ -26,6 +24,7 @@ class BacktestConfig:
     fill_ratio: float = 1.0
     fill_on_close: bool = False
     recalc_on_fill: bool = True
+    max_recalc_passes: int = 4
     allow_short: bool = False
     time_horizon_start: Optional[pd.Timestamp] = None
     time_horizon_end: Optional[pd.Timestamp] = None
@@ -40,6 +39,7 @@ class BacktestConfig:
     sharpe_debug: bool = False
     sharpe_basis: str = "daily"
     risk_free_rate: float = 0.0
+    vectorized_param_batch_size: int | None = None
 
 
 @dataclass
@@ -69,6 +69,7 @@ class BacktestEngine:
         catalog: Optional[ResultCatalog],
         config: BacktestConfig,
         base_data: Optional[pd.DataFrame] = None,
+        execution_metadata: Optional[Dict[str, str | None]] = None,
     ) -> None:
         # Base data (1m/tick) is source of truth; fall back to provided data if base not given.
         self.base_data = base_data.copy() if base_data is not None else data.copy()
@@ -80,13 +81,23 @@ class BacktestEngine:
         self.strategy_cls = strategy_cls
         self.catalog = catalog
         self.config = config
+        self.execution_metadata = {
+            "logical_run_id": None,
+            "requested_execution_mode": "reference",
+            "resolved_execution_mode": "reference",
+            "engine_impl": "reference",
+            "engine_version": "1",
+            "fallback_reason": None,
+            **(execution_metadata or {}),
+        }
         self.signal_data = self._build_signal_data(self.config.timeframe)
         self.data = data.copy()  # kept for compatibility
 
     def run(self, strategy_params: Dict) -> BacktestResult:
         data = self._slice_signal_data()
         run_id = self._compute_run_id(strategy_params, data)
-        run_started_at = pd.Timestamp.utcnow().isoformat()
+        execution_metadata = self._execution_metadata_for_run(run_id)
+        run_started_at = pd.Timestamp.now("UTC").isoformat()
 
         if self.config.use_cache and self.catalog:
             cached = self.catalog.fetch(run_id)
@@ -106,8 +117,14 @@ class BacktestEngine:
                         starting_cash=self.config.starting_cash,
                         metrics=cached.metrics,
                         run_started_at=cached.run_started_at,
-                        run_finished_at=cached.run_finished_at or pd.Timestamp.utcnow().isoformat(),
+                        run_finished_at=cached.run_finished_at or pd.Timestamp.now("UTC").isoformat(),
                         status=cached.status or "finished",
+                        logical_run_id=execution_metadata["logical_run_id"],
+                        requested_execution_mode=execution_metadata["requested_execution_mode"],
+                        resolved_execution_mode=execution_metadata["resolved_execution_mode"],
+                        engine_impl=execution_metadata["engine_impl"],
+                        engine_version=execution_metadata["engine_version"],
+                        fallback_reason=execution_metadata["fallback_reason"],
                     )
                 return BacktestResult(
                     run_id=run_id,
@@ -133,6 +150,12 @@ class BacktestEngine:
                 run_started_at=run_started_at,
                 run_finished_at=None,
                 status="running",
+                logical_run_id=execution_metadata["logical_run_id"],
+                requested_execution_mode=execution_metadata["requested_execution_mode"],
+                resolved_execution_mode=execution_metadata["resolved_execution_mode"],
+                engine_impl=execution_metadata["engine_impl"],
+                engine_version=execution_metadata["engine_version"],
+                fallback_reason=execution_metadata["fallback_reason"],
             )
 
         strategy = self.strategy_cls(**strategy_params)
@@ -157,9 +180,7 @@ class BacktestEngine:
             next_lookup = {timestamps[i]: timestamps[i + 1] for i in range(len(timestamps) - 1)}
             for timestamp, bar in data.iterrows():
                 # fill any orders eligible now at bar open
-                fills = broker.flush_orders(bar=bar, timestamp=timestamp)
-                if self.config.recalc_on_fill and fills:
-                    strategy.on_after_fill(timestamp, bar, broker)
+                self._flush_with_recalc(strategy, broker, timestamp, bar)
 
                 if self.config.intrabar_sim:
                     path = self._intrabar_path(bar)
@@ -174,19 +195,24 @@ class BacktestEngine:
                         if self.config.one_order_per_signal:
                             self._prune_pending_orders(broker, broker.position_qty)
                         # schedule to same timestamp (intrabars handled inside)
-                        fills2 = broker.flush_orders(bar=step_bar, timestamp=ts_step)
-                        if self.config.recalc_on_fill and fills2:
-                            strategy.on_after_fill(ts_step, step_bar, broker)
+                        self._flush_with_recalc(strategy, broker, ts_step, step_bar)
                         broker.record_equity(ts_step, price)
                 else:
                     strategy.on_bar(timestamp, bar, broker)
                     if self.config.one_order_per_signal:
                         self._prune_pending_orders(broker, broker.position_qty)
-                    # push earliest fill to next bar
-                    nxt = next_lookup.get(timestamp)
-                    for o in broker.pending_orders:
-                        if o.earliest_ts is None:
-                            o.earliest_ts = nxt if nxt is not None else timestamp
+                    if self.config.fill_on_close:
+                        for o in broker.pending_orders:
+                            if o.earliest_ts is None:
+                                o.earliest_ts = timestamp
+                        close_fill_bar = self._close_fill_bar(bar)
+                        self._flush_with_recalc(strategy, broker, timestamp, close_fill_bar)
+                    else:
+                        # push earliest fill to next bar
+                        nxt = next_lookup.get(timestamp)
+                        for o in broker.pending_orders:
+                            if o.earliest_ts is None:
+                                o.earliest_ts = nxt if nxt is not None else timestamp
                     broker.record_equity(timestamp, bar["close"])
 
         equity_curve = pd.Series({ts: eq for ts, eq in broker.equity_curve})
@@ -227,7 +253,7 @@ class BacktestEngine:
                 f"rf_per_period={diag['rf_per_period']:.6g}",
             )
 
-        run_finished_at = pd.Timestamp.utcnow().isoformat()
+        run_finished_at = pd.Timestamp.now("UTC").isoformat()
         if self.catalog:
             self.catalog.save(
                 run_id=run_id,
@@ -243,6 +269,12 @@ class BacktestEngine:
                 run_started_at=run_started_at,
                 run_finished_at=run_finished_at,
                 status="finished",
+                logical_run_id=execution_metadata["logical_run_id"],
+                requested_execution_mode=execution_metadata["requested_execution_mode"],
+                resolved_execution_mode=execution_metadata["resolved_execution_mode"],
+                engine_impl=execution_metadata["engine_impl"],
+                engine_version=execution_metadata["engine_version"],
+                fallback_reason=execution_metadata["fallback_reason"],
             )
             self.catalog.save_trades(run_id, broker.trades)
 
@@ -253,6 +285,11 @@ class BacktestEngine:
             metrics=metrics,
             cached=False,
         )
+
+    def _execution_metadata_for_run(self, run_id: str) -> Dict[str, str | None]:
+        metadata = dict(self.execution_metadata)
+        metadata["logical_run_id"] = metadata.get("logical_run_id") or run_id
+        return metadata
 
     def _slice_data(self) -> pd.DataFrame:
         data = self.data.copy()
@@ -315,9 +352,9 @@ class BacktestEngine:
         if not num:
             num = "1"
         if unit in ("min", "m"):
-            return f"{num}T"
+            return f"{num}min"
         if unit in ("h", "hr"):
-            return f"{num}H"
+            return f"{num}h"
         return tf  # fallback to original
 
     @staticmethod
@@ -339,6 +376,21 @@ class BacktestEngine:
         if keep:
             broker.pending_orders.append(keep)
 
+    def _flush_with_recalc(self, strategy: Strategy, broker: Broker, timestamp: pd.Timestamp, bar: pd.Series) -> list[Trade]:
+        fills = broker.flush_orders(bar=bar, timestamp=timestamp)
+        all_fills = list(fills)
+        if not self.config.recalc_on_fill:
+            return all_fills
+        passes = 0
+        while fills:
+            strategy.on_after_fill(timestamp, bar, broker)
+            if passes >= max(int(self.config.max_recalc_passes), 0):
+                break
+            fills = broker.flush_orders(bar=bar, timestamp=timestamp)
+            all_fills.extend(fills)
+            passes += 1
+        return all_fills
+
     def _intrabar_path(self, bar: pd.Series) -> list[float]:
         o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
         if c >= o:
@@ -348,6 +400,15 @@ class BacktestEngine:
     def _step_timestamp(self, base_ts: pd.Timestamp, idx: int, total: int) -> pd.Timestamp:
         # distribute microsecond offsets within the same bar
         return base_ts + pd.Timedelta(microseconds=idx + 1)
+
+    def _close_fill_bar(self, bar: pd.Series) -> pd.Series:
+        close_px = float(bar.get("close", bar.get("open", 0.0)))
+        close_bar = bar.copy()
+        close_bar["open"] = close_px
+        close_bar["high"] = close_px
+        close_bar["low"] = close_px
+        close_bar["close"] = close_px
+        return close_bar
 
     def _run_with_base_execution(self, strategy: Strategy, broker: Broker, signal_data: pd.DataFrame) -> None:
         """
@@ -364,9 +425,7 @@ class BacktestEngine:
 
         for ts, base_bar in base.iterrows():
             # 1) fill eligible orders at base open
-            fills = broker.flush_orders(bar=base_bar, timestamp=ts)
-            if self.config.recalc_on_fill and fills:
-                strategy.on_after_fill(ts, base_bar, broker)
+            self._flush_with_recalc(strategy, broker, ts, base_bar)
 
             # 2) evaluate any signal bars that close at or before this base timestamp
             while next_sig and next_sig[0] < ts:
@@ -388,30 +447,13 @@ class BacktestEngine:
             broker.record_equity(ts, base_bar["close"])
 
     def _compute_run_id(self, strategy_params: Dict, data: pd.DataFrame) -> str:
-        payload = {
-            "dataset_id": self.dataset_id,
-            "strategy": self.strategy_cls.__name__,
-            "params": strategy_params,
-            "timeframe": self.config.timeframe,
-            "start": str(data.index[0]),
-            "end": str(data.index[-1]),
-            "starting_cash": self.config.starting_cash,
-            "fill_on_close": self.config.fill_on_close,
-            "recalc_on_fill": self.config.recalc_on_fill,
-            "allow_short": self.config.allow_short,
-            "borrow_rate": self.config.borrow_rate,
-            "fill_ratio": self.config.fill_ratio,
-            "fee_rate": self.config.fee_rate,
-            "fee_schedule": self.config.fee_schedule,
-            "slippage": self.config.slippage,
-            "slippage_schedule": self.config.slippage_schedule,
-            "risk_free_rate": self.config.risk_free_rate,
-            "sharpe_basis": self.config.sharpe_basis,
-            "sharpe_annualization": self.config.sharpe_annualization,
-            "sharpe_session_seconds_per_day": self.config.sharpe_session_seconds_per_day,
-        }
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        return digest
+        return compute_logical_run_id(
+            dataset_id=self.dataset_id,
+            strategy=self.strategy_cls.__name__,
+            params=strategy_params,
+            config=self.config,
+            data=data,
+        )
 
     def _estimate_session_seconds_per_day(self) -> float | None:
         data = self.base_data if self.base_data is not None else self.signal_data

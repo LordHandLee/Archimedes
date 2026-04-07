@@ -58,6 +58,30 @@ It affects:
 
 The highest immediate value is in optimization and research throughput.
 
+## Lessons from the Local `vectorbt` Reference
+
+The local `vectorbt` checkout at `/home/ethan/vectorbt-master` is useful as an architectural reference, not as a drop-in dependency.
+
+The most valuable lessons for this project are:
+
+- The speed win does not come from eliminating all loops. It comes from moving loops out of Python strategy orchestration and into a small fast simulation core over broadcasted arrays.
+- Inputs, indicators, signals, and parameter grids should be aligned into a common shape before execution.
+- Signal-driven execution is the best first target. Order-book-style flexibility should come later.
+- Indicator preparation and parameter expansion should be treated as a reusable pipeline, not rebuilt ad hoc inside each optimization loop.
+- Repeated parameter studies should reuse data arrays and cached intermediate calculations whenever possible.
+- Independent batched runs are not the same thing as true shared-capital portfolio simulation.
+
+This means the right mental model for our engine is not:
+
+- rewrite everything as NumPy in one shot
+
+It is:
+
+- standardize data and parameter broadcasting
+- standardize vectorizable strategy adapters
+- run a fast execution kernel over that prepared workload
+- normalize results back into the same platform contract
+
 ## The Two Engines
 
 ### 1. Reference Engine
@@ -190,6 +214,8 @@ Recommended meaning:
 This allows:
 
 - engine-to-engine comparisons
+- dashboard comparison views keyed by `logical_run_id`
+- batch-level benchmark views that summarize paired reference/vectorized runs
 - clean caching
 - durable audit trails
 
@@ -303,6 +329,29 @@ This should likely remain reference-only in version 1 because it currently depen
 
 It may become vectorizable later in a restricted form, but it should not define the first implementation boundary.
 
+## First Implementation Target
+
+The first production target should be intentionally narrow.
+
+Use this as the semantic baseline:
+
+- `SMACrossStrategy`
+- single asset
+- long-only
+- bar-close signal generation
+- next-bar-open fills
+- fixed fee rate
+- fixed slippage
+- no intrabar simulation
+- no `on_after_fill`
+- no pending stop/limit orders
+
+If this slice is fast, clean, and parity-tested, it will already unlock meaningful acceleration for grid search and optimization.
+
+If this slice is not solid, broadening scope will only multiply complexity.
+
+The current implementation has expanded beyond this original baseline. Version 1 now also includes limited pending stop/limit support, adapter-driven cancel/replace flows, partial fills, `fill_on_close`, and short borrow accrual for supported strategies.
+
 ## Vectorized Engine Version 1 Scope
 
 Vectorized version 1 should be deliberately narrow.
@@ -315,16 +364,25 @@ Vectorized version 1 should be deliberately narrow.
 - deterministic parameter grids
 - large batches of compatible runs
 - shared market data arrays reused across many parameter combinations
+- same-timeframe execution on the provided bar set, including resampled `5m` / `15m` / `1h` bars when requested explicitly
 
 ### Supported Order / Position Model
 
 Recommended version 1 support:
 
 - market-style entry and exit semantics
-- target state or target exposure model
+- adapter-defined order plans for entry and exit conditions
 - flat to long transitions
-- optional simple flat/long/short transitions if borrowing assumptions remain simple
+- simple flat/long/short transitions when the adapter emits clean short entry and exit rules
+- a small fixed-size pending order book per run, including simultaneous stop and limit entry/exit orders emitted by the adapter
+- adapter-driven cancel/replace of one or more pending orders within that small order book
+- limited adapter-driven `recalc_on_fill` support for same-timeframe runs
+- bounded same-bar fill -> after-fill -> re-execute loops for same-timeframe runs, controlled by a deterministic pass cap
+- parity with reference-style `one_order_per_signal` pruning when that option is enabled
 - fixed fee and slippage modeling
+- partial fills via `fill_ratio`
+- same-bar market fills when `fill_on_close=true`
+- borrow accrual on short positions
 
 ### Recommended Config Support in Version 1
 
@@ -337,17 +395,21 @@ Good candidates:
 - starting cash
 - fee rate
 - slippage
-- allow short only if the target-state model supports it cleanly
+- `fill_ratio`
+- `fill_on_close`
+- `borrow_rate`
+- `max_recalc_passes`
+- `allow_short` only if the adapter emits clean short semantics
 - cache usage
 
 Reference-only for version 1:
 
 - `intrabar_sim`
-- `recalc_on_fill`
-- pending stop/limit order semantics
-- dynamic cancel/reissue order flows
-- partial fills
-- borrow costs with realistic path dependence
+- unrestricted `recalc_on_fill` for adapters that do not provide an after-fill update path
+- full `base_execution` parity where signals are generated on one timeframe and fills are driven from a lower base timeframe
+- large or unbounded pending-order books per run
+- deeply recursive or effectively unbounded cancel/reissue flows that depend on repeated fill-driven state changes within the same bar
+- borrow costs with more complex path dependence than bar-close accrual
 - highly stateful scaling rules
 
 ### Supported Workload Shapes
@@ -356,10 +418,12 @@ Vectorized version 1 should support:
 
 - one asset, many parameter combinations
 - many assets, many parameter combinations, as independent batched runs
+- explicit same-timeframe studies on resampled bars, even when the chosen timeframe is not `1 minutes`
 
 This is important:
 
 - batched independent multi-asset studies are not the same thing as true portfolio backtesting
+- same-timeframe resampled execution is not the same thing as full lower-timeframe `base_execution` parity
 
 Version 1 can absolutely accelerate optimization across many assets, as long as each run remains an independent single-asset calculation.
 
@@ -428,15 +492,62 @@ A compatible vectorized workload should flow like this:
 11. Extract trade events from position-state changes.
 12. Normalize and persist outputs as atomic run results.
 
+## Concrete Module Layout for This Repo
+
+The current design is correct, but the repo still needs a more explicit module split.
+
+Recommended additions:
+
+- `backtest_engine/execution.py`
+  Shared `ExecutionRequest`, `ExecutionResult`, portfolio execution request/result types, mode resolution, and orchestrator entry point.
+- `backtest_engine/reference_engine.py`
+  Thin adapter around the current `BacktestEngine` so the orchestrator can treat the reference engine as one backend among two.
+- `backtest_engine/vectorized_engine.py`
+  Vectorized backend entry point for compatible workloads.
+- `backtest_engine/vectorized_types.py`
+  Batch shapes, prepared arrays, compatibility reports, and normalized vectorized result containers.
+- `backtest_engine/vectorized_batch.py`
+  Parameter-grid expansion, array broadcasting, horizon slicing, and workload preparation.
+- `backtest_engine/vectorized_strategies.py`
+  `VectorizedStrategyAdapter` implementations, starting with `SMACrossStrategy`.
+- `backtest_engine/vectorized_trade_extractor.py`
+  Convert target-position or exposure changes into synthetic trades and equity events.
+
+Recommended updates to existing modules:
+
+- `backtest_engine/strategy.py`
+  Add capability metadata and optional adapter registration hooks.
+- `backtest_engine/grid_search.py`
+  Stop instantiating `BacktestEngine` directly and route through the execution orchestrator.
+- `backtest_engine/catalog.py`
+  Add engine-aware metadata such as `logical_run_id`, `requested_execution_mode`, `resolved_execution_mode`, `engine_impl`, and `engine_version`.
+- `backtest_engine/metrics.py`
+  Continue sharing the same metric calculations where possible so vectorized and reference runs are measured identically.
+
+Recommended test additions:
+
+- `tests/test_vectorized_parity.py`
+- `tests/test_execution_mode_resolution.py`
+- `tests/test_vectorized_grid_search.py`
+
 ## Strategy Output Model for Vectorization
 
-Version 1 vectorized strategies should not place discrete pending orders.
+Version 1 vectorized strategies should prefer a compact execution representation.
 
-Instead, they should emit a simpler representation such as:
+The primary path is still:
 
 - target position state
 - target exposure
 - entry/exit masks that can be translated deterministically
+
+But version 1 now also allows a limited richer form:
+
+- a small fixed-size pending order book per run
+- explicit stop/limit order types and prices emitted by the adapter
+- optional adapter-driven after-fill updates that cancel, replace, or submit multiple pending orders
+- bounded same-bar recursive re-execution after fills, up to a configured pass cap
+
+When `one_order_per_signal=true`, the vectorized engine should still mirror the reference engine's pruning behavior and collapse those pending orders down to the first actionable one.
 
 This is one reason vectorized execution is narrower than the reference engine.
 
@@ -456,8 +567,8 @@ Optional later support:
 Reference-only semantics in version 1:
 
 - intrabar path simulation
-- same-bar recursive fill/recalc behavior
-- pending order books with stop/limit evaluation
+- unbounded or highly recursive same-bar fill/recalc behavior
+- large or highly recursive pending order books with repeated within-bar state updates
 
 ## Trades and Artifact Generation
 
@@ -550,8 +661,9 @@ Portfolio support should be phased carefully.
 
 ### Version 1
 
-- no true shared-capital portfolio vectorization
-- allow only independent batched runs
+- allow independent batched runs for research studies
+- allow a narrow shared-capital portfolio mode with same-timeframe, long-only semantics
+- keep portfolio ownership rules explicit so portfolio logic does not silently replace strategy-owned sizing
 
 ### Later Version
 
@@ -559,8 +671,9 @@ Portfolio support should be phased carefully.
 - support allocation competition
 - support rebalance logic
 - support portfolio-level attribution in vectorized form
+- support ranking and selection modes that are aware of allocation ownership
 
-Until then, true portfolio backtests should remain on the reference engine.
+Until the later phases are complete, complex portfolio backtests should remain on the reference engine.
 
 ## Failure and Fallback Rules
 
@@ -609,7 +722,8 @@ Recommended expectations:
 Start parity with a small stable set such as:
 
 - SMA crossover
-- one more simple indicator or breakout strategy with market-style execution only
+- z-score mean reversion
+- synthetic stop/limit cancel-replace parity cases
 
 Do not start parity validation with the most stateful strategy in the codebase.
 
@@ -624,6 +738,14 @@ Important measures:
 - memory usage under batched execution
 - result parity versus the reference engine
 
+Current implemented performance work:
+
+- memory-aware parameter batching in the vectorized engine so large compatible studies can be executed in chunks instead of building one monolithic order-plan matrix
+- reuse of shared market arrays inside each vectorized batch
+- adapter-level prepared context reuse across chunks so indicator/preparation work does not need to be rebuilt for every chunk
+- batch-level execution benchmarks that record chunk counts, chunk sizes, cache hits, and wall-clock duration for each optimization batch
+- independent-asset study aggregation so the same compatible optimization can be run across multiple datasets and summarized as one research study without implying portfolio semantics
+
 The goal is not just "faster."
 
 The goal is:
@@ -632,41 +754,102 @@ The goal is:
 
 ## Phased Implementation Plan
 
+### Phase 0: Freeze the First Semantic Slice
+
+Before writing the vectorized backend, lock down the first supported semantic target:
+
+- `SMACrossStrategy`
+- long-only
+- single asset
+- next-bar-open fills
+- fixed fee/slippage
+- no intrabar or pending-order behavior
+
+Deliverables:
+
+- written compatibility checklist
+- one or two golden datasets/runs for parity
+- explicit statement of what is reference-only in version 1
+
+This prevents the first implementation from expanding into a hidden rewrite.
+
 ### Phase 1: Execution Abstraction
 
 Build:
 
-- shared execution request/result contract
-- orchestrator
-- execution mode selection
-- metadata and catalog support for engine identity
+- `ExecutionRequest` and `ExecutionResult`
+- portfolio execution request/result types under the same orchestration layer
+- orchestrator and mode resolver
+- thin `ReferenceEngine` adapter over the current `BacktestEngine`
+- catalog schema support for engine identity
 
-This phase avoids future rework even before the vectorized kernel is complete.
+Change these code paths first:
+
+- `backtest_engine/grid_search.py`
+- any dashboard or study entry point that currently creates `BacktestEngine` directly
+- `backtest_engine/catalog.py`
+
+Acceptance criteria:
+
+- the existing reference engine still runs through the new orchestrator with no behavior change
+- a run records requested mode, resolved mode, and engine identity
+- higher-level workflows no longer depend directly on `BacktestEngine`
 
 ### Phase 2: Vectorized Engine v1
 
 Build:
 
-- single-asset compatible kernel
-- batched parameter evaluation
-- support for a simple vectorizable strategy such as SMA crossover
-- parity tests against the reference engine
+- vectorized workload preparation for one asset and many parameter combinations
+- shared-array parameter broadcasting
+- `SMACrossStrategy` vectorized adapter
+- first vectorized execution kernel
+- trade extraction from target-position changes
+- support for explicit same-timeframe vectorized execution on resampled `5m` / `15m` / `1h` bars
+
+Implementation notes:
+
+- keep the first kernel simple and deterministic
+- use NumPy first if it keeps the design clean
+- add a compiled kernel path later if profiling shows Python overhead remains dominant
+- keep `Auto` conservative only for unsupported higher-timeframe workloads; when a study cleanly matches supported same-timeframe vectorized semantics, `Auto` may route it to vectorized execution
+
+Acceptance criteria:
+
+- one-asset SMA studies execute in batch without spinning up one `BacktestEngine` per parameter set
+- output includes normalized equity, trades, metrics, and run metadata
+- parity is within agreed tolerance against the reference engine
+- explicit vectorized studies on resampled higher-timeframe bars run successfully with same-timeframe semantics
 
 ### Phase 3: Optimization Integration
 
 Build:
 
-- optimization studies that run through the shared execution contract
-- study-level mode selection
-- vectorized execution for compatible studies
+- grid search routed through the orchestrator
+- study-level execution mode selection
+- reuse of loaded market arrays across parameter combinations
+- reuse of prepared adapter context across chunked vectorized batches
+- explicit batch benchmark capture for both reference and vectorized optimization batches
+- optional batching across independent assets for research studies
+
+Acceptance criteria:
+
+- optimization no longer recreates the whole engine per parameter set for compatible strategies
+- the study can run in `Auto`, `Reference`, or `Vectorized`
+- resolved execution mode is stored per study and per atomic run
+- large compatible parameter grids can be chunked safely without changing results
+- batch studies expose enough benchmark metadata to profile chunking behavior and compare research throughput across assets
 
 ### Phase 4: More Strategy Coverage
 
 Add:
 
-- more simple vectorizable strategies
-- richer but still compatible cost and short semantics
-- better artifact support
+- more vectorizable adapters beyond SMA crossover
+- optional simple short support where semantics remain clean
+- improved indicator caching and reuse across studies
+- direct chart snapshot support from vectorized outputs
+- full vectorized `base_execution` parity as a distinct milestone after same-timeframe higher-timeframe support
+
+Do not add stateful strategies just because they are popular. Add them only when the vectorized semantics are still clear and testable.
 
 ### Phase 5: Portfolio-Aware Vectorization
 
@@ -675,6 +858,81 @@ Add later:
 - shared-capital multi-asset logic
 - rebalance and allocation rules
 - portfolio-level vectorized attribution
+
+The first narrow implementation of this phase has now started.
+
+Current implemented portfolio-aware scope:
+
+- shared-cash multi-asset execution in a dedicated vectorized portfolio engine
+- same-timeframe only
+- long-only only
+- adapter-driven signal generation using the existing SMA and z-score vectorized adapters
+- explicit allocation ownership modes: `Strategy-Owned`, `Portfolio-Owned`, and `Hybrid`
+- explicit portfolio weighting modes, currently `Preserve Strategy Weights`, `Equal Weight Selected`, and `Score-Proportional`
+- portfolio construction constraints including minimum active weight, maximum asset weight, and optional cash reserve
+- rebalance on target-allocation change, with bounded periodic, drift-threshold, and combined periodic-plus-drift rebalance options
+- equal-weight or relative-weight allocation using shared portfolio capital
+- basic dashboard study-mode integration for shared-cash portfolio runs
+- simple dashboard allocation controls for equal-weight, relative-weight, and fixed-weight portfolio studies
+- initial portfolio ranking support through explicit `Top N`, `Score Threshold`, and `Top N Over Threshold` selection modes in `Portfolio-Owned` and `Hybrid` modes
+- portfolio-owned weighting overrides that can equal-weight selected assets or weight them proportionally to score
+- portfolio construction constraints that can prune tiny allocations, cap single-name concentration, and intentionally leave part of the portfolio in cash
+- portfolio runs and trades persisted through the existing batch/run catalog flow
+- portfolio execution available through the shared execution/orchestration layer, not just the dashboard worker path
+- initial portfolio chart artifact support through Magellan snapshot export using synthetic equity-derived bars plus portfolio weight/cash panes
+- initial portfolio attribution/reporting support with per-asset weights, tracking error, realized PnL, turnover, cash-weight, and exposure summaries
+- built-in portfolio fallback viewer with equity, exposure, asset-weight, and attribution-table views when Magellan is unavailable
+
+Allocation ownership rules:
+
+- `Strategy-Owned Allocation`
+  The strategy owns exposure sizing across its assets, and the portfolio layer should mostly enforce shared-cash accounting, caps, and execution.
+- `Portfolio-Owned Allocation`
+  The portfolio layer owns ranking, allocation, and rebalance rules, while strategies provide signals or candidates.
+- `Hybrid Allocation`
+  The strategy proposes weights or exposures and the portfolio layer applies caps, normalization, or risk constraints without replacing the core intent.
+
+Design rule:
+
+- Portfolio ranking or rebalancing must not silently override a strategy that already owns its own capital-allocation logic.
+- Portfolio weighting overrides must not silently replace strategy sizing unless the user explicitly selected `Portfolio-Owned Allocation`.
+- Portfolio-owned ranking and rebalance rules should only be enabled through an explicit ownership mode or user override.
+- This matters especially for multi-asset strategies whose alpha depends on their internal sizing logic.
+
+Current non-goals inside portfolio v1:
+
+- full portfolio UI/editor
+- shorting inside portfolio mode
+- pending-order portfolio books
+- advanced cross-asset ranking and selection rules beyond the initial explicit `Top N` and `Score Threshold` modes
+- base-execution parity
+- richer portfolio performance decomposition and custom report layouts beyond the initial attribution summary and fallback viewer
+
+This phase should not be treated as "done" until:
+
+- single-asset parity is trusted
+- optimization integration is stable
+- strategy capability checks are working
+- the portfolio engine is available through the shared execution/orchestration layer and higher-level workflows, not just a narrow dashboard path
+- richer portfolio controls and richer portfolio charting/reporting exist, including a built-in fallback when Magellan is unavailable
+
+### Phase 6: Compiled Kernel and Performance Tuning
+
+Only after the architecture and semantics are stable, optimize the hottest inner loops further.
+
+Candidates:
+
+- compiled execution kernel
+- faster trade extraction
+- reusable indicator caches across studies
+- memory-aware batching for very large parameter grids
+
+Some of this work has already started:
+
+- the current vectorized engine can split large compatible parameter grids into smaller chunks using an adaptive batch-size heuristic or an explicit config override
+- prepared adapter context can now be computed once for a study and reused across chunked vectorized execution
+
+This phase is where we should profile against the local `vectorbt` reference for ideas, but still keep our own contracts and semantics.
 
 ## Non-Goals for Version 1
 
@@ -685,6 +943,26 @@ These should stay out of scope for the first implementation:
 - intrabar simulation in vectorized mode
 - full portfolio-aware shared-cash vectorization
 - silent behavior changes for unsupported strategies
+
+## Remaining Parity Gap
+
+The biggest remaining semantic gap after same-timeframe higher-timeframe support is:
+
+- full `base_execution` parity
+
+Today, the reference engine can generate signals on a higher timeframe while still executing against a lower base timeframe such as `1 minutes`.
+
+That is materially different from:
+
+- running a vectorized study directly on resampled `5m` / `15m` / `1h` bars
+
+Both modes are useful, but they are not identical.
+
+So the plan should be explicit:
+
+- near term: support vectorized same-timeframe runs on higher-timeframe resampled bars
+- later: add true vectorized lower-timeframe `base_execution` parity
+- until then: let `Auto` use vectorized on supported same-timeframe higher-timeframe studies, but keep falling back to reference for unsupported or clearly base-execution-dependent workloads
 
 ## Summary
 

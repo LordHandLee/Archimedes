@@ -17,12 +17,20 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
-import requests
+try:
+    import requests
+except Exception as exc:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
+    _REQUESTS_IMPORT_ERROR = exc
+else:
+    _REQUESTS_IMPORT_ERROR = None
 
 try:
     from tqdm import tqdm
@@ -39,6 +47,10 @@ def _iso_date(dt_obj: dt.datetime) -> str:
 
 
 def _fetch_page(url: str, api_key: str) -> Dict[str, Any]:
+    if requests is None:
+        raise RuntimeError(
+            "Missing Python dependency: requests. Install project requirements before downloading data."
+        ) from _REQUESTS_IMPORT_ERROR
     headers = {"Authorization": f"Bearer {api_key}"}
     attempt = 0
     backoff = 1.0
@@ -118,7 +130,7 @@ def fetch_minutes(
                 "next_url": next_url,
                 "pages": pages,
                 "rows": len(all_rows),
-                "updated_at": dt.datetime.utcnow().isoformat(),
+                "updated_at": dt.datetime.now(dt.UTC).isoformat(),
             }
             state_path.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
         if progress_cb:
@@ -158,7 +170,7 @@ def main() -> None:
     #     raise SystemExit(f"Set {API_KEY_ENV} environment variable.")
     api_key = API_KEY_ENV
 
-    today = dt.datetime.utcnow().date()
+    today = dt.datetime.now(dt.UTC).date()
     default_end = today
     default_start = today - dt.timedelta(days=365 * 2)
 
@@ -187,35 +199,64 @@ def main() -> None:
         except Exception:
             resume_state = None
 
-    if args.progress:
-        print(json.dumps({"type": "start", "ticker": args.ticker.upper(), "start": str(start_dt.date()), "end": str(end_dt.date())}), flush=True)
-    else:
-        print(f"Fetching {args.ticker} from {start_dt.date()} to {end_dt.date()}...")
-    df = fetch_minutes(
-        args.ticker.upper(),
-        start_dt,
-        end_dt,
-        api_key,
-        delay_seconds=args.pace,
-        limit=args.limit,
-        unadjusted=args.unadjusted,
-        progress_cb=emit_progress,
-        resume_state=resume_state,
-        state_path=state_path if args.resume else None,
-    )
-    out_path = args.out
-    if args.out.name == "prices_1m.csv":
-        start_tag = start_dt.strftime("%Y-%m-%d")
-        end_tag = end_dt.strftime("%Y-%m-%d")
-        out_path = Path("data") / f"{args.ticker.upper()}_massive_{start_tag}_{end_tag}_1m.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_path)
-    if args.progress:
-        print(json.dumps({"type": "done", "ticker": args.ticker.upper(), "rows": len(df), "out": str(out_path)}), flush=True)
-    else:
-        print(f"Saved {len(df)} bars to {out_path}")
-    if args.resume and state_path.exists():
-        state_path.unlink()
+    try:
+        if args.progress:
+            print(
+                json.dumps(
+                    {
+                        "type": "start",
+                        "ticker": args.ticker.upper(),
+                        "start": str(start_dt.date()),
+                        "end": str(end_dt.date()),
+                    }
+                ),
+                flush=True,
+            )
+        else:
+            print(f"Fetching {args.ticker} from {start_dt.date()} to {end_dt.date()}...")
+        df = fetch_minutes(
+            args.ticker.upper(),
+            start_dt,
+            end_dt,
+            api_key,
+            delay_seconds=args.pace,
+            limit=args.limit,
+            unadjusted=args.unadjusted,
+            progress_cb=emit_progress,
+            resume_state=resume_state,
+            state_path=state_path if args.resume else None,
+        )
+        out_path = args.out
+        if args.out.name == "prices_1m.csv":
+            start_tag = start_dt.strftime("%Y-%m-%d")
+            end_tag = end_dt.strftime("%Y-%m-%d")
+            out_path = Path("data") / f"{args.ticker.upper()}_massive_{start_tag}_{end_tag}_1m.csv"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_path)
+        if args.progress:
+            print(json.dumps({"type": "done", "ticker": args.ticker.upper(), "rows": len(df), "out": str(out_path)}), flush=True)
+        else:
+            print(f"Saved {len(df)} bars to {out_path}")
+        if args.resume and state_path.exists():
+            state_path.unlink()
+    except Exception as exc:
+        details = traceback.format_exc()
+        if args.progress:
+            print(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "ticker": args.ticker.upper(),
+                        "message": str(exc),
+                        "error_type": type(exc).__name__,
+                        "details": details.splitlines()[-1] if details else str(exc),
+                    }
+                ),
+                flush=True,
+            )
+        else:
+            print(details or str(exc), file=sys.stderr, flush=True)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

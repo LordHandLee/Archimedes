@@ -20,6 +20,7 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = str(_CPU_THREADS)
 os.environ["NUMEXPR_MAX_THREADS"] = str(_CPU_THREADS)
 
 import json
+import time
 import urllib.request
 import signal
 import sqlite3
@@ -38,19 +39,55 @@ from mplfinance.original_flavor import candlestick_ohlc
 from PyQt6 import QtCore, QtGui, QtWidgets, sip
 
 from backtest_engine import (
+    ALLOCATION_OWNERSHIP_HYBRID,
+    ALLOCATION_OWNERSHIP_PORTFOLIO,
+    ALLOCATION_OWNERSHIP_STRATEGY,
+    BatchExecutionBenchmark,
     BacktestConfig,
     BacktestEngine,
     DuckDBStore,
+    EngineBatchComparisonSummary,
+    EngineComparisonSummary,
+    ExecutionMode,
+    ExecutionOrchestrator,
+    ExecutionRequest,
     GridSearch,
     GridSpec,
+    IndependentAssetTarget,
+    PortfolioExecutionAsset,
+    PortfolioExecutionRequest,
+    PortfolioConstructionConfig,
+    PortfolioAssetTarget,
+    RANKING_MODE_NONE,
+    RANKING_MODE_SCORE_THRESHOLD,
+    RANKING_MODE_TOP_N,
+    RANKING_MODE_TOP_N_OVER_SCORE_THRESHOLD,
+    REBALANCE_MODE_ON_CHANGE,
+    REBALANCE_MODE_ON_CHANGE_OR_DRIFT,
+    REBALANCE_MODE_ON_CHANGE_OR_PERIODIC,
+    REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT,
     ResultCatalog,
     SMACrossStrategy,
     InverseTurtleStrategy,
+    ZScoreMeanReversionStrategy,
+    UnsupportedExecutionModeError,
+    WEIGHTING_MODE_EQUAL_SELECTED,
+    WEIGHTING_MODE_PRESERVE,
+    WEIGHTING_MODE_SCORE_PROPORTIONAL,
     build_horizons,
+    build_portfolio_chart_data,
     load_csv_prices,
+    run_independent_asset_grid_search,
+    run_vectorized_portfolio_grid_search,
+    portfolio_report_frame,
+    summarize_portfolio_result,
+    summarize_engine_batch,
+    summarize_engine_runs,
 )
+from backtest_engine.chart_snapshot import ChartSnapshotExporter
 from backtest_engine.magellan import MagellanClient, MagellanError
 from backtest_engine.reporting import plot_param_heatmap
+from backtest_engine.sample_strategies import compute_zscore_mean_reversion_features
 
 
 # --- Palette (mirrors dashboard.html) ---------------------------------------
@@ -73,6 +110,12 @@ NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.tx
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
 EXPECTED_2Y_1M_EQUITY_ROWS = int(2 * 252 * 16 * 60)
 SCHEDULER_SCRIPT = Path("scripts") / "scheduler_service.py"
+DOWNLOAD_LOG_DIR = Path("data") / "download_logs"
+STUDY_MODE_INDEPENDENT = "independent"
+STUDY_MODE_PORTFOLIO = "portfolio"
+PORTFOLIO_ALLOC_EQUAL = "equal"
+PORTFOLIO_ALLOC_RELATIVE = "relative"
+PORTFOLIO_ALLOC_FIXED = "fixed"
 
 
 def load_stylesheet() -> str:
@@ -218,6 +261,7 @@ def load_stylesheet() -> str:
 @dataclass
 class RunRow:
     run_id: str
+    logical_run_id: str | None
     batch_id: str | None
     strategy: str
     params: str
@@ -230,6 +274,11 @@ class RunRow:
     run_started_at: str
     run_finished_at: str | None
     status: str
+    requested_execution_mode: str | None
+    resolved_execution_mode: str | None
+    engine_impl: str | None
+    engine_version: str | None
+    fallback_reason: str | None
 
 
 @dataclass
@@ -262,7 +311,26 @@ class CatalogReader:
             if batch_id:
                 rows = conn.execute(
                     """
-                    SELECT run_id,batch_id,strategy,params,timeframe,start,end,dataset_id,starting_cash,metrics,run_started_at,run_finished_at,status
+                    SELECT
+                        run_id,
+                        logical_run_id,
+                        batch_id,
+                        strategy,
+                        params,
+                        timeframe,
+                        start,
+                        end,
+                        dataset_id,
+                        starting_cash,
+                        metrics,
+                        run_started_at,
+                        run_finished_at,
+                        status,
+                        requested_execution_mode,
+                        resolved_execution_mode,
+                        engine_impl,
+                        engine_version,
+                        fallback_reason
                     FROM runs WHERE batch_id=? ORDER BY created_at DESC
                     """,
                     (batch_id,),
@@ -270,7 +338,26 @@ class CatalogReader:
             else:
                 rows = conn.execute(
                     """
-                    SELECT run_id,batch_id,strategy,params,timeframe,start,end,dataset_id,starting_cash,metrics,run_started_at,run_finished_at,status
+                    SELECT
+                        run_id,
+                        logical_run_id,
+                        batch_id,
+                        strategy,
+                        params,
+                        timeframe,
+                        start,
+                        end,
+                        dataset_id,
+                        starting_cash,
+                        metrics,
+                        run_started_at,
+                        run_finished_at,
+                        status,
+                        requested_execution_mode,
+                        resolved_execution_mode,
+                        engine_impl,
+                        engine_version,
+                        fallback_reason
                     FROM runs ORDER BY created_at DESC
                     """
                 ).fetchall()
@@ -279,18 +366,83 @@ class CatalogReader:
             result.append(
                 RunRow(
                     run_id=r[0],
-                    batch_id=r[1],
-                    strategy=r[2],
-                    params=r[3],
-                    timeframe=r[4],
-                    start=r[5],
-                    end=r[6],
-                    dataset_id=r[7],
-                    starting_cash=r[8],
-                    metrics=json.loads(r[9]) if r[9] else {},
-                    run_started_at=r[10],
-                    run_finished_at=r[11],
-                    status=r[12] or "finished",
+                    logical_run_id=r[1],
+                    batch_id=r[2],
+                    strategy=r[3],
+                    params=r[4],
+                    timeframe=r[5],
+                    start=r[6],
+                    end=r[7],
+                    dataset_id=r[8],
+                    starting_cash=r[9],
+                    metrics=json.loads(r[10]) if r[10] else {},
+                    run_started_at=r[11],
+                    run_finished_at=r[12],
+                    status=r[13] or "finished",
+                    requested_execution_mode=r[14],
+                    resolved_execution_mode=r[15],
+                    engine_impl=r[16],
+                    engine_version=r[17],
+                    fallback_reason=r[18],
+                )
+            )
+        return result
+
+    def load_runs_for_logical_run_id(self, logical_run_id: str) -> List[RunRow]:
+        if not logical_run_id or not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    run_id,
+                    logical_run_id,
+                    batch_id,
+                    strategy,
+                    params,
+                    timeframe,
+                    start,
+                    end,
+                    dataset_id,
+                    starting_cash,
+                    metrics,
+                    run_started_at,
+                    run_finished_at,
+                    status,
+                    requested_execution_mode,
+                    resolved_execution_mode,
+                    engine_impl,
+                    engine_version,
+                    fallback_reason
+                FROM runs
+                WHERE logical_run_id=?
+                ORDER BY COALESCE(run_finished_at, run_started_at, created_at) DESC, run_id DESC
+                """,
+                (logical_run_id,),
+            ).fetchall()
+        result = []
+        for r in rows:
+            result.append(
+                RunRow(
+                    run_id=r[0],
+                    logical_run_id=r[1],
+                    batch_id=r[2],
+                    strategy=r[3],
+                    params=r[4],
+                    timeframe=r[5],
+                    start=r[6],
+                    end=r[7],
+                    dataset_id=r[8],
+                    starting_cash=r[9],
+                    metrics=json.loads(r[10]) if r[10] else {},
+                    run_started_at=r[11],
+                    run_finished_at=r[12],
+                    status=r[13] or "finished",
+                    requested_execution_mode=r[14],
+                    resolved_execution_mode=r[15],
+                    engine_impl=r[16],
+                    engine_version=r[17],
+                    fallback_reason=r[18],
                 )
             )
         return result
@@ -354,6 +506,39 @@ class CatalogReader:
             )
         return batches
 
+    def load_batch_benchmarks(self, batch_id: str) -> tuple[BatchExecutionBenchmark, ...]:
+        if not batch_id:
+            return ()
+        records = ResultCatalog(self.db_path).load_batch_benchmarks(batch_id)
+        benchmarks: list[BatchExecutionBenchmark] = []
+        for record in records:
+            try:
+                requested_mode = ExecutionMode.from_value(record.requested_execution_mode)
+                resolved_mode = ExecutionMode.from_value(record.resolved_execution_mode)
+            except Exception:
+                continue
+            benchmarks.append(
+                BatchExecutionBenchmark(
+                    dataset_id=record.dataset_id,
+                    strategy=record.strategy,
+                    timeframe=record.timeframe,
+                    requested_execution_mode=requested_mode,
+                    resolved_execution_mode=resolved_mode,
+                    engine_impl=record.engine_impl,
+                    engine_version=record.engine_version,
+                    bars=record.bars,
+                    total_params=record.total_params,
+                    cached_runs=record.cached_runs,
+                    uncached_runs=record.uncached_runs,
+                    duration_seconds=record.duration_seconds,
+                    chunk_count=record.chunk_count,
+                    chunk_sizes=record.chunk_sizes,
+                    effective_param_batch_size=record.effective_param_batch_size,
+                    prepared_context_reused=record.prepared_context_reused,
+                )
+            )
+        return tuple(benchmarks)
+
     def load_heatmaps(self) -> pd.DataFrame:
         if not self.db_path.exists():
             return pd.DataFrame(columns=["heatmap_id", "description", "file_path"])
@@ -396,6 +581,83 @@ class CatalogReader:
 
 
 # --- Qt Models --------------------------------------------------------------
+def _parse_catalog_timestamp(value: str | None) -> pd.Timestamp | None:
+    if not value:
+        return None
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+    except Exception:
+        return None
+    if ts is pd.NaT or pd.isna(ts):
+        return None
+    return ts
+
+
+def _format_duration(start: str | None, end: str | None) -> str:
+    start_ts = _parse_catalog_timestamp(start)
+    end_ts = _parse_catalog_timestamp(end)
+    if start_ts is None:
+        return "—"
+    if end_ts is None:
+        return "Running…"
+    seconds = max(0.0, float((end_ts - start_ts).total_seconds()))
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 60.0:
+        return f"{seconds:.2f} s"
+    if seconds < 3600.0:
+        minutes = int(seconds // 60)
+        rem = seconds - (minutes * 60)
+        return f"{minutes}m {rem:.1f}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    rem_seconds = int(seconds % 60)
+    return f"{hours}h {minutes}m {rem_seconds}s"
+
+
+def _format_seconds_precise(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    try:
+        seconds = float(seconds)
+    except Exception:
+        return "—"
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 60.0:
+        return f"{seconds:.3f} s"
+    if seconds < 3600.0:
+        minutes = int(seconds // 60)
+        rem = seconds - (minutes * 60)
+        return f"{minutes}m {rem:.2f}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    rem = seconds % 60
+    return f"{hours}h {minutes}m {rem:.1f}s"
+
+
+def _summarize_batch_benchmarks(benchmarks: Sequence[BatchExecutionBenchmark]) -> str:
+    if not benchmarks:
+        return "No batch benchmark data is available for this batch in the current session."
+    vectorized = [b for b in benchmarks if b.resolved_execution_mode == ExecutionMode.VECTORIZED]
+    reference = [b for b in benchmarks if b.resolved_execution_mode == ExecutionMode.REFERENCE]
+    total_duration = sum(b.duration_seconds for b in benchmarks)
+    total_params = sum(b.total_params for b in benchmarks)
+    total_chunks = sum(b.chunk_count for b in benchmarks)
+    reused = sum(1 for b in benchmarks if b.prepared_context_reused)
+    lines = [
+        f"Batches: {len(benchmarks)}",
+        f"Wall-clock total: {_format_seconds_precise(total_duration)}",
+        f"Parameter evaluations: {total_params}",
+        f"Vectorized batches: {len(vectorized)}",
+        f"Reference batches: {len(reference)}",
+    ]
+    if vectorized:
+        lines.append(f"Vectorized chunks: {total_chunks}")
+        lines.append(f"Prepared-context reuse batches: {reused}")
+    return " | ".join(lines)
+
+
 class RunsTableModel(QtCore.QAbstractTableModel):
     def __init__(self, runs: Sequence[RunRow]) -> None:
         super().__init__()
@@ -404,12 +666,16 @@ class RunsTableModel(QtCore.QAbstractTableModel):
             "Status",
             "Run ID",
             "Strategy",
+            "Requested",
+            "Resolved",
+            "Engine",
             "Params",
             "Timeframe",
             "Data Start",
             "Data End",
             "Run Started",
             "Run Finished",
+            "Duration",
             "Dataset",
             "Total Return",
             "Sharpe",
@@ -440,43 +706,59 @@ class RunsTableModel(QtCore.QAbstractTableModel):
             if col == 2:
                 return run.strategy
             if col == 3:
-                return run.params
+                return (run.requested_execution_mode or "—").title()
             if col == 4:
-                return run.timeframe
+                return (run.resolved_execution_mode or "—").title()
             if col == 5:
-                return run.start
+                return run.engine_impl or "—"
             if col == 6:
-                return run.end
+                return run.params
             if col == 7:
-                return run.run_started_at or ""
+                return run.timeframe
             if col == 8:
-                return run.run_finished_at or ""
+                return run.start
             if col == 9:
-                return run.dataset_id
+                return run.end
             if col == 10:
-                return "—" if not metrics else f"{metrics.get('total_return', 0):.4f}"
+                return run.run_started_at or ""
             if col == 11:
-                return "—" if not metrics else f"{metrics.get('sharpe', 0):.3f}"
+                return run.run_finished_at or ""
             if col == 12:
+                return _format_duration(run.run_started_at, run.run_finished_at)
+            if col == 13:
+                return run.dataset_id
+            if col == 14:
+                return "—" if not metrics else f"{metrics.get('total_return', 0):.4f}"
+            if col == 15:
+                return "—" if not metrics else f"{metrics.get('sharpe', 0):.3f}"
+            if col == 16:
                 if not metrics:
                     return "—"
                 roll = metrics.get("rolling_sharpe")
                 if roll is None or (isinstance(roll, float) and roll != roll):
                     return "—"
                 return f"{roll:.3f}"
-            if col == 13:
+            if col == 17:
                 return "—" if not metrics else f"{metrics.get('max_drawdown', 0):.4f}"
-            if col == 14:
+            if col == 18:
                 start_cash = run.starting_cash if run.starting_cash is not None else 100_000
                 final_equity = start_cash * (1 + metrics.get("total_return", 0)) if metrics else start_cash
                 return f"{final_equity:,.0f}"
-            if col == 15:
+            if col == 19:
                 return ""
-            if col == 16:
+            if col == 20:
                 return ""
         if role == QtCore.Qt.ItemDataRole.ForegroundRole and col == 0:
             color = PALETTE["green"] if run.status == "finished" else PALETTE["red"]
             return QtGui.QColor(color)
+        if role == QtCore.Qt.ItemDataRole.ToolTipRole:
+            fallback = f"\nFallback: {run.fallback_reason}" if run.fallback_reason else ""
+            return (
+                f"Requested: {run.requested_execution_mode or '—'}\n"
+                f"Resolved: {run.resolved_execution_mode or '—'}\n"
+                f"Engine: {run.engine_impl or '—'} v{run.engine_version or '—'}\n"
+                f"Duration: {_format_duration(run.run_started_at, run.run_finished_at)}{fallback}"
+            )
         if role == QtCore.Qt.ItemDataRole.TextAlignmentRole:
             return int(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
         return None
@@ -506,6 +788,7 @@ class BatchTableModel(QtCore.QAbstractTableModel):
             "Horizons",
             "Started",
             "Finished",
+            "Duration",
             "Runs",
             "Best Return",
             "Sharpe",
@@ -545,15 +828,17 @@ class BatchTableModel(QtCore.QAbstractTableModel):
             if col == 8:
                 return batch.run_finished_at or ""
             if col == 9:
+                return _format_duration(batch.run_started_at, batch.run_finished_at)
+            if col == 10:
                 total = batch.run_total or batch.run_count
                 return f"{batch.finished_count}/{total}" if total else "0"
-            if col == 10:
-                return "—" if not metrics else f"{metrics.get('total_return', 0):.4f}"
             if col == 11:
-                return "—" if not metrics else f"{metrics.get('sharpe', 0):.3f}"
+                return "—" if not metrics else f"{metrics.get('total_return', 0):.4f}"
             if col == 12:
-                return "—" if not metrics else f"{metrics.get('max_drawdown', 0):.4f}"
+                return "—" if not metrics else f"{metrics.get('sharpe', 0):.3f}"
             if col == 13:
+                return "—" if not metrics else f"{metrics.get('max_drawdown', 0):.4f}"
+            if col == 14:
                 start_cash = 100_000
                 final_equity = start_cash * (1 + metrics.get("total_return", 0)) if metrics else start_cash
                 return f"{final_equity:,.0f}"
@@ -590,6 +875,8 @@ class GridWorker(QtCore.QThread):
         self,
         csv_path: Path,
         dataset_id: str,
+        dataset_ids: Sequence[str],
+        study_mode: str,
         timeframes: list[str],
         horizons: list[str],
         catalog_path: Path,
@@ -599,11 +886,13 @@ class GridWorker(QtCore.QThread):
         intrabar_sim: bool,
         sharpe_debug: bool,
         risk_free_rate: float,
-        bt_settings: Dict[str, float | bool | dict],
+        bt_settings: Dict[str, float | bool | dict | str],
     ) -> None:
         super().__init__()
         self.csv_path = csv_path
         self.dataset_id = dataset_id
+        self.dataset_ids = [dataset for dataset in dataset_ids if str(dataset).strip()]
+        self.study_mode = str(study_mode or STUDY_MODE_INDEPENDENT)
         self.timeframes = timeframes
         self.horizons = horizons
         self.catalog_path = catalog_path
@@ -617,6 +906,18 @@ class GridWorker(QtCore.QThread):
         self.risk_free_rate = risk_free_rate
         self.bt_settings = bt_settings
 
+    @staticmethod
+    def _dataset_label(dataset_ids: Sequence[str]) -> str:
+        unique = [dataset_id for dataset_id in dataset_ids if dataset_id]
+        if not unique:
+            return "dataset"
+        if len(unique) == 1:
+            return unique[0]
+        preview = ", ".join(unique[:3])
+        if len(unique) <= 3:
+            return preview
+        return f"{len(unique)} datasets ({preview}, ...)"
+
     def run(self) -> None:
         try:
             # Allow worker to tune BLAS threads per run.
@@ -626,11 +927,23 @@ class GridWorker(QtCore.QThread):
             os.environ["NUMEXPR_MAX_THREADS"] = str(self.blas_threads)
 
             duck = DuckDBStore()
-            try:
-                raw = duck.load(self.dataset_id)
-            except Exception as exc:
-                raise RuntimeError(f"Dataset '{self.dataset_id}' not found in DuckDB/parquet store. Add it first.") from exc
-            end_ts = raw.index[-1]
+            dataset_ids = list(dict.fromkeys(self.dataset_ids or [self.dataset_id]))
+            raw_by_dataset: dict[str, pd.DataFrame] = {}
+            for dataset_id in dataset_ids:
+                try:
+                    raw_by_dataset[dataset_id] = duck.load(dataset_id)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Dataset '{dataset_id}' not found in DuckDB/parquet store. Add it first."
+                    ) from exc
+            end_ts = min(raw.index[-1] for raw in raw_by_dataset.values())
+            dataset_label = self._dataset_label(dataset_ids)
+            study_mode = str(self.study_mode or STUDY_MODE_INDEPENDENT)
+            batch_dataset_label = dataset_label
+            batch_strategy_label = self.strategy_factory.__name__
+            if study_mode == STUDY_MODE_PORTFOLIO:
+                batch_dataset_label = f"Portfolio | {dataset_label}"
+                batch_strategy_label = f"{self.strategy_factory.__name__} [Portfolio]"
 
             # Parse horizons (e.g., "7d,30d") -> timedeltas
             deltas = []
@@ -649,6 +962,8 @@ class GridWorker(QtCore.QThread):
             for lst in param_lists:
                 param_combo *= max(1, len(lst))
             run_total = max(1, len(self.timeframes)) * max(1, len(horizons)) * param_combo
+            if study_mode != STUDY_MODE_PORTFOLIO:
+                run_total *= max(1, len(dataset_ids))
             base_config = BacktestConfig(
                 timeframe=self.timeframes[0],
                 starting_cash=float(self.bt_settings.get("starting_cash", 100_000)),
@@ -669,16 +984,6 @@ class GridWorker(QtCore.QThread):
                 risk_free_rate=self.risk_free_rate,
             )
 
-            def loader(tf: str):
-                return duck.resample(self.dataset_id, tf)
-
-            grid = GridSearch(
-                dataset_id=self.dataset_id,
-                data_loader=loader,
-                strategy_cls=self.strategy_factory,
-                base_config=base_config,
-                catalog=catalog,
-            )
             if not self.strategy_params:
                 raise ValueError("No strategy parameters provided.")
             first_key = list(self.strategy_params.keys())[0]
@@ -690,14 +995,55 @@ class GridWorker(QtCore.QThread):
                 metric="total_return",
                 heatmap_rows=second_key,
                 heatmap_cols=first_key,
-                description=f"Grid for {self.dataset_id}",
+                description=f"{'Portfolio study' if study_mode == STUDY_MODE_PORTFOLIO else 'Grid'} for {batch_dataset_label}",
                 batch_id=self.batch_id,
+                execution_mode=str(self.bt_settings.get("execution_mode", ExecutionMode.AUTO.value)),
             )
+            batch_params = dict(self.strategy_params)
+            if study_mode == STUDY_MODE_PORTFOLIO:
+                batch_params["_study_mode"] = STUDY_MODE_PORTFOLIO
+                batch_params["_portfolio_allocation_mode"] = str(
+                    self.bt_settings.get("portfolio_allocation_mode", PORTFOLIO_ALLOC_EQUAL)
+                )
+                batch_params["_portfolio_target_weights"] = dict(
+                    self.bt_settings.get("portfolio_target_weights", {}) or {}
+                )
+                batch_params["_portfolio_ownership_mode"] = str(
+                    self.bt_settings.get("portfolio_ownership_mode", ALLOCATION_OWNERSHIP_STRATEGY)
+                )
+                batch_params["_portfolio_ranking_mode"] = str(
+                    self.bt_settings.get("portfolio_ranking_mode", RANKING_MODE_NONE)
+                )
+                batch_params["_portfolio_rank_count"] = int(self.bt_settings.get("portfolio_rank_count", 1) or 1)
+                batch_params["_portfolio_score_threshold"] = float(
+                    self.bt_settings.get("portfolio_score_threshold", 0.0) or 0.0
+                )
+                batch_params["_portfolio_weighting_mode"] = str(
+                    self.bt_settings.get("portfolio_weighting_mode", WEIGHTING_MODE_PRESERVE)
+                )
+                batch_params["_portfolio_min_active_weight"] = float(
+                    self.bt_settings.get("portfolio_min_active_weight", 0.0) or 0.0
+                )
+                batch_params["_portfolio_max_asset_weight"] = float(
+                    self.bt_settings.get("portfolio_max_asset_weight", 0.0) or 0.0
+                )
+                batch_params["_portfolio_cash_reserve_weight"] = float(
+                    self.bt_settings.get("portfolio_cash_reserve_weight", 0.0) or 0.0
+                )
+                batch_params["_portfolio_rebalance_mode"] = str(
+                    self.bt_settings.get("portfolio_rebalance_mode", REBALANCE_MODE_ON_CHANGE)
+                )
+                batch_params["_portfolio_rebalance_every_n_bars"] = int(
+                    self.bt_settings.get("portfolio_rebalance_every_n_bars", 20) or 20
+                )
+                batch_params["_portfolio_rebalance_drift_threshold"] = float(
+                    self.bt_settings.get("portfolio_rebalance_drift_threshold", 0.05) or 0.05
+                )
             catalog.save_batch(
                 batch_id=self.batch_id,
-                strategy=self.strategy_factory.__name__,
-                dataset_id=self.dataset_id,
-                params=self.strategy_params,
+                strategy=batch_strategy_label,
+                dataset_id=batch_dataset_label,
+                params=batch_params,
                 timeframes=self.timeframes,
                 horizons=[str(h) for h in self.horizons],
                 run_total=run_total,
@@ -705,18 +1051,114 @@ class GridWorker(QtCore.QThread):
                 started_at=started_at,
                 finished_at=None,
             )
-            df = grid.run(
-                spec,
-                make_heatmap=False,  # avoid matplotlib in worker thread to prevent crashes
-                stop_cb=lambda: self._stop_requested,
-                progress_cb=lambda d, t: self.progress_signal.emit(d, t),
-            )
-            message = "Grid stopped." if self._stop_requested else "Grid completed."
+            if study_mode == STUDY_MODE_PORTFOLIO:
+                allocation_mode = str(self.bt_settings.get("portfolio_allocation_mode", PORTFOLIO_ALLOC_EQUAL))
+                target_weights = {
+                    str(dataset_id): float(weight)
+                    for dataset_id, weight in dict(self.bt_settings.get("portfolio_target_weights", {}) or {}).items()
+                }
+                construction_config = PortfolioConstructionConfig(
+                    allocation_ownership=str(
+                        self.bt_settings.get("portfolio_ownership_mode", ALLOCATION_OWNERSHIP_STRATEGY)
+                    ),
+                    ranking_mode=str(self.bt_settings.get("portfolio_ranking_mode", RANKING_MODE_NONE)),
+                    max_ranked_assets=int(self.bt_settings.get("portfolio_rank_count", 1) or 1),
+                    min_rank_score=float(self.bt_settings.get("portfolio_score_threshold", 0.0) or 0.0),
+                    weighting_mode=str(self.bt_settings.get("portfolio_weighting_mode", WEIGHTING_MODE_PRESERVE)),
+                    min_active_weight=(
+                        float(self.bt_settings.get("portfolio_min_active_weight", 0.0) or 0.0) or None
+                    ),
+                    max_asset_weight=(
+                        float(self.bt_settings.get("portfolio_max_asset_weight", 0.0) or 0.0) or None
+                    ),
+                    cash_reserve_weight=float(self.bt_settings.get("portfolio_cash_reserve_weight", 0.0) or 0.0),
+                    rebalance_mode=str(
+                        self.bt_settings.get("portfolio_rebalance_mode", REBALANCE_MODE_ON_CHANGE)
+                    ),
+                    rebalance_every_n_bars=int(
+                        self.bt_settings.get("portfolio_rebalance_every_n_bars", 20) or 20
+                    ),
+                    rebalance_weight_drift_threshold=float(
+                        self.bt_settings.get("portfolio_rebalance_drift_threshold", 0.05) or 0.05
+                    ),
+                )
+                normalize_weights = allocation_mode != PORTFOLIO_ALLOC_FIXED
+                targets = [
+                    PortfolioAssetTarget(
+                        dataset_id=dataset_id,
+                        data_loader=(lambda tf, did=dataset_id: duck.resample(did, tf)),
+                        target_weight=(
+                            None
+                            if allocation_mode == PORTFOLIO_ALLOC_EQUAL
+                            else float(target_weights.get(dataset_id, 0.0))
+                        ),
+                    )
+                    for dataset_id in dataset_ids
+                ]
+                df = run_vectorized_portfolio_grid_search(
+                    targets=targets,
+                    strategy_cls=self.strategy_factory,
+                    base_config=base_config,
+                    grid=spec,
+                    catalog=catalog,
+                    stop_cb=lambda: self._stop_requested,
+                    progress_cb=lambda d, t: self.progress_signal.emit(d, t),
+                    normalize_weights=normalize_weights,
+                    construction_config=construction_config,
+                )
+                batch_benchmarks = tuple(df.attrs.get("batch_benchmarks") or ())
+            elif len(dataset_ids) == 1:
+                def loader(tf: str):
+                    return duck.resample(dataset_ids[0], tf)
+
+                grid = GridSearch(
+                    dataset_id=dataset_ids[0],
+                    data_loader=loader,
+                    strategy_cls=self.strategy_factory,
+                    base_config=base_config,
+                    catalog=catalog,
+                )
+                df = grid.run(
+                    spec,
+                    make_heatmap=False,  # avoid matplotlib in worker thread to prevent crashes
+                    stop_cb=lambda: self._stop_requested,
+                    progress_cb=lambda d, t: self.progress_signal.emit(d, t),
+                )
+                batch_benchmarks = tuple(grid.last_batch_benchmarks)
+            else:
+                targets = [
+                    IndependentAssetTarget(
+                        dataset_id=dataset_id,
+                        data_loader=(lambda tf, did=dataset_id: duck.resample(did, tf)),
+                    )
+                    for dataset_id in dataset_ids
+                ]
+                df = run_independent_asset_grid_search(
+                    targets=targets,
+                    strategy_cls=self.strategy_factory,
+                    base_config=base_config,
+                    grid=spec,
+                    catalog=catalog,
+                    make_heatmap=False,
+                    stop_cb=lambda: self._stop_requested,
+                    progress_cb=lambda d, t: self.progress_signal.emit(d, t),
+                    share_batch_id=True,
+                )
+                batch_benchmarks = tuple(df.attrs.get("batch_benchmarks") or ())
+            catalog.save_batch_benchmarks(self.batch_id, batch_benchmarks)
+            if self._stop_requested:
+                message = "Study stopped." if study_mode == STUDY_MODE_PORTFOLIO else "Grid stopped."
+            elif study_mode == STUDY_MODE_PORTFOLIO:
+                message = f"Portfolio study completed across {len(dataset_ids)} datasets."
+            elif len(dataset_ids) > 1:
+                message = f"Independent study completed across {len(dataset_ids)} datasets."
+            else:
+                message = "Grid completed."
             catalog.save_batch(
                 batch_id=self.batch_id,
-                strategy=self.strategy_factory.__name__,
-                dataset_id=self.dataset_id,
-                params=self.strategy_params,
+                strategy=batch_strategy_label,
+                dataset_id=batch_dataset_label,
+                params=batch_params,
                 timeframes=self.timeframes,
                 horizons=[str(h) for h in self.horizons],
                 run_total=run_total,
@@ -724,7 +1166,17 @@ class GridWorker(QtCore.QThread):
                 started_at=started_at,
                 finished_at=pd.Timestamp.utcnow().isoformat(),
             )
-            self.finished_signal.emit({"df": df, "spec": spec, "message": message})
+            self.finished_signal.emit(
+                {
+                    "df": df,
+                    "spec": spec,
+                    "message": message,
+                    "batch_id": self.batch_id,
+                    "batch_benchmarks": batch_benchmarks,
+                }
+            )
+        except UnsupportedExecutionModeError as exc:
+            self.error_signal.emit(str(exc))
         except Exception as exc:
             tb = traceback.format_exc()
             print("GridWorker error:\n", tb)
@@ -733,6 +1185,64 @@ class GridWorker(QtCore.QThread):
 
     def request_stop(self) -> None:
         self._stop_requested = True
+
+
+class DatasetSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, datasets: Sequence[str], selected: Sequence[str], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose Study Datasets")
+        self.resize(420, 520)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        label = QtWidgets.QLabel(
+            "Select one or more datasets for an independent multi-dataset study.\n"
+            "Each dataset will be backtested separately under the same study."
+        )
+        label.setObjectName("Sub")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
+        selected_set = set(selected)
+        for dataset_id in datasets:
+            item = QtWidgets.QListWidgetItem(dataset_id)
+            self.list_widget.addItem(item)
+            if dataset_id in selected_set:
+                item.setSelected(True)
+        layout.addWidget(self.list_widget)
+
+        actions = QtWidgets.QHBoxLayout()
+        select_all_btn = QtWidgets.QPushButton("Select All")
+        select_all_btn.clicked.connect(self._select_all)
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.clicked.connect(self.list_widget.clearSelection)
+        actions.addWidget(select_all_btn)
+        actions.addWidget(clear_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _select_all(self) -> None:
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item is not None:
+                item.setSelected(True)
+
+    def selected_datasets(self) -> list[str]:
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+    def accept(self) -> None:
+        if not self.selected_datasets():
+            QtWidgets.QMessageBox.information(self, "No datasets selected", "Select at least one dataset.")
+            return
+        super().accept()
 
 
 # --- UI ---------------------------------------------------------------------
@@ -757,8 +1267,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.download_paused = False
         self.download_active_ticker: str | None = None
         self.download_progress_rows: dict[str, dict] = {}
+        self.download_proc_meta: dict[int, dict] = {}
         self.scheduled_tasks: list[dict] = []
         self.magellan = MagellanClient(self)
+        self.snapshot_exporter = ChartSnapshotExporter()
+        self._closing = False
+        self._current_grid_started_at: float | None = None
+        self._batch_benchmark_cache: dict[str, tuple[BatchExecutionBenchmark, ...]] = {}
+        self.study_dataset_ids: list[str] = []
+        self.portfolio_target_weights: dict[str, float] = {}
+        self._magellan_warm_timer = QtCore.QTimer(self)
+        self._magellan_warm_timer.setSingleShot(True)
+        self._magellan_warm_timer.timeout.connect(self._warm_magellan)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -781,7 +1301,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.refresh_timer.timeout.connect(self._refresh_batches_live)
         self.refresh_timer.start()
         self.refresh()
-        QtCore.QTimer.singleShot(0, self._warm_magellan)
+        self._magellan_warm_timer.start(0)
 
     # -- sections ------------------------------------------------------------
     def _build_header(self) -> QtWidgets.QWidget:
@@ -869,8 +1389,40 @@ class DashboardWindow(QtWidgets.QMainWindow):
         main_layout.setSpacing(10)
 
         self.strategy_combo = QtWidgets.QComboBox()
+        self.execution_mode_combo = QtWidgets.QComboBox()
+        self.execution_mode_combo.addItem("Auto (Recommended)", ExecutionMode.AUTO.value)
+        self.execution_mode_combo.addItem("Reference", ExecutionMode.REFERENCE.value)
+        self.execution_mode_combo.addItem("Vectorized", ExecutionMode.VECTORIZED.value)
+        self.execution_mode_combo.setToolTip(
+            "Choose which execution backend to use for new runs.\n"
+            "Auto selects vectorized when supported and falls back to reference.\n"
+            "On supported higher-timeframe studies, Auto may choose same-timeframe resampled vectorized execution.\n"
+            "Higher-timeframe vectorized execution currently uses same-timeframe resampled bars; "
+            "full base-execution parity is still future work."
+        )
+        self.study_mode_combo = QtWidgets.QComboBox()
+        self.study_mode_combo.addItem("Independent Assets", STUDY_MODE_INDEPENDENT)
+        self.study_mode_combo.addItem("Portfolio (Vectorized v1)", STUDY_MODE_PORTFOLIO)
+        self.study_mode_combo.setToolTip(
+            "Independent Assets runs the same backtest separately on each selected dataset.\n"
+            "Portfolio (Vectorized v1) uses shared cash across the selected datasets with the vectorized portfolio backend.\n"
+            "Portfolio mode is currently same-timeframe only, long-only, and requires a vectorized-supported strategy."
+        )
+        self.portfolio_allocation_combo = QtWidgets.QComboBox()
+        self.portfolio_allocation_combo.addItem("Equal Weight", PORTFOLIO_ALLOC_EQUAL)
+        self.portfolio_allocation_combo.addItem("Relative Weights", PORTFOLIO_ALLOC_RELATIVE)
+        self.portfolio_allocation_combo.addItem("Fixed Weights", PORTFOLIO_ALLOC_FIXED)
+        self.portfolio_allocation_combo.setToolTip(
+            "Equal Weight splits capital evenly across active assets.\n"
+            "Relative Weights normalizes your weights across the selected assets.\n"
+            "Fixed Weights uses your weights as absolute targets and then caps gross exposure if needed."
+        )
         main_layout.addWidget(QtWidgets.QLabel("Strategy"))
         main_layout.addWidget(self.strategy_combo)
+        main_layout.addWidget(QtWidgets.QLabel("Execution Mode"))
+        main_layout.addWidget(self.execution_mode_combo)
+        main_layout.addWidget(QtWidgets.QLabel("Study Mode"))
+        main_layout.addWidget(self.study_mode_combo)
 
         main_layout.addWidget(QtWidgets.QLabel("CSV Path"))
         csv_row = QtWidgets.QHBoxLayout()
@@ -889,7 +1441,166 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.dataset_combo.setEditable(True)
         self.dataset_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         self.dataset_combo.setMinimumContentsLength(12)
+        self.dataset_combo.currentTextChanged.connect(lambda _: self._update_study_dataset_summary())
         main_layout.addWidget(self.dataset_combo)
+        main_layout.addWidget(QtWidgets.QLabel("Study Datasets"))
+        dataset_row = QtWidgets.QHBoxLayout()
+        self.study_dataset_summary = QtWidgets.QLineEdit()
+        self.study_dataset_summary.setReadOnly(True)
+        self.study_dataset_summary.setPlaceholderText("Current dataset only")
+        choose_datasets_btn = QtWidgets.QPushButton("Choose Datasets")
+        choose_datasets_btn.clicked.connect(self._choose_study_datasets)
+        current_only_btn = QtWidgets.QPushButton("Current Only")
+        current_only_btn.clicked.connect(self._reset_study_datasets_to_current)
+        dataset_row.addWidget(self.study_dataset_summary, 3)
+        dataset_row.addWidget(choose_datasets_btn, 1)
+        dataset_row.addWidget(current_only_btn, 1)
+        main_layout.addLayout(dataset_row)
+        self.study_mode_note = QtWidgets.QLabel()
+        self.study_mode_note.setObjectName("Sub")
+        self.study_mode_note.setWordWrap(True)
+        main_layout.addWidget(self.study_mode_note)
+        self.study_mode_combo.currentTextChanged.connect(lambda _: self._update_study_mode_note())
+        main_layout.addWidget(QtWidgets.QLabel("Portfolio Allocation"))
+        main_layout.addWidget(self.portfolio_allocation_combo)
+        self.portfolio_weights_edit = QtWidgets.QLineEdit()
+        self.portfolio_weights_edit.setPlaceholderText("Optional. SPY=0.6,QQQ=0.4 or 0.6,0.4 in selected order")
+        self.portfolio_weights_edit.setToolTip(
+            "Used for Relative Weights and Fixed Weights.\n"
+            "Examples:\n"
+            "- SPY=0.6,QQQ=0.4\n"
+            "- 0.6,0.4 (applies in the selected dataset order)\n"
+            "Named weights may omit datasets to set them to zero."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Portfolio Weights"))
+        main_layout.addWidget(self.portfolio_weights_edit)
+        self.portfolio_allocation_summary = QtWidgets.QLabel()
+        self.portfolio_allocation_summary.setObjectName("Sub")
+        self.portfolio_allocation_summary.setWordWrap(True)
+        main_layout.addWidget(self.portfolio_allocation_summary)
+        self.portfolio_allocation_combo.currentTextChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_weights_edit.textChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_ownership_combo = QtWidgets.QComboBox()
+        self.portfolio_ownership_combo.addItem("Strategy-Owned", ALLOCATION_OWNERSHIP_STRATEGY)
+        self.portfolio_ownership_combo.addItem("Portfolio-Owned", ALLOCATION_OWNERSHIP_PORTFOLIO)
+        self.portfolio_ownership_combo.addItem("Hybrid", ALLOCATION_OWNERSHIP_HYBRID)
+        self.portfolio_ownership_combo.setToolTip(
+            "Strategy-Owned keeps strategy sizing in control.\n"
+            "Portfolio-Owned lets the portfolio layer decide allocation from strategy candidates.\n"
+            "Hybrid keeps strategy weights but allows explicit portfolio filters such as ranking."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Allocation Ownership"))
+        main_layout.addWidget(self.portfolio_ownership_combo)
+        self.portfolio_ranking_combo = QtWidgets.QComboBox()
+        self.portfolio_ranking_combo.addItem("No Ranking", RANKING_MODE_NONE)
+        self.portfolio_ranking_combo.addItem("Top N", RANKING_MODE_TOP_N)
+        self.portfolio_ranking_combo.addItem("Score Threshold", RANKING_MODE_SCORE_THRESHOLD)
+        self.portfolio_ranking_combo.addItem("Top N Over Threshold", RANKING_MODE_TOP_N_OVER_SCORE_THRESHOLD)
+        self.portfolio_ranking_combo.setToolTip(
+            "Top N keeps only the strongest ranked assets among the currently eligible portfolio candidates.\n"
+            "Score Threshold keeps only assets whose score is at or above the configured minimum score.\n"
+            "Top N Over Threshold first filters by minimum score, then keeps the strongest N survivors."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Portfolio Ranking"))
+        main_layout.addWidget(self.portfolio_ranking_combo)
+        self.portfolio_rank_count_spin = QtWidgets.QSpinBox()
+        self.portfolio_rank_count_spin.setRange(1, 9999)
+        self.portfolio_rank_count_spin.setValue(1)
+        main_layout.addWidget(QtWidgets.QLabel("Max Ranked Assets"))
+        main_layout.addWidget(self.portfolio_rank_count_spin)
+        self.portfolio_score_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.portfolio_score_threshold_spin.setDecimals(4)
+        self.portfolio_score_threshold_spin.setRange(-999999.0, 999999.0)
+        self.portfolio_score_threshold_spin.setSingleStep(0.05)
+        self.portfolio_score_threshold_spin.setValue(0.0)
+        self.portfolio_score_threshold_spin.setToolTip(
+            "Minimum portfolio score required for Score Threshold ranking."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Min Rank Score"))
+        main_layout.addWidget(self.portfolio_score_threshold_spin)
+        self.portfolio_weighting_combo = QtWidgets.QComboBox()
+        self.portfolio_weighting_combo.addItem("Preserve Strategy Weights", WEIGHTING_MODE_PRESERVE)
+        self.portfolio_weighting_combo.addItem("Equal Weight Selected", WEIGHTING_MODE_EQUAL_SELECTED)
+        self.portfolio_weighting_combo.addItem("Score-Proportional", WEIGHTING_MODE_SCORE_PROPORTIONAL)
+        self.portfolio_weighting_combo.setToolTip(
+            "Preserve Strategy Weights keeps the surviving candidate weights as-is.\n"
+            "Equal Weight Selected distributes portfolio weight evenly across the selected assets.\n"
+            "Score-Proportional weights selected assets by their current portfolio score."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Portfolio Weighting"))
+        main_layout.addWidget(self.portfolio_weighting_combo)
+        self.portfolio_min_active_weight_spin = QtWidgets.QDoubleSpinBox()
+        self.portfolio_min_active_weight_spin.setDecimals(4)
+        self.portfolio_min_active_weight_spin.setRange(0.0, 1.0)
+        self.portfolio_min_active_weight_spin.setSingleStep(0.01)
+        self.portfolio_min_active_weight_spin.setValue(0.0)
+        self.portfolio_min_active_weight_spin.setToolTip(
+            "Optional minimum target weight for any active asset after portfolio construction. Set 0 to disable."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Min Active Weight"))
+        main_layout.addWidget(self.portfolio_min_active_weight_spin)
+        self.portfolio_max_asset_weight_spin = QtWidgets.QDoubleSpinBox()
+        self.portfolio_max_asset_weight_spin.setDecimals(4)
+        self.portfolio_max_asset_weight_spin.setRange(0.0, 1.0)
+        self.portfolio_max_asset_weight_spin.setSingleStep(0.01)
+        self.portfolio_max_asset_weight_spin.setValue(0.0)
+        self.portfolio_max_asset_weight_spin.setToolTip(
+            "Optional cap on any single asset target weight after portfolio construction. Set 0 to disable."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Max Asset Weight"))
+        main_layout.addWidget(self.portfolio_max_asset_weight_spin)
+        self.portfolio_cash_reserve_spin = QtWidgets.QDoubleSpinBox()
+        self.portfolio_cash_reserve_spin.setDecimals(4)
+        self.portfolio_cash_reserve_spin.setRange(0.0, 0.99)
+        self.portfolio_cash_reserve_spin.setSingleStep(0.01)
+        self.portfolio_cash_reserve_spin.setValue(0.0)
+        self.portfolio_cash_reserve_spin.setToolTip(
+            "Optional fraction of capital to keep unallocated as cash reserve."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Cash Reserve Weight"))
+        main_layout.addWidget(self.portfolio_cash_reserve_spin)
+        self.portfolio_rebalance_combo = QtWidgets.QComboBox()
+        self.portfolio_rebalance_combo.addItem("On Change", REBALANCE_MODE_ON_CHANGE)
+        self.portfolio_rebalance_combo.addItem("On Change + Periodic", REBALANCE_MODE_ON_CHANGE_OR_PERIODIC)
+        self.portfolio_rebalance_combo.addItem("On Change + Drift Threshold", REBALANCE_MODE_ON_CHANGE_OR_DRIFT)
+        self.portfolio_rebalance_combo.addItem(
+            "On Change + Periodic + Drift Threshold",
+            REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT,
+        )
+        self.portfolio_rebalance_combo.setToolTip(
+            "On Change only rebalances when desired target weights change.\n"
+            "On Change + Periodic also refreshes target quantities every N bars to manage drift.\n"
+            "On Change + Drift Threshold also rebalances when actual weights drift too far from target weights.\n"
+            "On Change + Periodic + Drift Threshold uses both periodic and drift-triggered refreshes."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Portfolio Rebalance"))
+        main_layout.addWidget(self.portfolio_rebalance_combo)
+        self.portfolio_rebalance_every_spin = QtWidgets.QSpinBox()
+        self.portfolio_rebalance_every_spin.setRange(1, 999999)
+        self.portfolio_rebalance_every_spin.setValue(20)
+        main_layout.addWidget(QtWidgets.QLabel("Rebalance Every N Bars"))
+        main_layout.addWidget(self.portfolio_rebalance_every_spin)
+        self.portfolio_rebalance_drift_spin = QtWidgets.QDoubleSpinBox()
+        self.portfolio_rebalance_drift_spin.setDecimals(4)
+        self.portfolio_rebalance_drift_spin.setRange(0.0001, 1.0)
+        self.portfolio_rebalance_drift_spin.setSingleStep(0.01)
+        self.portfolio_rebalance_drift_spin.setValue(0.05)
+        self.portfolio_rebalance_drift_spin.setToolTip(
+            "Maximum absolute asset-weight drift allowed before a drift-triggered rebalance occurs."
+        )
+        main_layout.addWidget(QtWidgets.QLabel("Rebalance Drift Threshold"))
+        main_layout.addWidget(self.portfolio_rebalance_drift_spin)
+        self.portfolio_ownership_combo.currentTextChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_ranking_combo.currentTextChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_rank_count_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_score_threshold_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_weighting_combo.currentTextChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_min_active_weight_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_max_asset_weight_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_cash_reserve_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_rebalance_combo.currentTextChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_rebalance_every_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
+        self.portfolio_rebalance_drift_spin.valueChanged.connect(lambda _: self._update_portfolio_allocation_summary())
 
         main_layout.addWidget(QtWidgets.QLabel("Timeframes"))
         self.timeframes_combo = QtWidgets.QComboBox()
@@ -1039,6 +1750,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         self._init_strategy_selector()
         self._refresh_dataset_options()
+        self._update_study_mode_note()
+        self._update_portfolio_allocation_summary()
 
         return panel
 
@@ -1302,8 +2015,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         layout.addLayout(autostart_row)
         self._refresh_autostart_status()
 
-        self.progress_table = QtWidgets.QTableWidget(0, 5)
-        self.progress_table.setHorizontalHeaderLabels(["Ticker", "Status", "Pages", "Rows", "Progress"])
+        self.progress_table = QtWidgets.QTableWidget(0, 6)
+        self.progress_table.setHorizontalHeaderLabels(["Ticker", "Status", "Pages", "Rows", "Progress", "Log"])
         self.progress_table.horizontalHeader().setStretchLastSection(True)
         self.progress_table.verticalHeader().setVisible(False)
         self.progress_table.setAlternatingRowColors(True)
@@ -1812,6 +2525,55 @@ WantedBy=default.target
                 return candidate
         return None
 
+    def _create_download_log_path(self, ticker: str) -> Path:
+        DOWNLOAD_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = pd.Timestamp.now("UTC").strftime("%Y%m%d_%H%M%S")
+        return DOWNLOAD_LOG_DIR / f"{ticker.upper()}_{stamp}_{uuid.uuid4().hex[:8]}.log"
+
+    def _append_download_log(self, log_path: Path | None, text: str) -> None:
+        if log_path is None or not text:
+            return
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _download_meta(self, proc: QtCore.QProcess | None) -> dict | None:
+        if proc is None:
+            return None
+        return self.download_proc_meta.get(id(proc))
+
+    def _open_download_log(self, ticker: str) -> None:
+        info = self.download_progress_rows.get(ticker)
+        if not info:
+            QtWidgets.QMessageBox.information(self, "Log", f"No download row exists for {ticker}.")
+            return
+        log_path = info.get("log_path")
+        if not log_path:
+            QtWidgets.QMessageBox.information(self, "Log", f"No log path recorded for {ticker}.")
+            return
+        path = Path(log_path)
+        if not path.exists():
+            QtWidgets.QMessageBox.information(self, "Log", f"No log available yet for {ticker}.")
+            return
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Log", f"Unable to read log: {exc}")
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Download Log {ticker}")
+        dlg.resize(900, 600)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        subtitle = QtWidgets.QLabel(str(path))
+        subtitle.setObjectName("Sub")
+        subtitle.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(subtitle)
+        text = QtWidgets.QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(content)
+        layout.addWidget(text)
+        dlg.exec()
+
     def _start_download(self) -> None:
         if self.download_procs:
             QtWidgets.QMessageBox.information(self, "Download running", "A download process is already running.")
@@ -1822,6 +2584,7 @@ WantedBy=default.target
             return
         self.download_queue = list(symbols)
         self.download_progress_rows = {}
+        self.download_proc_meta = {}
         self.progress_table.setRowCount(0)
         self.download_paused = False
         self.download_progress.setVisible(True)
@@ -1842,7 +2605,8 @@ WantedBy=default.target
         end_dt = pd.Timestamp.utcnow().date()
         start_dt = end_dt - pd.Timedelta(days=365 * 2)
         out_path = Path("data") / f"{ticker}_massive_{start_dt}_{end_dt}_1m.csv"
-        self._ensure_progress_row(ticker)
+        log_path = self._create_download_log_path(ticker)
+        self._ensure_progress_row(ticker, log_path)
         proc = QtCore.QProcess(self)
         proc.setProgram(sys.executable)
         args = [
@@ -1864,54 +2628,126 @@ WantedBy=default.target
         proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
         proc.readyReadStandardOutput.connect(self._handle_download_output)
         proc.finished.connect(self._download_finished)
+        proc.errorOccurred.connect(self._download_process_error)
+        self.download_proc_meta[id(proc)] = {
+            "ticker": ticker,
+            "log_path": log_path,
+            "buffer": "",
+            "last_error": "",
+            "out_path": str(out_path),
+        }
+        launch_text = (
+            f"[{pd.Timestamp.now('UTC').isoformat()}] Launching download for {ticker}\n"
+            f"Command: {sys.executable} {' '.join(args)}\n\n"
+        )
+        self._append_download_log(log_path, launch_text)
         proc.start()
         self.download_proc = proc
         self.download_procs.append(proc)
         self.download_status.setText(f"Downloading {ticker}…")
-        self._update_progress_row(ticker, status="running")
+        self._update_progress_row(ticker, status="running", tooltip=f"Log: {log_path}")
 
     def _handle_download_output(self) -> None:
         proc = self.sender()
         if not isinstance(proc, QtCore.QProcess):
             return
+        meta = self._download_meta(proc)
         data = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
-        for line in data.splitlines():
+        if meta is None:
+            return
+        self._append_download_log(Path(meta["log_path"]), data)
+        buffer = str(meta.get("buffer", "")) + data
+        lines = buffer.split("\n")
+        meta["buffer"] = lines.pop() if lines else ""
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
-            try:
-                payload = json.loads(line)
-            except Exception:
-                continue
-            if payload.get("type") == "progress":
-                pages = payload.get("pages")
-                rows = payload.get("rows")
-                self.download_status.setText(
-                    f"Downloading {payload.get('ticker')}… pages={pages} rows={rows}"
-                )
-                self._update_progress_row(payload.get("ticker"), pages=pages, rows=rows)
-            elif payload.get("type") == "start":
-                self.download_status.setText(
-                    f"Downloading {payload.get('ticker')}… {payload.get('start')} → {payload.get('end')}"
-                )
-                self._update_progress_row(payload.get("ticker"), status="running")
-            elif payload.get("type") == "done":
-                self.download_status.setText(
-                    f"Finished {payload.get('ticker')} ({payload.get('rows')} bars)"
-                )
-                self._update_progress_row(payload.get("ticker"), status="done", rows=payload.get("rows"), done=True)
+            self._process_download_output_line(meta, line)
 
-    def _download_finished(self) -> None:
+    def _process_download_output_line(self, meta: dict, line: str) -> None:
+        ticker = str(meta.get("ticker", ""))
+        try:
+            payload = json.loads(line)
+        except Exception:
+            if "Traceback" in line or "Error" in line or "Exception" in line or "No module named" in line:
+                meta["last_error"] = line
+                self._update_progress_row(ticker, status="error", tooltip=line)
+            return
+        if payload.get("type") == "progress":
+            pages = payload.get("pages")
+            rows = payload.get("rows")
+            self.download_status.setText(
+                f"Downloading {payload.get('ticker')}… pages={pages} rows={rows}"
+            )
+            self._update_progress_row(payload.get("ticker"), pages=pages, rows=rows)
+        elif payload.get("type") == "start":
+            self.download_status.setText(
+                f"Downloading {payload.get('ticker')}… {payload.get('start')} → {payload.get('end')}"
+            )
+            self._update_progress_row(payload.get("ticker"), status="running")
+        elif payload.get("type") == "done":
+            self.download_status.setText(
+                f"Finished {payload.get('ticker')} ({payload.get('rows')} bars)"
+            )
+            self._update_progress_row(payload.get("ticker"), status="done", rows=payload.get("rows"), done=True)
+        elif payload.get("type") == "error":
+            message = str(payload.get("message") or payload.get("details") or "Unknown download error")
+            meta["last_error"] = message
+            self.download_status.setText(f"{payload.get('ticker')} failed: {message}")
+            self._update_progress_row(payload.get("ticker"), status="error", tooltip=message)
+
+    def _download_process_error(self, error: QtCore.QProcess.ProcessError) -> None:
         proc = self.sender()
+        if not isinstance(proc, QtCore.QProcess):
+            return
+        meta = self._download_meta(proc)
+        if meta is None:
+            return
+        ticker = str(meta.get("ticker", ""))
+        message = f"Process error: {getattr(error, 'name', str(error))}"
+        meta["last_error"] = message
+        self.download_status.setText(f"{ticker} failed: {message}")
+        self._update_progress_row(ticker, status="error", tooltip=message)
+
+    def _download_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus) -> None:
+        proc = self.sender()
+        meta = self._download_meta(proc) if isinstance(proc, QtCore.QProcess) else None
+        ticker = str(meta.get("ticker", "")) if meta else ""
+        if meta:
+            remainder = str(meta.get("buffer", ""))
+            if remainder.strip():
+                self._append_download_log(Path(meta["log_path"]), remainder + "\n")
+                self._process_download_output_line(meta, remainder.strip())
+                meta["buffer"] = ""
+            log_path = Path(meta["log_path"])
+            summary = str(meta.get("last_error") or "")
+            if (exit_code != 0 or exit_status != QtCore.QProcess.ExitStatus.NormalExit) and not summary:
+                try:
+                    summary = self._summarize_error(log_path.read_text(encoding="utf-8"))
+                except Exception:
+                    summary = f"Process exited with code {exit_code}"
+            if exit_code != 0 or exit_status != QtCore.QProcess.ExitStatus.NormalExit:
+                if not summary:
+                    summary = f"Process exited with code {exit_code}"
+                self.download_status.setText(f"{ticker} failed: {summary}")
+                self._update_progress_row(ticker, status="error", tooltip=summary)
+            elif ticker:
+                self._update_progress_row(ticker, tooltip=f"Completed. Log: {log_path}")
         if isinstance(proc, QtCore.QProcess) and proc in self.download_procs:
             self.download_procs.remove(proc)
+        if isinstance(proc, QtCore.QProcess):
+            self.download_proc_meta.pop(id(proc), None)
         self.download_proc = self.download_procs[0] if self.download_procs else None
         if self.download_paused:
             return
         if self.download_queue:
             self._start_next_download()
         elif not self.download_procs:
-            self.download_status.setText("Downloads complete.")
+            if self.download_status.text().startswith(f"{ticker} failed:"):
+                pass
+            else:
+                self.download_status.setText("Downloads complete.")
             self.download_progress.setVisible(False)
 
     def _pause_download(self) -> None:
@@ -1956,8 +2792,10 @@ WantedBy=default.target
         for ticker in list(self.download_progress_rows.keys()):
             self._update_progress_row(ticker, status="stopped")
 
-    def _ensure_progress_row(self, ticker: str) -> None:
+    def _ensure_progress_row(self, ticker: str, log_path: Path | None = None) -> None:
         if ticker in self.download_progress_rows:
+            if log_path is not None:
+                self.download_progress_rows[ticker]["log_path"] = str(log_path)
             return
         row = self.progress_table.rowCount()
         self.progress_table.insertRow(row)
@@ -1969,7 +2807,10 @@ WantedBy=default.target
         bar.setRange(0, EXPECTED_2Y_1M_EQUITY_ROWS)
         bar.setValue(0)
         self.progress_table.setCellWidget(row, 4, bar)
-        self.download_progress_rows[ticker] = {"row": row, "bar": bar}
+        log_btn = QtWidgets.QPushButton("Log")
+        log_btn.clicked.connect(lambda _, sym=ticker: self._open_download_log(sym))
+        self.progress_table.setCellWidget(row, 5, log_btn)
+        self.download_progress_rows[ticker] = {"row": row, "bar": bar, "log_path": str(log_path) if log_path else None}
 
     def _update_progress_row(
         self,
@@ -1978,6 +2819,7 @@ WantedBy=default.target
         pages: int | None = None,
         rows: int | None = None,
         done: bool = False,
+        tooltip: str | None = None,
     ) -> None:
         if not ticker or ticker not in self.download_progress_rows:
             return
@@ -1987,6 +2829,8 @@ WantedBy=default.target
             item = self.progress_table.item(row, 1)
             if item:
                 item.setText(status)
+                if tooltip:
+                    item.setToolTip(tooltip)
         if pages is not None:
             item = self.progress_table.item(row, 2)
             if item:
@@ -2000,6 +2844,11 @@ WantedBy=default.target
         if done:
             bar.setRange(0, 100)
             bar.setValue(100)
+        if tooltip:
+            for col in range(self.progress_table.columnCount()):
+                item = self.progress_table.item(row, col)
+                if item is not None:
+                    item.setToolTip(tooltip)
 
     def _render_batches(self, batches: List[BatchRow]) -> None:
         self.batch_model.set_batches(batches)
@@ -2073,7 +2922,7 @@ WantedBy=default.target
         except Exception as exc:
             self._show_error_dialog("Import Error", str(exc), details=traceback.format_exc())
 
-    def _collect_backtest_settings(self) -> Dict[str, float | bool | dict]:
+    def _collect_backtest_settings(self) -> Dict[str, float | bool | dict | str]:
         def _float(edit: QtWidgets.QLineEdit, default: float) -> float:
             try:
                 val = float(edit.text().strip())
@@ -2104,11 +2953,307 @@ WantedBy=default.target
             "use_cache": self.use_cache_chk.isChecked(),
             "prevent_scale_in": self.prevent_scale_in_chk.isChecked(),
             "one_order_per_signal": self.one_order_chk.isChecked(),
+            "execution_mode": str(self.execution_mode_combo.currentData() or ExecutionMode.AUTO.value),
+            "study_mode": str(self.study_mode_combo.currentData() or STUDY_MODE_INDEPENDENT),
+            "portfolio_allocation_mode": str(self.portfolio_allocation_combo.currentData() or PORTFOLIO_ALLOC_EQUAL),
+            "portfolio_weights_text": self.portfolio_weights_edit.text().strip(),
+            "portfolio_ownership_mode": str(
+                self.portfolio_ownership_combo.currentData() or ALLOCATION_OWNERSHIP_STRATEGY
+            ),
+            "portfolio_ranking_mode": str(self.portfolio_ranking_combo.currentData() or RANKING_MODE_NONE),
+            "portfolio_rank_count": int(self.portfolio_rank_count_spin.value()),
+            "portfolio_score_threshold": float(self.portfolio_score_threshold_spin.value()),
+            "portfolio_weighting_mode": str(self.portfolio_weighting_combo.currentData() or WEIGHTING_MODE_PRESERVE),
+            "portfolio_min_active_weight": float(self.portfolio_min_active_weight_spin.value()),
+            "portfolio_max_asset_weight": float(self.portfolio_max_asset_weight_spin.value()),
+            "portfolio_cash_reserve_weight": float(self.portfolio_cash_reserve_spin.value()),
+            "portfolio_rebalance_mode": str(self.portfolio_rebalance_combo.currentData() or REBALANCE_MODE_ON_CHANGE),
+            "portfolio_rebalance_every_n_bars": int(self.portfolio_rebalance_every_spin.value()),
+            "portfolio_rebalance_drift_threshold": float(self.portfolio_rebalance_drift_spin.value()),
         }
+
+    @staticmethod
+    def _study_mode_label(mode: str | None) -> str:
+        if mode == STUDY_MODE_PORTFOLIO:
+            return "Portfolio"
+        return "Independent"
+
+    def _vectorized_support_issues(
+        self,
+        strategy_factory: Callable,
+        timeframes: list[str],
+        bt_settings: Dict[str, float | bool | dict | str],
+    ) -> tuple[list[str], bool]:
+        issues: list[str] = []
+        supported_strategies = {"SMACrossStrategy", "ZScoreMeanReversionStrategy"}
+        if strategy_factory.__name__ not in supported_strategies:
+            issues.append(
+                f"{strategy_factory.__name__} does not have a vectorized adapter yet. "
+                "Current vectorized support is limited to SMACrossStrategy and ZScoreMeanReversionStrategy."
+            )
+            return issues, False
+
+        if self.intrabar_chk.isChecked():
+            issues.append("Intrabar simulation must be turned off for vectorized v1.")
+        return issues, True
+
+    def _apply_vectorized_defaults(self) -> None:
+        self.intrabar_chk.setChecked(False)
+
+    def _portfolio_vectorized_support_issues(
+        self,
+        strategy_factory: Callable,
+        timeframes: list[str],
+        bt_settings: Dict[str, float | bool | dict | str],
+    ) -> tuple[list[str], bool]:
+        issues, can_apply_defaults = self._vectorized_support_issues(strategy_factory, timeframes, bt_settings)
+        requested_mode = str(bt_settings.get("execution_mode", ExecutionMode.AUTO.value))
+        ownership_mode = str(bt_settings.get("portfolio_ownership_mode", ALLOCATION_OWNERSHIP_STRATEGY))
+        ranking_mode = str(bt_settings.get("portfolio_ranking_mode", RANKING_MODE_NONE))
+        weighting_mode = str(bt_settings.get("portfolio_weighting_mode", WEIGHTING_MODE_PRESERVE))
+        min_active_weight = float(bt_settings.get("portfolio_min_active_weight", 0.0) or 0.0)
+        max_asset_weight = float(bt_settings.get("portfolio_max_asset_weight", 0.0) or 0.0)
+        cash_reserve_weight = float(bt_settings.get("portfolio_cash_reserve_weight", 0.0) or 0.0)
+        if requested_mode == ExecutionMode.REFERENCE.value:
+            issues.append("Portfolio study mode does not have a reference-engine fallback yet.")
+        if bool(bt_settings.get("allow_short", True)):
+            issues.append("Portfolio vectorization v1 is long-only, so 'Allow Short' must be turned off.")
+        if ownership_mode == ALLOCATION_OWNERSHIP_STRATEGY and ranking_mode != RANKING_MODE_NONE:
+            issues.append(
+                "Strategy-Owned allocation cannot be combined with portfolio ranking. Use Hybrid or Portfolio-Owned allocation."
+            )
+            can_apply_defaults = False
+        if ownership_mode != ALLOCATION_OWNERSHIP_PORTFOLIO and weighting_mode != WEIGHTING_MODE_PRESERVE:
+            issues.append(
+                "Portfolio weighting overrides require Portfolio-Owned allocation. Strategy-Owned and Hybrid modes must preserve strategy sizing."
+            )
+            can_apply_defaults = False
+        if min_active_weight < 0.0:
+            issues.append("Min Active Weight must be >= 0.")
+            can_apply_defaults = False
+        if max_asset_weight < 0.0:
+            issues.append("Max Asset Weight must be >= 0.")
+            can_apply_defaults = False
+        if min_active_weight > 0.0 and max_asset_weight > 0.0 and max_asset_weight < min_active_weight:
+            issues.append("Max Asset Weight must be >= Min Active Weight when both are enabled.")
+            can_apply_defaults = False
+        if not (0.0 <= cash_reserve_weight < 1.0):
+            issues.append("Cash Reserve Weight must be between 0 and 1.")
+            can_apply_defaults = False
+        if (
+            str(bt_settings.get("portfolio_rebalance_mode", REBALANCE_MODE_ON_CHANGE))
+            in {REBALANCE_MODE_ON_CHANGE_OR_PERIODIC, REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT}
+            and int(bt_settings.get("portfolio_rebalance_every_n_bars", 0) or 0) <= 0
+        ):
+            issues.append("Periodic portfolio rebalancing requires Rebalance Every N Bars > 0.")
+            can_apply_defaults = False
+        if (
+            str(bt_settings.get("portfolio_rebalance_mode", REBALANCE_MODE_ON_CHANGE))
+            in {REBALANCE_MODE_ON_CHANGE_OR_DRIFT, REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT}
+            and float(bt_settings.get("portfolio_rebalance_drift_threshold", 0.0) or 0.0) <= 0.0
+        ):
+            issues.append("Drift-threshold portfolio rebalancing requires a drift threshold > 0.")
+            can_apply_defaults = False
+        return issues, can_apply_defaults
+
+    def _apply_portfolio_vectorized_defaults(self) -> None:
+        self._apply_vectorized_defaults()
+        self.allow_short_chk.setChecked(False)
+        if str(self.portfolio_ranking_combo.currentData() or RANKING_MODE_NONE) != RANKING_MODE_NONE and (
+            str(self.portfolio_ownership_combo.currentData() or ALLOCATION_OWNERSHIP_STRATEGY)
+            == ALLOCATION_OWNERSHIP_STRATEGY
+        ):
+            idx = self.portfolio_ownership_combo.findData(ALLOCATION_OWNERSHIP_HYBRID)
+            if idx >= 0:
+                self.portfolio_ownership_combo.setCurrentIndex(idx)
+        if str(self.execution_mode_combo.currentData() or "") == ExecutionMode.REFERENCE.value:
+            idx = self.execution_mode_combo.findData(ExecutionMode.AUTO.value)
+            if idx >= 0:
+                self.execution_mode_combo.setCurrentIndex(idx)
+        if (
+            str(self.portfolio_ownership_combo.currentData() or ALLOCATION_OWNERSHIP_STRATEGY)
+            != ALLOCATION_OWNERSHIP_PORTFOLIO
+            and str(self.portfolio_weighting_combo.currentData() or WEIGHTING_MODE_PRESERVE)
+            != WEIGHTING_MODE_PRESERVE
+        ):
+            idx = self.portfolio_weighting_combo.findData(WEIGHTING_MODE_PRESERVE)
+            if idx >= 0:
+                self.portfolio_weighting_combo.setCurrentIndex(idx)
+        if self.portfolio_rebalance_drift_spin.value() <= 0.0:
+            self.portfolio_rebalance_drift_spin.setValue(0.05)
+
+    def _ensure_portfolio_vectorized_compatible(
+        self,
+        strategy_factory: Callable,
+        timeframes: list[str],
+        bt_settings: Dict[str, float | bool | dict | str],
+    ) -> tuple[list[str], Dict[str, float | bool | dict | str]] | None:
+        issues, can_apply_defaults = self._portfolio_vectorized_support_issues(strategy_factory, timeframes, bt_settings)
+        if not issues:
+            return timeframes, bt_settings
+
+        if not can_apply_defaults:
+            self._show_error_dialog(
+                "Portfolio Mode Unsupported",
+                issues[0],
+                details="\n".join(f"- {issue}" for issue in issues),
+            )
+            return None
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Portfolio Mode Requirements")
+        box.setText("Portfolio vectorized v1 cannot run with the current settings.")
+        box.setInformativeText(
+            "Blockers:\n" + "\n".join(f"- {issue}" for issue in issues) + "\n\n"
+            "Choose 'Apply Compatible Defaults' to switch to a portfolio-compatible setup."
+        )
+        apply_btn = box.addButton("Apply Compatible Defaults", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not apply_btn:
+            return None
+
+        self._apply_portfolio_vectorized_defaults()
+        new_timeframes = [tf.strip() for tf in self.timeframes_combo.currentText().split(",") if tf.strip()]
+        new_settings = self._collect_backtest_settings()
+        follow_up_issues, _ = self._portfolio_vectorized_support_issues(strategy_factory, new_timeframes, new_settings)
+        if follow_up_issues:
+            self._show_error_dialog(
+                "Portfolio Mode Still Unsupported",
+                follow_up_issues[0],
+                details="\n".join(f"- {issue}" for issue in follow_up_issues),
+            )
+            return None
+        return new_timeframes, new_settings
+
+    def _parse_portfolio_weights(
+        self,
+        dataset_ids: Sequence[str],
+        allocation_mode: str,
+        weight_text: str,
+    ) -> tuple[dict[str, float], list[str]]:
+        datasets = [dataset_id for dataset_id in dataset_ids if dataset_id]
+        if not datasets:
+            return {}, []
+        if allocation_mode == PORTFOLIO_ALLOC_EQUAL:
+            return {dataset_id: 1.0 for dataset_id in datasets}, []
+
+        text = (weight_text or "").strip()
+        if not text:
+            return {dataset_id: 1.0 for dataset_id in datasets}, []
+
+        tokens = [token.strip() for token in text.split(",") if token.strip()]
+        if not tokens:
+            return {dataset_id: 1.0 for dataset_id in datasets}, []
+
+        weights: dict[str, float] = {}
+        errors: list[str] = []
+        if any("=" in token for token in tokens):
+            weights = {dataset_id: 0.0 for dataset_id in datasets}
+            seen: set[str] = set()
+            for token in tokens:
+                if "=" not in token:
+                    errors.append(f"Invalid portfolio weight token '{token}'. Use dataset=weight format.")
+                    continue
+                dataset_id, raw_weight = token.split("=", 1)
+                dataset_id = dataset_id.strip()
+                if dataset_id not in datasets:
+                    errors.append(f"Portfolio weight dataset '{dataset_id}' is not in the selected study datasets.")
+                    continue
+                if dataset_id in seen:
+                    errors.append(f"Duplicate portfolio weight provided for '{dataset_id}'.")
+                    continue
+                try:
+                    weight = float(raw_weight.strip())
+                except Exception:
+                    errors.append(f"Portfolio weight for '{dataset_id}' is not a valid number.")
+                    continue
+                if weight < 0:
+                    errors.append(f"Portfolio weight for '{dataset_id}' must be non-negative.")
+                    continue
+                weights[dataset_id] = weight
+                seen.add(dataset_id)
+        else:
+            if len(tokens) != len(datasets):
+                return {}, [
+                    "Positional portfolio weights must provide exactly one value per selected dataset, "
+                    f"but received {len(tokens)} value(s) for {len(datasets)} dataset(s)."
+                ]
+            for dataset_id, token in zip(datasets, tokens):
+                try:
+                    weight = float(token)
+                except Exception:
+                    errors.append(f"Portfolio weight '{token}' is not a valid number.")
+                    continue
+                if weight < 0:
+                    errors.append(f"Portfolio weight for '{dataset_id}' must be non-negative.")
+                    continue
+                weights[dataset_id] = weight
+
+        if not errors and sum(weights.values()) <= 0:
+            errors.append("Portfolio weights must sum to more than zero.")
+        return weights, errors
+
+    def _ensure_vectorized_compatible(
+        self,
+        strategy_factory: Callable,
+        timeframes: list[str],
+        bt_settings: Dict[str, float | bool | dict | str],
+    ) -> tuple[list[str], Dict[str, float | bool | dict | str]] | None:
+        issues, can_apply_defaults = self._vectorized_support_issues(strategy_factory, timeframes, bt_settings)
+        if not issues:
+            return timeframes, bt_settings
+
+        if not can_apply_defaults:
+            self._show_error_dialog(
+                "Vectorized Mode Unsupported",
+                issues[0],
+                details="\n".join(f"- {issue}" for issue in issues),
+            )
+            return None
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Vectorized Mode Requirements")
+        box.setText("Vectorized v1 cannot run with the current settings.")
+        timeframe_note = ""
+        if any(tf != "1 minutes" for tf in timeframes):
+            timeframe_note = (
+                "\nNote: explicit vectorized runs on higher timeframes currently use "
+                "same-timeframe resampled bars, not full base-execution parity."
+            )
+        box.setInformativeText(
+            "Blockers:\n" + "\n".join(f"- {issue}" for issue in issues) + "\n\n"
+            "Choose 'Apply Compatible Defaults' to switch to a vectorized-compatible setup."
+            + timeframe_note
+        )
+        apply_btn = box.addButton("Apply Compatible Defaults", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not apply_btn:
+            return None
+
+        self._apply_vectorized_defaults()
+        new_timeframes = [tf.strip() for tf in self.timeframes_combo.currentText().split(",") if tf.strip()]
+        new_settings = self._collect_backtest_settings()
+        follow_up_issues, _ = self._vectorized_support_issues(strategy_factory, new_timeframes, new_settings)
+        if follow_up_issues:
+            self._show_error_dialog(
+                "Vectorized Mode Still Unsupported",
+                follow_up_issues[0],
+                details="\n".join(f"- {issue}" for issue in follow_up_issues),
+            )
+            return None
+        return new_timeframes, new_settings
 
     def _run_grid_clicked(self) -> None:
         csv_path = Path(self.csv_path_edit.text().strip())
-        dataset_id = self.dataset_combo.currentText().strip() or "dataset"
+        dataset_ids = self._selected_study_dataset_ids()
+        dataset_id = dataset_ids[0] if dataset_ids else (self.dataset_combo.currentText().strip() or "dataset")
+        study_mode = str(self.study_mode_combo.currentData() or STUDY_MODE_INDEPENDENT)
         timeframes = [tf.strip() for tf in self.timeframes_combo.currentText().split(",") if tf.strip()]
         horizons_raw = [h.strip() for h in self.horizons_combo.currentText().split(",") if h.strip()]
         risk_free_raw = self.risk_free_edit.text().strip()
@@ -2120,12 +3265,23 @@ WantedBy=default.target
         if self.worker and self.worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Busy", "Grid already running.")
             return
+        if not dataset_ids:
+            QtWidgets.QMessageBox.warning(self, "Dataset missing", "Select at least one dataset.")
+            return
         # Ensure dataset already imported.
         duck = DuckDBStore()
-        try:
-            duck.load(dataset_id)
-        except Exception:
-            QtWidgets.QMessageBox.warning(self, "Dataset missing", f"Dataset '{dataset_id}' not found. Click 'Add CSV to Database' first.")
+        missing_datasets = []
+        for selected_dataset in dataset_ids:
+            try:
+                duck.load(selected_dataset)
+            except Exception:
+                missing_datasets.append(selected_dataset)
+        if missing_datasets:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Dataset missing",
+                "These datasets were not found in the local store:\n" + "\n".join(missing_datasets),
+            )
             return
         if not timeframes:
             QtWidgets.QMessageBox.warning(self, "Timeframes", "Provide at least one timeframe.")
@@ -2135,14 +3291,53 @@ WantedBy=default.target
         if param_errors:
             QtWidgets.QMessageBox.warning(self, "Parameter warnings", "Some values were invalid and replaced with defaults:\n" + "\n".join(param_errors))
 
+        requested_mode = str(bt_settings.get("execution_mode", ExecutionMode.AUTO.value))
+        if study_mode == STUDY_MODE_PORTFOLIO:
+            compatible = self._ensure_portfolio_vectorized_compatible(strategy_factory, timeframes, bt_settings)
+            if compatible is None:
+                self.status_label.setText("Portfolio study cancelled")
+                return
+            timeframes, bt_settings = compatible
+            allocation_mode = str(bt_settings.get("portfolio_allocation_mode", PORTFOLIO_ALLOC_EQUAL))
+            target_weights, weight_errors = self._parse_portfolio_weights(
+                dataset_ids,
+                allocation_mode,
+                str(bt_settings.get("portfolio_weights_text", "")),
+            )
+            if weight_errors:
+                self._show_error_dialog(
+                    "Portfolio Weights Invalid",
+                    weight_errors[0],
+                    details="\n".join(f"- {issue}" for issue in weight_errors),
+                )
+                self.status_label.setText("Portfolio study cancelled")
+                return
+            self.portfolio_target_weights = dict(target_weights)
+            bt_settings["portfolio_target_weights"] = target_weights
+        elif requested_mode == ExecutionMode.VECTORIZED.value:
+            compatible = self._ensure_vectorized_compatible(strategy_factory, timeframes, bt_settings)
+            if compatible is None:
+                self.status_label.setText("Vectorized run cancelled")
+                return
+            timeframes, bt_settings = compatible
+
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.progress.setValue(0)
-        self.status_label.setText("Running grid…")
+        mode_label = self._execution_mode_label(str(bt_settings.get("execution_mode", ExecutionMode.AUTO.value)))
+        self._current_grid_started_at = time.perf_counter()
+        if study_mode == STUDY_MODE_PORTFOLIO:
+            self.status_label.setText(f"Running portfolio study ({mode_label}) across {len(dataset_ids)} datasets…")
+        elif len(dataset_ids) > 1:
+            self.status_label.setText(f"Running independent study ({mode_label}) across {len(dataset_ids)} datasets…")
+        else:
+            self.status_label.setText(f"Running grid ({mode_label})…")
 
         self.worker = GridWorker(
             csv_path=csv_path,
             dataset_id=dataset_id,
+            dataset_ids=dataset_ids,
+            study_mode=study_mode,
             timeframes=timeframes,
             horizons=horizons_raw,
             catalog_path=self.catalog.db_path,
@@ -2166,10 +3361,36 @@ WantedBy=default.target
         message = "Grid completed."
         df = None
         spec = None
+        batch_id = None
+        batch_benchmarks: tuple[BatchExecutionBenchmark, ...] = ()
         if isinstance(payload, dict):
             message = payload.get("message", message)
             df = payload.get("df")
             spec = payload.get("spec")
+            batch_id = payload.get("batch_id")
+            batch_benchmarks = tuple(payload.get("batch_benchmarks") or ())
+        elapsed_text = ""
+        if self._current_grid_started_at is not None:
+            elapsed_text = f" in {time.perf_counter() - self._current_grid_started_at:.2f}s"
+            self._current_grid_started_at = None
+        if elapsed_text and message.endswith("."):
+            message = f"{message[:-1]}{elapsed_text}."
+        elif elapsed_text:
+            message = f"{message}{elapsed_text}"
+        if isinstance(df, pd.DataFrame) and not df.empty and "resolved_execution_mode" in df.columns:
+            mode_counts = df["resolved_execution_mode"].fillna("unknown").value_counts().to_dict()
+            mode_summary = ", ".join(
+                f"{self._execution_mode_label(mode)}: {count}" for mode, count in sorted(mode_counts.items())
+            )
+            if mode_summary:
+                message = f"{message} Engines used -> {mode_summary}"
+            if "dataset_id" in df.columns:
+                dataset_count = int(df["dataset_id"].nunique())
+                if dataset_count > 1:
+                    message = f"{message} Datasets -> {dataset_count}"
+        if batch_id and batch_benchmarks:
+            self._batch_benchmark_cache[str(batch_id)] = batch_benchmarks
+            message = f"{message} {_summarize_batch_benchmarks(batch_benchmarks)}"
         self.status_label.setText(message)
         self.progress.setValue(100)
         if df is not None and spec is not None:
@@ -2181,7 +3402,12 @@ WantedBy=default.target
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress.setValue(0)
-        self.status_label.setText("Grid error")
+        if self._current_grid_started_at is not None:
+            elapsed = time.perf_counter() - self._current_grid_started_at
+            self.status_label.setText(f"Grid error after {elapsed:.2f}s")
+            self._current_grid_started_at = None
+        else:
+            self.status_label.setText("Grid error")
         # Echo to console for debugging heavy workloads.
         print("Grid error:\n", message or "Unknown error")
         summary = self._summarize_error(message)
@@ -2194,7 +3420,15 @@ WantedBy=default.target
             return
         pct = int((done / total) * 100)
         self.progress.setValue(min(100, max(0, pct)))
-        self.status_label.setText(f"Running grid… {done}/{total}")
+        mode_label = "Auto"
+        study_prefix = "Running grid"
+        if self.worker is not None:
+            mode_label = self._execution_mode_label(str(self.worker.bt_settings.get("execution_mode", ExecutionMode.AUTO.value)))
+            if getattr(self.worker, "study_mode", STUDY_MODE_INDEPENDENT) == STUDY_MODE_PORTFOLIO:
+                study_prefix = f"Running portfolio study across {len(self.worker.dataset_ids)} datasets"
+            elif len(getattr(self.worker, "dataset_ids", [])) > 1:
+                study_prefix = f"Running independent study across {len(self.worker.dataset_ids)} datasets"
+        self.status_label.setText(f"{study_prefix} ({mode_label})… {done}/{total}")
 
     def _generate_heatmap_from_results(self, df: pd.DataFrame, spec: GridSpec) -> None:
         try:
@@ -2208,7 +3442,15 @@ WantedBy=default.target
             metric = spec.metric or "total_return"
             if col not in df.columns or row not in df.columns or metric not in df.columns:
                 return
-            fig = plot_param_heatmap(df, value_col=metric, row=row, col=col, title=f"{metric} heatmap")
+            heatmap_df = df
+            if heatmap_df.duplicated(subset=[row, col]).any():
+                heatmap_df = (
+                    heatmap_df.groupby([row, col], as_index=False)[metric]
+                    .median()
+                    .sort_values([row, col])
+                    .reset_index(drop=True)
+                )
+            fig = plot_param_heatmap(heatmap_df, value_col=metric, row=row, col=col, title=f"{metric} heatmap")
             heatmap_id = f"heatmap_{uuid.uuid4().hex[:8]}"
             heatmap_dir = Path("heatmaps")
             heatmap_dir.mkdir(parents=True, exist_ok=True)
@@ -2238,14 +3480,180 @@ WantedBy=default.target
         # Use cpu_count() - 1 to leave a little headroom for UI/OS.
         return max(1, (os.cpu_count() or 2) - 1)
 
+    @staticmethod
+    def _execution_mode_label(mode: str | None) -> str:
+        if not mode:
+            return "—"
+        try:
+            return ExecutionMode.from_value(mode).value.title()
+        except Exception:
+            return str(mode).replace("_", " ").title()
+
+    def _update_study_mode_note(self) -> None:
+        if not hasattr(self, "study_mode_note"):
+            return
+        mode = str(self.study_mode_combo.currentData() or STUDY_MODE_INDEPENDENT)
+        self.portfolio_allocation_combo.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_ownership_combo.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_ranking_combo.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_rank_count_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_score_threshold_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_weighting_combo.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_min_active_weight_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_max_asset_weight_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_cash_reserve_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_rebalance_combo.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_rebalance_every_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        self.portfolio_rebalance_drift_spin.setEnabled(mode == STUDY_MODE_PORTFOLIO)
+        if mode == STUDY_MODE_PORTFOLIO:
+            self.study_mode_note.setText(
+                "Portfolio mode uses shared cash across the selected datasets with the vectorized portfolio backend. "
+                "Current scope is same-timeframe only, long-only, and one strategy applied across the selected assets."
+            )
+        else:
+            self.study_mode_note.setText(
+                "Optional. Choose multiple datasets to run one independent multi-dataset study. "
+                "Each asset is backtested separately; this is not portfolio backtesting."
+            )
+        self._update_portfolio_allocation_summary()
+
+    def _update_portfolio_allocation_summary(self) -> None:
+        if not hasattr(self, "portfolio_allocation_summary"):
+            return
+        study_mode = str(self.study_mode_combo.currentData() or STUDY_MODE_INDEPENDENT)
+        allocation_mode = str(self.portfolio_allocation_combo.currentData() or PORTFOLIO_ALLOC_EQUAL)
+        ownership_mode = str(self.portfolio_ownership_combo.currentData() or ALLOCATION_OWNERSHIP_STRATEGY)
+        ranking_mode = str(self.portfolio_ranking_combo.currentData() or RANKING_MODE_NONE)
+        weighting_mode = str(self.portfolio_weighting_combo.currentData() or WEIGHTING_MODE_PRESERVE)
+        min_active_weight = float(self.portfolio_min_active_weight_spin.value())
+        max_asset_weight = float(self.portfolio_max_asset_weight_spin.value())
+        cash_reserve_weight = float(self.portfolio_cash_reserve_spin.value())
+        rebalance_mode = str(self.portfolio_rebalance_combo.currentData() or REBALANCE_MODE_ON_CHANGE)
+        self.portfolio_rank_count_spin.setEnabled(
+            study_mode == STUDY_MODE_PORTFOLIO
+            and ranking_mode in {RANKING_MODE_TOP_N, RANKING_MODE_TOP_N_OVER_SCORE_THRESHOLD}
+        )
+        self.portfolio_score_threshold_spin.setEnabled(
+            study_mode == STUDY_MODE_PORTFOLIO
+            and ranking_mode in {RANKING_MODE_SCORE_THRESHOLD, RANKING_MODE_TOP_N_OVER_SCORE_THRESHOLD}
+        )
+        self.portfolio_rebalance_every_spin.setEnabled(
+            study_mode == STUDY_MODE_PORTFOLIO
+            and rebalance_mode in {
+                REBALANCE_MODE_ON_CHANGE_OR_PERIODIC,
+                REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT,
+            }
+        )
+        self.portfolio_rebalance_drift_spin.setEnabled(
+            study_mode == STUDY_MODE_PORTFOLIO
+            and rebalance_mode in {
+                REBALANCE_MODE_ON_CHANGE_OR_DRIFT,
+                REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT,
+            }
+        )
+        dataset_ids = self._selected_study_dataset_ids()
+        self.portfolio_weights_edit.setEnabled(
+            study_mode == STUDY_MODE_PORTFOLIO and allocation_mode != PORTFOLIO_ALLOC_EQUAL
+        )
+        if study_mode != STUDY_MODE_PORTFOLIO:
+            self.portfolio_allocation_summary.setText(
+                "Portfolio allocation settings apply only when Study Mode is set to Portfolio."
+            )
+            return
+        if not dataset_ids:
+            self.portfolio_allocation_summary.setText("Select one or more datasets for the portfolio study.")
+            return
+        if ownership_mode == ALLOCATION_OWNERSHIP_STRATEGY and ranking_mode != RANKING_MODE_NONE:
+            self.portfolio_allocation_summary.setText(
+                "Strategy-Owned allocation cannot be combined with portfolio ranking. Switch to Hybrid or Portfolio-Owned."
+            )
+            return
+        if ownership_mode != ALLOCATION_OWNERSHIP_PORTFOLIO and weighting_mode != WEIGHTING_MODE_PRESERVE:
+            self.portfolio_allocation_summary.setText(
+                "Portfolio weighting overrides require Portfolio-Owned allocation. Strategy-Owned and Hybrid modes must preserve strategy sizing."
+            )
+            return
+        if min_active_weight > 0.0 and max_asset_weight > 0.0 and max_asset_weight < min_active_weight:
+            self.portfolio_allocation_summary.setText(
+                "Max Asset Weight must be greater than or equal to Min Active Weight."
+            )
+            return
+        if allocation_mode == PORTFOLIO_ALLOC_EQUAL:
+            allocation_text = f"Equal-weight portfolio across {len(dataset_ids)} selected dataset(s)."
+        else:
+            weights, errors = self._parse_portfolio_weights(
+                dataset_ids,
+                allocation_mode,
+                self.portfolio_weights_edit.text().strip(),
+            )
+            if errors:
+                self.portfolio_allocation_summary.setText(errors[0])
+                return
+            nonzero = [(dataset_id, weight) for dataset_id, weight in weights.items() if weight > 0]
+            preview = ", ".join(f"{dataset_id}={weight:g}" for dataset_id, weight in nonzero[:4]) or "all zero"
+            if len(nonzero) > 4:
+                preview = f"{preview}, ..."
+            if allocation_mode == PORTFOLIO_ALLOC_RELATIVE:
+                allocation_text = (
+                    f"Relative weights will be normalized across the selected datasets. Current weights: {preview}"
+                )
+            else:
+                allocation_text = (
+                    f"Fixed weights will be applied as absolute targets before gross-exposure capping. Current weights: {preview}"
+                )
+        ranking_text = "No cross-asset ranking."
+        if ranking_mode == RANKING_MODE_TOP_N:
+            ranking_text = f"Top-N ranking keeps the strongest {int(self.portfolio_rank_count_spin.value())} asset(s)."
+        elif ranking_mode == RANKING_MODE_SCORE_THRESHOLD:
+            ranking_text = (
+                f"Score-threshold ranking keeps only assets with score >= {float(self.portfolio_score_threshold_spin.value()):g}."
+            )
+        elif ranking_mode == RANKING_MODE_TOP_N_OVER_SCORE_THRESHOLD:
+            ranking_text = (
+                f"Top-N-over-threshold ranking keeps up to {int(self.portfolio_rank_count_spin.value())} asset(s) "
+                f"with score >= {float(self.portfolio_score_threshold_spin.value()):g}."
+            )
+        weighting_text = "Selected assets preserve their underlying strategy or target weights."
+        if weighting_mode == WEIGHTING_MODE_EQUAL_SELECTED:
+            weighting_text = "Selected assets are equal-weighted by the portfolio layer."
+        elif weighting_mode == WEIGHTING_MODE_SCORE_PROPORTIONAL:
+            weighting_text = "Selected assets are weighted in proportion to their portfolio score."
+        constraint_parts: list[str] = []
+        if min_active_weight > 0.0:
+            constraint_parts.append(f"drop allocations below {min_active_weight:g}")
+        if max_asset_weight > 0.0:
+            constraint_parts.append(f"cap any single asset at {max_asset_weight:g}")
+        if cash_reserve_weight > 0.0:
+            constraint_parts.append(f"hold {cash_reserve_weight:g} as cash reserve")
+        constraint_text = "No additional portfolio construction constraints."
+        if constraint_parts:
+            constraint_text = "Construction constraints: " + ", ".join(constraint_parts) + "."
+        rebalance_text = "Rebalance on target change only."
+        if rebalance_mode == REBALANCE_MODE_ON_CHANGE_OR_PERIODIC:
+            rebalance_text = (
+                f"Also rebalance every {int(self.portfolio_rebalance_every_spin.value())} bar(s) to manage drift."
+            )
+        elif rebalance_mode == REBALANCE_MODE_ON_CHANGE_OR_DRIFT:
+            rebalance_text = (
+                f"Also rebalance when any asset drifts by at least {float(self.portfolio_rebalance_drift_spin.value()):g} weight."
+            )
+        elif rebalance_mode == REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT:
+            rebalance_text = (
+                f"Also rebalance every {int(self.portfolio_rebalance_every_spin.value())} bar(s) and "
+                f"whenever any asset drifts by at least {float(self.portfolio_rebalance_drift_spin.value()):g} weight."
+            )
+        ownership_text = {
+            ALLOCATION_OWNERSHIP_STRATEGY: "Strategy-Owned allocation preserves strategy sizing.",
+            ALLOCATION_OWNERSHIP_PORTFOLIO: "Portfolio-Owned allocation uses strategy candidates and portfolio controls.",
+            ALLOCATION_OWNERSHIP_HYBRID: "Hybrid allocation keeps strategy weights but applies explicit portfolio filters.",
+        }.get(ownership_mode, "Unknown ownership mode.")
+        self.portfolio_allocation_summary.setText(
+            f"{ownership_text} {allocation_text} {ranking_text} {weighting_text} {constraint_text} {rebalance_text}"
+        )
+
     def _refresh_dataset_options(self, select_id: str | None = None) -> None:
         try:
-            store = DuckDBStore()
-            opts = []
-            for path in store.data_dir.glob("*.parquet"):
-                if path.is_file():
-                    opts.append(path.stem)
-            opts = sorted(set(opts))
+            opts = self._available_dataset_ids()
             self.dataset_combo.blockSignals(True)
             self.dataset_combo.clear()
             self.dataset_combo.addItems(opts)
@@ -2255,11 +3663,76 @@ WantedBy=default.target
                 self.dataset_combo.setCurrentText(select_id)
             elif opts:
                 self.dataset_combo.setCurrentIndex(0)
+            self.study_dataset_ids = [dataset_id for dataset_id in self.study_dataset_ids if dataset_id in opts]
+            self.portfolio_target_weights = {
+                dataset_id: weight
+                for dataset_id, weight in self.portfolio_target_weights.items()
+                if dataset_id in opts
+            }
+            self._update_study_dataset_summary()
         except Exception:
             # Best-effort; leave combo as-is if listing fails.
             pass
 
+    def _available_dataset_ids(self) -> list[str]:
+        store = DuckDBStore()
+        opts = []
+        for path in store.data_dir.glob("*.parquet"):
+            if path.is_file():
+                opts.append(path.stem)
+        return sorted(set(opts))
+
+    def _selected_study_dataset_ids(self) -> list[str]:
+        explicit = [dataset_id for dataset_id in self.study_dataset_ids if dataset_id]
+        if explicit:
+            return explicit
+        current = self.dataset_combo.currentText().strip()
+        return [current] if current else []
+
+    def _update_study_dataset_summary(self) -> None:
+        if not hasattr(self, "study_dataset_summary"):
+            return
+        dataset_ids = self._selected_study_dataset_ids()
+        if not dataset_ids:
+            self.study_dataset_summary.setText("")
+            self.study_dataset_summary.setToolTip("")
+            self._update_portfolio_allocation_summary()
+            return
+        if len(dataset_ids) == 1 and not self.study_dataset_ids:
+            label = f"Current dataset only: {dataset_ids[0]}"
+        elif len(dataset_ids) <= 3:
+            label = ", ".join(dataset_ids)
+        else:
+            label = f"{len(dataset_ids)} datasets selected"
+        self.study_dataset_summary.setText(label)
+        self.study_dataset_summary.setToolTip("\n".join(dataset_ids))
+        self._update_portfolio_allocation_summary()
+
+    def _choose_study_datasets(self) -> None:
+        available = self._available_dataset_ids()
+        if not available:
+            QtWidgets.QMessageBox.information(self, "No datasets", "No datasets are available in the local store yet.")
+            return
+        initial = self._selected_study_dataset_ids()
+        dlg = DatasetSelectionDialog(available, initial, self)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        selected = dlg.selected_datasets()
+        current = self.dataset_combo.currentText().strip()
+        if len(selected) == 1 and selected[0] == current:
+            self.study_dataset_ids = []
+        else:
+            self.study_dataset_ids = selected
+        self._update_study_dataset_summary()
+
+    def _reset_study_datasets_to_current(self) -> None:
+        self.study_dataset_ids = []
+        self._update_study_dataset_summary()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._closing = True
+        if self._magellan_warm_timer.isActive():
+            self._magellan_warm_timer.stop()
         if self.worker and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait(2000)
@@ -2267,110 +3740,158 @@ WantedBy=default.target
         event.accept()
 
     def _warm_magellan(self) -> None:
+        if self._closing:
+            return
         try:
             self.magellan.ensure_running(timeout_ms=2500)
         except Exception:
             # Keep warmup best-effort so the dashboard still opens even if Magellan is unavailable.
             pass
 
+    def _snapshot_root_for_run(self, run: "RunRow") -> Path:
+        return self.snapshot_exporter.root_dir / str(run.run_id)
+
+    def _existing_snapshot_root_for_run(self, run: "RunRow") -> Path | None:
+        snapshot_root = self._snapshot_root_for_run(run)
+        manifest_path = snapshot_root / "manifest.json"
+        if manifest_path.exists():
+            return snapshot_root.resolve()
+        return None
+
+    def _rebuild_portfolio_result_for_run(self, run: "RunRow"):
+        params = json.loads(run.params) if isinstance(run.params, str) else (run.params or {})
+        assets_payload = params.get("assets") or []
+        if not assets_payload:
+            raise ValueError(
+                "This portfolio run does not contain asset definitions needed to rebuild a chart snapshot."
+            )
+
+        execution_cfg = dict(params.get("execution_config") or {})
+        construction_cfg = dict(params.get("construction_config") or {})
+        timeframe = str(run.timeframe or "1 minutes")
+        duck = DuckDBStore()
+        assets: list[PortfolioExecutionAsset] = []
+        for asset_payload in assets_payload:
+            dataset_id = str(asset_payload.get("dataset_id") or "").strip()
+            if not dataset_id:
+                raise ValueError("A saved portfolio asset is missing dataset_id.")
+            data = duck.resample(dataset_id, timeframe)
+            if data is None or data.empty:
+                raise ValueError(
+                    f"Historical data is unavailable for portfolio asset '{dataset_id}' at timeframe '{timeframe}'."
+                )
+            strategy_cls = RunChartDialog._strategy_class_static(str(asset_payload.get("strategy") or ""))
+            assets.append(
+                PortfolioExecutionAsset(
+                    dataset_id=dataset_id,
+                    data=data,
+                    strategy_cls=strategy_cls,
+                    strategy_params=dict(asset_payload.get("params") or {}),
+                    target_weight=asset_payload.get("target_weight"),
+                )
+            )
+
+        config = BacktestConfig(
+            timeframe=timeframe,
+            starting_cash=(
+                float(run.starting_cash)
+                if getattr(run, "starting_cash", None) is not None
+                else float(execution_cfg.get("starting_cash", 100_000.0))
+            ),
+            fee_rate=float(execution_cfg.get("fee_rate", self.bt_settings.get("fee_rate", 0.0002))),
+            fee_schedule=execution_cfg.get(
+                "fee_schedule",
+                self.bt_settings.get("fee_schedule", {"buy": 0.0003, "sell": 0.0005}),
+            ),
+            slippage=float(execution_cfg.get("slippage", self.bt_settings.get("slippage", 0.0002))),
+            slippage_schedule=execution_cfg.get(
+                "slippage_schedule",
+                self.bt_settings.get("slippage_schedule", {"buy": 0.0003, "sell": 0.0001}),
+            ),
+            fill_ratio=float(execution_cfg.get("fill_ratio", self.bt_settings.get("fill_ratio", 1.0))),
+            fill_on_close=bool(execution_cfg.get("fill_on_close", self.bt_settings.get("fill_on_close", False))),
+            allow_short=False,
+            use_cache=False,
+            base_execution=False,
+            time_horizon_start=str(run.start) if getattr(run, "start", None) else None,
+            time_horizon_end=str(run.end) if getattr(run, "end", None) else None,
+            prevent_scale_in=bool(
+                execution_cfg.get("prevent_scale_in", self.bt_settings.get("prevent_scale_in", True))
+            ),
+            one_order_per_signal=bool(
+                execution_cfg.get("one_order_per_signal", self.bt_settings.get("one_order_per_signal", True))
+            ),
+            risk_free_rate=float(execution_cfg.get("risk_free_rate", self.bt_settings.get("risk_free_rate", 0.0))),
+        )
+        orchestrator = ExecutionOrchestrator()
+        portfolio_result = orchestrator.execute_portfolio(
+            PortfolioExecutionRequest(
+                assets=assets,
+                config=config,
+                catalog=None,
+                requested_execution_mode=ExecutionMode.VECTORIZED,
+                normalize_weights=bool(params.get("normalize_weights", True)),
+                portfolio_dataset_id=str(run.dataset_id),
+                construction_config=PortfolioConstructionConfig(**construction_cfg),
+                logical_run_id=str(getattr(run, "logical_run_id", "") or ""),
+            )
+        )
+        return portfolio_result.result
+
+    def _ensure_portfolio_snapshot(self, run: "RunRow") -> Path:
+        existing = self._existing_snapshot_root_for_run(run)
+        if existing is not None:
+            return existing
+        portfolio_result = self._rebuild_portfolio_result_for_run(run)
+        artifact = self.snapshot_exporter.export_portfolio_snapshot(
+            run=run,
+            portfolio_result=portfolio_result,
+            overwrite=True,
+        )
+        return artifact.snapshot_root
+
+    def _build_portfolio_chart_payload_for_run(self, run: "RunRow"):
+        portfolio_result = self._rebuild_portfolio_result_for_run(run)
+        report = summarize_portfolio_result(
+            portfolio_result,
+            starting_cash=(
+                float(run.starting_cash) if getattr(run, "starting_cash", None) is not None else None
+            ),
+        )
+        return portfolio_result, report
+
+    def _build_portfolio_report_for_run(self, run: "RunRow"):
+        _, report = self._build_portfolio_chart_payload_for_run(run)
+        return report
+
     def _open_run_chart_in_magellan(self, run: "RunRow") -> bool:
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
-            bars = RunChartDialog._load_bars_utc_static(run)
-            if bars is None or bars.empty:
-                raise MagellanError("No bar data is available for this run.")
+            if (run.engine_impl or "").lower() == "vectorized_portfolio":
+                snapshot_root = self._ensure_portfolio_snapshot(run)
+            else:
+                bars = RunChartDialog._load_bars_utc_static(run)
+                if bars is None or bars.empty:
+                    raise MagellanError(RunChartDialog._missing_run_data_message_static(run))
 
-            overlay_defs, pane_defs = RunChartDialog._build_magellan_indicator_defs_static(run, bars)
-            trade_markers, equity_points = RunChartDialog._build_magellan_trade_payload_static(
-                run,
-                self.catalog.db_path,
-                bars,
-            )
+                overlays, panes, series_styles = RunChartDialog._build_snapshot_series_static(run, bars)
+                trades_df = ChartSnapshotExporter.build_trade_frame(run, self.catalog.db_path, bars)
+                equity_curve = ChartSnapshotExporter.build_equity_curve(run, bars, trades_df)
+                snapshot = self.snapshot_exporter.export_backtest_snapshot(
+                    run=run,
+                    bars=bars,
+                    overlays=overlays,
+                    panes=panes,
+                    series_styles=series_styles,
+                    equity_curve=equity_curve,
+                    trades_df=trades_df,
+                )
+                snapshot_root = snapshot.snapshot_root
 
             if not self.magellan.ensure_running(timeout_ms=5000):
                 raise MagellanError(self.magellan.last_error or "Magellan is unavailable.")
 
-            session_id = f"backtest-run-{run.run_id}"
-            title = run.dataset_id
-            subtitle = f"{run.strategy} | {run.timeframe} | {run.run_id[:12]}..."
-            self.magellan.open_live_session(
-                session_id,
-                title=title,
-                subtitle=subtitle,
-                status_text="Loading historical run...",
-            )
-
-            timestamps_ns = bars.index.view("int64")
-            opens = bars["open"].to_numpy(dtype=float)
-            highs = bars["high"].to_numpy(dtype=float)
-            lows = bars["low"].to_numpy(dtype=float)
-            closes = bars["close"].to_numpy(dtype=float)
-            volumes = bars["volume"].to_numpy(dtype=float) if "volume" in bars.columns else np.zeros(len(bars), dtype=float)
-            chunk_size = 1500
-            equity_chunks: dict[int, list[dict]] = {}
-            marker_chunks: dict[int, list[dict]] = {}
-            for point in equity_points:
-                equity_chunks.setdefault(int(point["bar_index"]) // chunk_size, []).append(point)
-            for marker in trade_markers:
-                marker_chunks.setdefault(int(marker["bar_index"]) // chunk_size, []).append(marker)
-
-            def build_series_chunk(series_defs: list[tuple[str, str, np.ndarray]], start: int, stop: int) -> list[dict]:
-                series_payload: list[dict] = []
-                ts_chunk = timestamps_ns[start:stop]
-                for name, color, values in series_defs:
-                    points = [
-                        {
-                            "timestamp_utc_ns": str(int(ts_ns)),
-                            "value": float(value),
-                            "bar_index": start + offset,
-                        }
-                        for offset, (ts_ns, value) in enumerate(zip(ts_chunk, values[start:stop]))
-                        if np.isfinite(value)
-                    ]
-                    if points:
-                        series_payload.append({"name": name, "color": color, "points": points})
-                return series_payload
-
-            for chunk_idx, start in enumerate(range(0, len(bars), chunk_size), start=1):
-                stop = min(start + chunk_size, len(bars))
-                bar_payload = [
-                    {
-                        "timestamp_utc_ns": str(int(timestamps_ns[row])),
-                        "open": float(opens[row]),
-                        "high": float(highs[row]),
-                        "low": float(lows[row]),
-                        "close": float(closes[row]),
-                        "volume": float(volumes[row]),
-                        "bar_index": row,
-                    }
-                    for row in range(start, stop)
-                ]
-                overlay_payload = build_series_chunk(overlay_defs, start, stop)
-                pane_payload = build_series_chunk(pane_defs, start, stop)
-                chunk_key = start // chunk_size
-                chunk_equity_points = equity_chunks.get(chunk_key, [])
-                equity_payload = [{"name": "Equity", "color": "#27d07d", "points": chunk_equity_points}] if chunk_equity_points else []
-                marker_payload = marker_chunks.get(chunk_key, [])
-                is_last_chunk = stop >= len(bars)
-                status_text = (
-                    "Historical run ready."
-                    if is_last_chunk
-                    else f"Loading historical run... {stop:,}/{len(bars):,} bars"
-                )
-                self.magellan.send_live_update(
-                    session_id,
-                    title=title if is_last_chunk else "",
-                    subtitle=subtitle if is_last_chunk else "",
-                    status_text=status_text,
-                    bars=bar_payload,
-                    overlay_series=overlay_payload,
-                    pane_series=pane_payload,
-                    equity_series=equity_payload,
-                    trade_markers=marker_payload,
-                    timeout_ms=1500,
-                )
-                if chunk_idx % 8 == 0:
-                    QtCore.QCoreApplication.processEvents()
+            self.magellan.open_snapshot(snapshot_root)
             return True
         except Exception as exc:
             self.magellan._last_error = str(exc)
@@ -2385,12 +3906,16 @@ WantedBy=default.target
         if not batch:
             return
         runs = self.catalog.load_runs(batch.batch_id)
-        dlg = BatchDetailDialog(batch, runs, self.catalog.db_path, self)
+        benchmarks = self._batch_benchmark_cache.get(batch.batch_id)
+        if benchmarks is None:
+            benchmarks = self.catalog.load_batch_benchmarks(batch.batch_id)
+            self._batch_benchmark_cache[batch.batch_id] = benchmarks
+        dlg = BatchDetailDialog(batch, runs, self.catalog.db_path, self, batch_benchmarks=benchmarks)
         dlg.exec()
 
     # -- strategies ----------------------------------------------------------
     def _init_strategy_selector(self) -> None:
-        self.strategy_specs: Dict[str, Dict[str, Tuple[type, type, float]]] = {
+        self.strategy_specs: Dict[str, Dict[str, object]] = {
             "SMA Crossover": {
                 "class": SMACrossStrategy,
                 "params": {
@@ -2406,6 +3931,23 @@ WantedBy=default.target
                     "exit_len": (int, 10),
                     "atr_len": (int, 14),
                     "atr_mult": (float, 2.0),
+                    "target": (float, 1.0),
+                },
+            },
+            "Z-Score Mean Reversion": {
+                "class": ZScoreMeanReversionStrategy,
+                "params": {
+                    "half_life_lookback": (int, 100),
+                    "half_life_factor": (float, 1.5),
+                    "std_len": (int, 20),
+                    "z_smooth_type": (str, "None"),
+                    "z_smooth_len": (int, 5),
+                    "use_vol_norm": (bool, True),
+                    "vol_type": (str, "ATR"),
+                    "vol_len": (int, 14),
+                    "atr_mult": (float, 1.0),
+                    "long_entry_z": (float, -1.0),
+                    "long_exit_z": (float, 0.0),
                     "target": (float, 1.0),
                 },
             },
@@ -2428,9 +3970,27 @@ WantedBy=default.target
         for param, (_, default) in spec["params"].items():
             edit = QtWidgets.QLineEdit(str(default))
             edit.setPlaceholderText("comma list or start:end:step (e.g., 5,10,15 or 5:15:5)")
-            edit.setToolTip("Enter comma-separated values or range notation start:end:step for step sizes.")
+            edit.setToolTip(
+                "Enter comma-separated values.\n"
+                "Numeric params also support range notation start:end:step.\n"
+                "String params accept literals like None,SMA,EMA.\n"
+                "Boolean params accept true/false."
+            )
             self.strategy_params_box.addRow(QtWidgets.QLabel(param), edit)
             self.param_inputs[param] = edit
+
+    @staticmethod
+    def _parse_strategy_param_value(ptype: type, token: str):
+        if ptype is bool:
+            lowered = token.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+            raise ValueError(f"invalid boolean literal: {token}")
+        if ptype is str:
+            return token.strip()
+        return ptype(token)
 
     def _collect_strategy_params(self):
         name = self.strategy_combo.currentText()
@@ -2452,11 +4012,11 @@ WantedBy=default.target
                     if not token:
                         continue
                     try:
-                        if ":" in token:
+                        if ":" in token and ptype in {int, float}:
                             start_s, end_s, step_s = token.split(":")
-                            start_v = ptype(start_s)
-                            end_v = ptype(end_s)
-                            step_v = ptype(step_s)
+                            start_v = self._parse_strategy_param_value(ptype, start_s)
+                            end_v = self._parse_strategy_param_value(ptype, end_s)
+                            step_v = self._parse_strategy_param_value(ptype, step_s)
                             if step_v == 0:
                                 raise ValueError("step cannot be 0")
                             current = start_v
@@ -2464,7 +4024,7 @@ WantedBy=default.target
                                 vals.append(current)
                                 current = ptype(current + step_v)
                         else:
-                            vals.append(ptype(token))
+                            vals.append(self._parse_strategy_param_value(ptype, token))
                     except Exception:
                         errors.append(f"{key}: '{token}'")
                 if not vals:
@@ -2511,11 +4071,20 @@ WantedBy=default.target
 
 
 class BatchDetailDialog(QtWidgets.QDialog):
-    def __init__(self, batch: BatchRow, runs: List[RunRow], catalog_path: Path, parent=None) -> None:
+    def __init__(
+        self,
+        batch: BatchRow,
+        runs: List[RunRow],
+        catalog_path: Path,
+        parent=None,
+        batch_benchmarks: Sequence[BatchExecutionBenchmark] = (),
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Batch {batch.batch_id}")
         self.resize(900, 600)
         self.catalog_path = catalog_path
+        self.runs = list(runs)
+        self.batch_benchmarks = tuple(batch_benchmarks)
 
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QLabel(
@@ -2525,27 +4094,54 @@ class BatchDetailDialog(QtWidgets.QDialog):
         )
         header.setObjectName("Sub")
         layout.addWidget(header)
+        self.benchmark_summary = QtWidgets.QLabel(_summarize_batch_benchmarks(self.batch_benchmarks))
+        self.benchmark_summary.setObjectName("Sub")
+        self.benchmark_summary.setWordWrap(True)
+        self.benchmark_summary.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.benchmark_summary)
 
-        model = RunsTableModel(runs)
-        table = QtWidgets.QTableView()
-        table.setModel(model)
-        table.setAlternatingRowColors(True)
-        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.verticalHeader().setVisible(False)
-        table.setObjectName("Panel")
-        table.doubleClicked.connect(lambda idx: self._open_run_chart(model, idx))
+        actions = QtWidgets.QHBoxLayout()
+        self.open_chart_btn = QtWidgets.QPushButton("Open Selected Chart")
+        self.open_chart_btn.clicked.connect(self._open_selected_run_chart)
+        self.compare_btn = QtWidgets.QPushButton("Compare Engines")
+        self.compare_btn.clicked.connect(self._compare_selected_run)
+        self.compare_batch_btn = QtWidgets.QPushButton("Compare Batch")
+        self.compare_batch_btn.clicked.connect(self._compare_batch_runs)
+        self.portfolio_report_btn = QtWidgets.QPushButton("Portfolio Report")
+        self.portfolio_report_btn.clicked.connect(self._open_selected_portfolio_report)
+        self.benchmark_btn = QtWidgets.QPushButton("Benchmarks")
+        self.benchmark_btn.clicked.connect(self._show_batch_benchmarks)
+        actions.addWidget(self.open_chart_btn)
+        actions.addWidget(self.compare_btn)
+        actions.addWidget(self.compare_batch_btn)
+        actions.addWidget(self.portfolio_report_btn)
+        actions.addWidget(self.benchmark_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.model = RunsTableModel(runs)
+        self.table = QtWidgets.QTableView()
+        self.table.setModel(self.model)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setObjectName("Panel")
+        self.table.doubleClicked.connect(lambda idx: self._open_run_chart(self.model, idx))
         # Add log/download buttons per row for trades.
         for r_idx, run in enumerate(runs):
             log_btn = QtWidgets.QPushButton("Log")
             log_btn.clicked.connect(lambda _, rr=run: self._open_trades_log(rr))
-            table.setIndexWidget(model.index(r_idx, model.columnCount() - 2), log_btn)
+            self.table.setIndexWidget(self.model.index(r_idx, self.model.columnCount() - 2), log_btn)
             btn = QtWidgets.QPushButton("Download")
             btn.clicked.connect(lambda _, rr=run: self._download_trades(rr))
-            table.setIndexWidget(model.index(r_idx, model.columnCount() - 1), btn)
-        layout.addWidget(table)
+            self.table.setIndexWidget(self.model.index(r_idx, self.model.columnCount() - 1), btn)
+        if self.model.rowCount() > 0:
+            self.table.selectRow(0)
+        layout.addWidget(self.table)
 
-    def _collect_backtest_settings(self) -> Dict[str, float | bool | dict]:
+    def _collect_backtest_settings(self) -> Dict[str, float | bool | dict | str]:
         parent = self.parent()
         if parent and hasattr(parent, "_collect_backtest_settings"):
             try:
@@ -2566,6 +4162,22 @@ class BatchDetailDialog(QtWidgets.QDialog):
             "use_cache": False,
             "prevent_scale_in": True,
             "one_order_per_signal": True,
+            "execution_mode": ExecutionMode.AUTO.value,
+            "study_mode": STUDY_MODE_INDEPENDENT,
+            "portfolio_allocation_mode": PORTFOLIO_ALLOC_EQUAL,
+            "portfolio_weights_text": "",
+            "portfolio_target_weights": {},
+            "portfolio_ownership_mode": ALLOCATION_OWNERSHIP_STRATEGY,
+            "portfolio_ranking_mode": RANKING_MODE_NONE,
+            "portfolio_rank_count": 1,
+            "portfolio_score_threshold": 0.0,
+            "portfolio_weighting_mode": WEIGHTING_MODE_PRESERVE,
+            "portfolio_min_active_weight": 0.0,
+            "portfolio_max_asset_weight": 0.0,
+            "portfolio_cash_reserve_weight": 0.0,
+            "portfolio_rebalance_mode": REBALANCE_MODE_ON_CHANGE,
+            "portfolio_rebalance_every_n_bars": 20,
+            "portfolio_rebalance_drift_threshold": 0.05,
         }
 
     def _open_run_chart(self, model: RunsTableModel, index: QtCore.QModelIndex) -> None:
@@ -2575,7 +4187,40 @@ class BatchDetailDialog(QtWidgets.QDialog):
         if row < 0 or row >= model.rowCount():
             return
         run = model._runs[row]
+        self._open_run_chart_for_run(run)
+
+    def _selected_run(self) -> RunRow | None:
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return self.runs[0] if self.runs else None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return self.runs[0] if self.runs else None
+        row = rows[0].row()
+        if row < 0 or row >= len(self.runs):
+            return None
+        return self.runs[row]
+
+    def _open_selected_run_chart(self) -> None:
+        run = self._selected_run()
+        if run is None:
+            QtWidgets.QMessageBox.information(self, "No run selected", "Select a run first.")
+            return
+        self._open_run_chart_for_run(run)
+
+    def _open_run_chart_for_run(self, run: RunRow) -> None:
+        is_portfolio = (run.engine_impl or "").lower() == "vectorized_portfolio"
+        if not is_portfolio:
+            bars_utc = RunChartDialog._load_bars_utc_static(run)
+            if bars_utc is None or bars_utc.empty:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Historical Data Unavailable",
+                    RunChartDialog._missing_run_data_message_static(run),
+                )
+                return
         parent = self.parent()
+        portfolio_fallback_reason = ""
         if parent and hasattr(parent, "_open_run_chart_in_magellan"):
             try:
                 if parent._open_run_chart_in_magellan(run):  # type: ignore[attr-defined]
@@ -2583,19 +4228,124 @@ class BatchDetailDialog(QtWidgets.QDialog):
                 magellan = getattr(parent, "magellan", None)
                 magellan_error = getattr(magellan, "last_error", "")
                 if magellan_error:
+                    if is_portfolio:
+                        portfolio_fallback_reason = str(magellan_error)
                     QtWidgets.QMessageBox.warning(
                         self,
                         "Magellan unavailable",
                         f"{magellan_error}\n\nFalling back to the built-in chart viewer.",
                     )
             except Exception as exc:
+                if is_portfolio:
+                    portfolio_fallback_reason = str(exc)
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Magellan unavailable",
                     f"{exc}\n\nFalling back to the built-in chart viewer.",
                 )
+        if is_portfolio:
+            if parent is None or not hasattr(parent, "_build_portfolio_chart_payload_for_run"):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Portfolio Chart Unavailable",
+                    "This portfolio run could not be opened because the built-in fallback viewer is unavailable.",
+                )
+                return
+            try:
+                portfolio_result, report = parent._build_portfolio_chart_payload_for_run(run)  # type: ignore[attr-defined]
+            except Exception as exc:
+                detail = f"{portfolio_fallback_reason}\n\n" if portfolio_fallback_reason else ""
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Portfolio Chart Error",
+                    f"{detail}{exc}",
+                )
+                return
+            try:
+                dlg = PortfolioRunChartDialog(run, portfolio_result, report, self)
+                dlg.exec()
+            except Exception as exc:
+                detail = f"{portfolio_fallback_reason}\n\n" if portfolio_fallback_reason else ""
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Portfolio Chart Error",
+                    f"{detail}{exc}",
+                )
+            return
         bt_settings = self._collect_backtest_settings()
         dlg = RunChartDialog(run, self.catalog_path, bt_settings, self)
+        dlg.exec()
+
+    def _compare_selected_run(self) -> None:
+        run = self._selected_run()
+        if run is None:
+            QtWidgets.QMessageBox.information(self, "No run selected", "Select a run first.")
+            return
+        if not run.logical_run_id:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Comparison Unavailable",
+                "This run does not have a logical run id, so engine peers cannot be matched automatically.",
+            )
+            return
+        peers = CatalogReader(self.catalog_path).load_runs_for_logical_run_id(run.logical_run_id)
+        if not peers:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Comparison Unavailable",
+                "No peer runs were found for this logical run id.",
+            )
+            return
+        dlg = EngineComparisonDialog(run, peers, self.catalog_path, self._collect_backtest_settings(), self)
+        dlg.exec()
+
+    def _compare_batch_runs(self) -> None:
+        if not self.runs:
+            QtWidgets.QMessageBox.information(self, "Comparison Unavailable", "This batch has no runs to compare.")
+            return
+        dlg = BatchEngineComparisonDialog(
+            self.runs,
+            self.catalog_path,
+            self._collect_backtest_settings(),
+            self,
+            batch_benchmarks=self.batch_benchmarks,
+        )
+        dlg.exec()
+
+    def _show_batch_benchmarks(self) -> None:
+        dlg = BatchBenchmarkDialog(self.batch_benchmarks, self)
+        dlg.exec()
+
+    def _open_selected_portfolio_report(self) -> None:
+        run = self._selected_run()
+        if run is None:
+            QtWidgets.QMessageBox.information(self, "No run selected", "Select a run first.")
+            return
+        if (run.engine_impl or "").lower() != "vectorized_portfolio":
+            QtWidgets.QMessageBox.information(
+                self,
+                "Portfolio Report Unavailable",
+                "Portfolio attribution reports are currently available only for vectorized portfolio runs.",
+            )
+            return
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "_build_portfolio_report_for_run"):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Portfolio Report Unavailable",
+                "The parent window cannot build a portfolio report for this run.",
+            )
+            return
+        try:
+            report = parent._build_portfolio_report_for_run(run)  # type: ignore[attr-defined]
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Portfolio Report Error",
+                str(exc),
+            )
+            return
+        dlg = PortfolioReportDialog(run, report, self)
         dlg.exec()
 
     def _open_trades_log(self, run: RunRow) -> None:
@@ -2657,6 +4407,958 @@ class BatchDetailDialog(QtWidgets.QDialog):
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Trades CSV", f"{run.run_id[:10]}_trades.csv", "CSV Files (*.csv)")
             if path:
                 df.to_csv(path, index=False)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export error", str(exc))
+
+
+class BatchBenchmarkDialog(QtWidgets.QDialog):
+    def __init__(self, benchmarks: Sequence[BatchExecutionBenchmark], parent=None) -> None:
+        super().__init__(parent)
+        self.benchmarks = list(benchmarks)
+        self.setWindowTitle("Batch Benchmarks")
+        self.resize(1140, 720)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        summary = QtWidgets.QLabel(_summarize_batch_benchmarks(self.benchmarks))
+        summary.setObjectName("Sub")
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(summary)
+
+        if not self.benchmarks:
+            empty = QtWidgets.QLabel(
+                "No benchmark data is available for this batch yet."
+            )
+            empty.setObjectName("Sub")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(self.accept)
+            layout.addWidget(close_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+            return
+
+        self.figure = Figure(figsize=(10.5, 3.4), tight_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas)
+        self._draw_charts()
+
+        self.table = QtWidgets.QTableWidget(len(self.benchmarks), 13)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Engine",
+                "Dataset",
+                "Requested",
+                "Resolved",
+                "Timeframe",
+                "Bars",
+                "Params",
+                "Cached",
+                "Uncached",
+                "Duration",
+                "Chunks",
+                "Chunk Sizes",
+                "Prepared Reuse",
+            ]
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setObjectName("Panel")
+        for row_idx, benchmark in enumerate(self.benchmarks):
+            self._populate_row(row_idx, benchmark)
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
+        layout.addWidget(self.table)
+
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+    def _populate_row(self, row_idx: int, benchmark: BatchExecutionBenchmark) -> None:
+        values = [
+            benchmark.engine_impl,
+            benchmark.dataset_id,
+            benchmark.requested_execution_mode.value.title(),
+            benchmark.resolved_execution_mode.value.title(),
+            benchmark.timeframe,
+            str(benchmark.bars),
+            str(benchmark.total_params),
+            str(benchmark.cached_runs),
+            str(benchmark.uncached_runs),
+            _format_seconds_precise(benchmark.duration_seconds),
+            str(benchmark.chunk_count),
+            ", ".join(str(size) for size in benchmark.chunk_sizes) if benchmark.chunk_sizes else "—",
+            "Yes" if benchmark.prepared_context_reused else "No",
+        ]
+        for col_idx, value in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(value)
+            if col_idx == 10:
+                detail = [
+                    f"Dataset: {benchmark.dataset_id}",
+                    f"Strategy: {benchmark.strategy}",
+                    f"Engine: {benchmark.engine_impl} v{benchmark.engine_version}",
+                ]
+                if benchmark.effective_param_batch_size is not None:
+                    detail.append(f"Effective batch size: {benchmark.effective_param_batch_size}")
+                item.setToolTip("\n".join(detail))
+            self.table.setItem(row_idx, col_idx, item)
+
+    def _draw_charts(self) -> None:
+        self.figure.clear()
+        if not self.benchmarks:
+            self.canvas.draw_idle()
+            return
+        labels = [
+            f"{benchmark.dataset_id}\n{benchmark.timeframe}\n{benchmark.engine_impl}"
+            for benchmark in self.benchmarks
+        ]
+        x = np.arange(len(self.benchmarks))
+        duration_ax = self.figure.add_subplot(1, 2, 1)
+        throughput_ax = self.figure.add_subplot(1, 2, 2)
+
+        duration_colors = [
+            PALETTE["green"] if benchmark.resolved_execution_mode == ExecutionMode.VECTORIZED else PALETTE["blue"]
+            for benchmark in self.benchmarks
+        ]
+        duration_values = [benchmark.duration_seconds for benchmark in self.benchmarks]
+        duration_bars = duration_ax.bar(x, duration_values, color=duration_colors, alpha=0.9)
+        duration_ax.set_title("Batch Duration")
+        duration_ax.set_ylabel("Seconds")
+        duration_ax.set_xticks(x)
+        duration_ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+        duration_ax.grid(axis="y", alpha=0.2)
+        for bar, seconds in zip(duration_bars, duration_values):
+            duration_ax.text(
+                bar.get_x() + (bar.get_width() / 2),
+                bar.get_height(),
+                _format_seconds_precise(seconds),
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=PALETTE["text"],
+            )
+
+        cached = np.array([benchmark.cached_runs for benchmark in self.benchmarks], dtype=float)
+        uncached = np.array([benchmark.uncached_runs for benchmark in self.benchmarks], dtype=float)
+        throughput_ax.bar(x, cached, label="Cached", color=PALETTE["blue"], alpha=0.75)
+        throughput_ax.bar(x, uncached, bottom=cached, label="Uncached", color=PALETTE["amber"], alpha=0.85)
+        throughput_ax.set_title("Run Composition")
+        throughput_ax.set_ylabel("Run Count")
+        throughput_ax.set_xticks(x)
+        throughput_ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+        throughput_ax.grid(axis="y", alpha=0.2)
+        chunk_ax = throughput_ax.twinx()
+        chunk_values = [benchmark.chunk_count for benchmark in self.benchmarks]
+        chunk_ax.plot(x, chunk_values, color=PALETTE["red"], marker="o", linewidth=1.8, label="Chunks")
+        chunk_ax.set_ylabel("Chunks")
+
+        handles_1, labels_1 = throughput_ax.get_legend_handles_labels()
+        handles_2, labels_2 = chunk_ax.get_legend_handles_labels()
+        throughput_ax.legend(handles_1 + handles_2, labels_1 + labels_2, loc="upper right", fontsize=8)
+        self.canvas.draw_idle()
+
+
+class EngineComparisonDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        anchor_run: RunRow,
+        peer_runs: List[RunRow],
+        catalog_path: Path,
+        bt_settings: Dict[str, float | bool | dict | str],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.anchor_run = anchor_run
+        self.runs = sorted(peer_runs, key=self._row_sort_key, reverse=True)
+        self.catalog_path = Path(catalog_path)
+        self.bt_settings = bt_settings
+        self.summary = summarize_engine_runs(self.runs)
+
+        self.setWindowTitle(f"Compare Engines | {anchor_run.strategy}")
+        self.resize(1050, 620)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel(
+            f"Strategy: {anchor_run.strategy} | Dataset: {anchor_run.dataset_id} | Timeframe: {anchor_run.timeframe}\n"
+            f"Logical Run ID: {anchor_run.logical_run_id or '—'}\n"
+            f"Params: {anchor_run.params}"
+        )
+        header.setObjectName("Sub")
+        header.setWordWrap(True)
+        header.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(header)
+
+        summary_label = QtWidgets.QLabel(self._summary_text(self.summary, anchor_run))
+        summary_label.setObjectName("Sub")
+        summary_label.setWordWrap(True)
+        summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(summary_label)
+
+        self.table = QtWidgets.QTableWidget(len(self.runs), 11)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Engine",
+                "Requested",
+                "Resolved",
+                "Version",
+                "Duration",
+                "Total Return",
+                "Sharpe",
+                "Rolling Sharpe",
+                "Max DD",
+                "Status",
+                "Run ID",
+            ]
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setObjectName("Panel")
+        self.table.doubleClicked.connect(lambda _: self._open_selected_chart())
+        for row_idx, run in enumerate(self.runs):
+            self._populate_row(row_idx, run)
+            if run.run_id == anchor_run.run_id:
+                self.table.selectRow(row_idx)
+        if self.table.rowCount() > 0 and not self.table.selectionModel().hasSelection():
+            self.table.selectRow(0)
+        layout.addWidget(self.table)
+
+        button_row = QtWidgets.QHBoxLayout()
+        open_btn = QtWidgets.QPushButton("Open Selected Chart")
+        open_btn.clicked.connect(self._open_selected_chart)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        button_row.addWidget(open_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+    @staticmethod
+    def _row_sort_key(run: RunRow) -> tuple[int, int, int, str]:
+        engine = (run.engine_impl or run.resolved_execution_mode or run.requested_execution_mode or "").lower()
+        engine_rank = 2
+        if engine == "vectorized":
+            engine_rank = 1
+        elif engine == "reference":
+            engine_rank = 0
+        finished = _parse_catalog_timestamp(run.run_finished_at)
+        started = _parse_catalog_timestamp(run.run_started_at)
+        finished_score = finished.value if finished is not None else -1
+        started_score = started.value if started is not None else -1
+        return (engine_rank, finished_score, started_score, run.run_id)
+
+    def _populate_row(self, row_idx: int, run: RunRow) -> None:
+        metrics = run.metrics or {}
+        values = [
+            (run.engine_impl or "—").title(),
+            (run.requested_execution_mode or "—").title(),
+            (run.resolved_execution_mode or "—").title(),
+            run.engine_version or "—",
+            _format_duration(run.run_started_at, run.run_finished_at),
+            self._format_metric(metrics.get("total_return"), precision=4),
+            self._format_metric(metrics.get("sharpe"), precision=4),
+            self._format_metric(metrics.get("rolling_sharpe"), precision=4),
+            self._format_metric(metrics.get("max_drawdown"), precision=4),
+            run.status or "—",
+            run.run_id,
+        ]
+        for col_idx, value in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(value)
+            if col_idx == 10:
+                item.setToolTip(
+                    f"Requested: {run.requested_execution_mode or '—'}\n"
+                    f"Resolved: {run.resolved_execution_mode or '—'}\n"
+                    f"Engine: {run.engine_impl or '—'} v{run.engine_version or '—'}\n"
+                    f"Fallback: {run.fallback_reason or '—'}"
+                )
+            self.table.setItem(row_idx, col_idx, item)
+
+    def _selected_run(self) -> RunRow | None:
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return self.runs[0] if self.runs else None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return self.runs[0] if self.runs else None
+        row = rows[0].row()
+        if row < 0 or row >= len(self.runs):
+            return None
+        return self.runs[row]
+
+    def _open_selected_chart(self) -> None:
+        run = self._selected_run()
+        if run is None:
+            QtWidgets.QMessageBox.information(self, "No run selected", "Select a run first.")
+            return
+        if (run.engine_impl or "").lower() != "vectorized_portfolio":
+            bars_utc = RunChartDialog._load_bars_utc_static(run)
+            if bars_utc is None or bars_utc.empty:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Historical Data Unavailable",
+                    RunChartDialog._missing_run_data_message_static(run),
+                )
+                return
+        parent = self.parent()
+        if parent and hasattr(parent, "_open_run_chart_for_run"):
+            try:
+                parent._open_run_chart_for_run(run)  # type: ignore[attr-defined]
+                return
+            except Exception:
+                pass
+        dlg = RunChartDialog(run, self.catalog_path, self.bt_settings, self)
+        dlg.exec()
+
+    @staticmethod
+    def _format_metric(value, precision: int = 4) -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if np.isnan(numeric):
+            return "—"
+        return f"{numeric:.{precision}f}"
+
+    def _summary_text(self, summary: EngineComparisonSummary, anchor_run: RunRow) -> str:
+        ref = summary.latest_reference
+        vec = summary.latest_vectorized
+        lines: list[str] = []
+        if ref is not None:
+            lines.append(f"Reference duration: {_format_duration(ref.run_started_at, ref.run_finished_at)}")
+        if vec is not None:
+            lines.append(f"Vectorized duration: {_format_duration(vec.run_started_at, vec.run_finished_at)}")
+        if summary.speedup_vs_reference is not None:
+            lines.append(f"Vectorized speedup vs reference: {summary.speedup_vs_reference:.2f}x")
+        if summary.total_return_delta is not None:
+            lines.append(f"Return delta (vectorized - reference): {summary.total_return_delta:+.6f}")
+        if summary.sharpe_delta is not None:
+            lines.append(f"Sharpe delta (vectorized - reference): {summary.sharpe_delta:+.6f}")
+        if summary.max_drawdown_delta is not None:
+            lines.append(f"Max DD delta (vectorized - reference): {summary.max_drawdown_delta:+.6f}")
+        if not lines:
+            lines.append("Only one engine variant is available for this logical run so far.")
+        if anchor_run.timeframe != "1 minutes" and ref is not None and vec is not None:
+            lines.append(
+                "Note: higher-timeframe vectorized runs currently use same-timeframe resampled bars; "
+                "full base-execution parity is still future work."
+            )
+        return "\n".join(lines)
+
+
+class BatchEngineComparisonDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        runs: List[RunRow],
+        catalog_path: Path,
+        bt_settings: Dict[str, float | bool | dict | str],
+        parent=None,
+        batch_benchmarks: Sequence[BatchExecutionBenchmark] = (),
+    ) -> None:
+        super().__init__(parent)
+        self.runs = list(runs)
+        self.catalog_path = Path(catalog_path)
+        self.bt_settings = bt_settings
+        self.batch_benchmarks = tuple(batch_benchmarks)
+        self.summary = summarize_engine_batch(self.runs)
+        self.group_runs = self._build_group_runs(self.runs)
+        self.group_keys = sorted(self.group_runs.keys())
+
+        self.setWindowTitle("Batch Engine Comparison")
+        self.resize(1220, 680)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        summary_label = QtWidgets.QLabel(self._summary_text(self.summary))
+        summary_label.setObjectName("Sub")
+        summary_label.setWordWrap(True)
+        summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(summary_label)
+        benchmark_label = QtWidgets.QLabel(_summarize_batch_benchmarks(self.batch_benchmarks))
+        benchmark_label.setObjectName("Sub")
+        benchmark_label.setWordWrap(True)
+        benchmark_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(benchmark_label)
+
+        self.table = QtWidgets.QTableWidget(len(self.summary.groups), 12)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Timeframe",
+                "Params",
+                "Reference",
+                "Vectorized",
+                "Speedup",
+                "Return Δ",
+                "Sharpe Δ",
+                "Max DD Δ",
+                "Runs",
+                "Engines",
+                "Logical Run ID",
+                "Example Run",
+            ]
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setObjectName("Panel")
+        self.table.doubleClicked.connect(lambda _: self._inspect_selected_pair())
+        for row_idx, group in enumerate(self.summary.groups):
+            self._populate_row(row_idx, group)
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
+        layout.addWidget(self.table)
+
+        buttons = QtWidgets.QHBoxLayout()
+        inspect_btn = QtWidgets.QPushButton("Inspect Selected Pair")
+        inspect_btn.clicked.connect(self._inspect_selected_pair)
+        export_btn = QtWidgets.QPushButton("Export CSV")
+        export_btn.clicked.connect(self._export_csv)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(inspect_btn)
+        buttons.addWidget(export_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _build_group_runs(runs: List[RunRow]) -> dict[str, list[RunRow]]:
+        grouped: dict[str, list[RunRow]] = {}
+        for run in runs:
+            key = run.logical_run_id or f"run::{run.run_id}"
+            grouped.setdefault(key, []).append(run)
+        return grouped
+
+    def _populate_row(self, row_idx: int, group: EngineComparisonSummary) -> None:
+        group_key = self.group_keys[row_idx] if row_idx < len(self.group_keys) else ""
+        runs = self.group_runs.get(group_key, [])
+        example = runs[0] if runs else None
+        ref = group.latest_reference
+        vec = group.latest_vectorized
+        values = [
+            example.timeframe if example else "—",
+            example.params if example else "—",
+            _format_duration(ref.run_started_at, ref.run_finished_at) if ref is not None else "—",
+            _format_duration(vec.run_started_at, vec.run_finished_at) if vec is not None else "—",
+            self._format_float(group.speedup_vs_reference, precision=2, suffix="x"),
+            self._format_float(group.total_return_delta, precision=6, signed=True),
+            self._format_float(group.sharpe_delta, precision=6, signed=True),
+            self._format_float(group.max_drawdown_delta, precision=6, signed=True),
+            str(group.compared_run_count),
+            ", ".join(group.available_engines) if group.available_engines else "—",
+            (group.logical_run_id or "—")[:12] + ("…" if group.logical_run_id and len(group.logical_run_id) > 12 else ""),
+            example.run_id[:12] + "…" if example else "—",
+        ]
+        for col_idx, value in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(value)
+            if col_idx == 1 and example is not None:
+                item.setToolTip(example.params)
+            if col_idx == 10:
+                item.setToolTip(group.logical_run_id or "—")
+            self.table.setItem(row_idx, col_idx, item)
+
+    @staticmethod
+    def _format_float(
+        value: float | None,
+        *,
+        precision: int = 4,
+        signed: bool = False,
+        suffix: str = "",
+    ) -> str:
+        if value is None:
+            return "—"
+        if np.isnan(value):
+            return "—"
+        fmt = f"{{:{'+' if signed else ''}.{precision}f}}"
+        return f"{fmt.format(value)}{suffix}"
+
+    def _summary_text(self, summary: EngineBatchComparisonSummary) -> str:
+        lines = [
+            f"Logical run groups: {summary.total_groups}",
+            f"Paired groups: {summary.paired_groups}",
+            f"Reference-only groups: {summary.reference_only_groups}",
+            f"Vectorized-only groups: {summary.vectorized_only_groups}",
+        ]
+        if summary.median_speedup_vs_reference is not None:
+            lines.append(f"Median vectorized speedup: {summary.median_speedup_vs_reference:.2f}x")
+        if summary.mean_speedup_vs_reference is not None:
+            lines.append(f"Mean vectorized speedup: {summary.mean_speedup_vs_reference:.2f}x")
+        if summary.max_abs_total_return_delta is not None:
+            lines.append(f"Max |return delta|: {summary.max_abs_total_return_delta:.6f}")
+        if summary.max_abs_sharpe_delta is not None:
+            lines.append(f"Max |sharpe delta|: {summary.max_abs_sharpe_delta:.6f}")
+        if summary.max_abs_max_drawdown_delta is not None:
+            lines.append(f"Max |max DD delta|: {summary.max_abs_max_drawdown_delta:.6f}")
+        lines.append(
+            "Higher-timeframe vectorized rows may still reflect same-timeframe resampled semantics rather than "
+            "full base-execution parity."
+        )
+        return " | ".join(lines)
+
+    def _selected_group(self) -> tuple[EngineComparisonSummary | None, list[RunRow]]:
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return None, []
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None, []
+        row_idx = rows[0].row()
+        if row_idx < 0 or row_idx >= len(self.summary.groups):
+            return None, []
+        group = self.summary.groups[row_idx]
+        group_key = self.group_keys[row_idx] if row_idx < len(self.group_keys) else ""
+        runs = self.group_runs.get(group_key, [])
+        return group, runs
+
+    def _inspect_selected_pair(self) -> None:
+        group, runs = self._selected_group()
+        if group is None or not runs:
+            QtWidgets.QMessageBox.information(self, "No pair selected", "Select a comparison row first.")
+            return
+        anchor = group.latest_vectorized or group.latest_reference
+        if anchor is None:
+            QtWidgets.QMessageBox.information(self, "Comparison Unavailable", "No engine runs are available for this row.")
+            return
+        anchor_run = next((run for run in runs if run.run_id == anchor.run_id), runs[0])
+        dlg = EngineComparisonDialog(anchor_run, runs, self.catalog_path, self.bt_settings, self)
+        dlg.exec()
+
+    def _export_csv(self) -> None:
+        frame = self._to_frame()
+        if frame.empty:
+            QtWidgets.QMessageBox.information(self, "No data", "There is nothing to export yet.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Batch Comparison CSV",
+            "batch_engine_comparison.csv",
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            frame.to_csv(path, index=False)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export error", str(exc))
+
+    def _to_frame(self) -> pd.DataFrame:
+        rows = []
+        for row_idx, group in enumerate(self.summary.groups):
+            group_key = self.group_keys[row_idx] if row_idx < len(self.group_keys) else ""
+            runs = self.group_runs.get(group_key, [])
+            example = runs[0] if runs else None
+            rows.append(
+                {
+                    "logical_run_id": group.logical_run_id,
+                    "timeframe": example.timeframe if example else None,
+                    "params": example.params if example else None,
+                    "reference_run_id": group.latest_reference.run_id if group.latest_reference is not None else None,
+                    "vectorized_run_id": group.latest_vectorized.run_id if group.latest_vectorized is not None else None,
+                    "reference_duration_seconds": group.latest_reference.duration_seconds if group.latest_reference is not None else None,
+                    "vectorized_duration_seconds": group.latest_vectorized.duration_seconds if group.latest_vectorized is not None else None,
+                    "speedup_vs_reference": group.speedup_vs_reference,
+                    "total_return_delta": group.total_return_delta,
+                    "sharpe_delta": group.sharpe_delta,
+                    "rolling_sharpe_delta": group.rolling_sharpe_delta,
+                    "max_drawdown_delta": group.max_drawdown_delta,
+                    "available_engines": ",".join(group.available_engines),
+                    "compared_run_count": group.compared_run_count,
+                }
+            )
+        return pd.DataFrame(rows)
+
+
+class PortfolioReportDialog(QtWidgets.QDialog):
+    def __init__(self, run: RunRow, report, parent=None) -> None:
+        super().__init__(parent)
+        self.run = run
+        self.report = report
+        self.setWindowTitle(f"Portfolio Report | {run.run_id[:10]}")
+        self.resize(1100, 700)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        summary = QtWidgets.QLabel(self._summary_text(report))
+        summary.setObjectName("Sub")
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(summary)
+
+        frame = portfolio_report_frame(report)
+        self.table = QtWidgets.QTableWidget(len(frame), len(frame.columns))
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Asset",
+                "Avg Weight",
+                "Avg Target",
+                "Avg |Track Err|",
+                "Final Weight",
+                "Peak Weight",
+                "Active %",
+                "Trades",
+                "Realized PnL",
+                "Turnover $",
+                "Turnover x",
+            ]
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setObjectName("Panel")
+        for row_idx, row in frame.iterrows():
+            values = [
+                str(row["dataset_id"]),
+                self._fmt(row["avg_weight"]),
+                self._fmt(row["avg_target_weight"]),
+                self._fmt(row["avg_abs_tracking_error"]),
+                self._fmt(row["final_weight"]),
+                self._fmt(row["peak_weight"]),
+                self._fmt_pct(row["active_bar_fraction"]),
+                str(int(row["trade_count"])),
+                self._fmt_money(row["realized_pnl"]),
+                self._fmt_money(row["turnover_notional"]),
+                self._fmt(row["turnover_ratio"], precision=3),
+            ]
+            for col_idx, value in enumerate(values):
+                self.table.setItem(row_idx, col_idx, QtWidgets.QTableWidgetItem(value))
+        layout.addWidget(self.table)
+
+        buttons = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("Export CSV")
+        export_btn.clicked.connect(lambda: self._export_csv(frame))
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(export_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _fmt(value: float | int, precision: int = 4) -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if np.isnan(numeric):
+            return "—"
+        return f"{numeric:.{precision}f}"
+
+    @staticmethod
+    def _fmt_pct(value: float | int) -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if np.isnan(numeric):
+            return "—"
+        return f"{numeric * 100:.2f}%"
+
+    @staticmethod
+    def _fmt_money(value: float | int) -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if np.isnan(numeric):
+            return "—"
+        return f"${numeric:,.2f}"
+
+    @classmethod
+    def _summary_text(cls, report) -> str:
+        lines = [
+            f"Starting equity: {cls._fmt_money(report.starting_equity)}",
+            f"Ending equity: {cls._fmt_money(report.ending_equity)}",
+            f"Total return: {report.total_return:.4f}",
+            f"CAGR: {report.cagr:.4f}",
+            f"Max drawdown: {report.max_drawdown:.4f}",
+            f"Sharpe: {report.sharpe:.4f}",
+            f"Rolling Sharpe: {report.rolling_sharpe:.4f}",
+            f"Avg cash weight: {report.avg_cash_weight:.4f}",
+            f"Avg gross exposure: {report.avg_gross_exposure:.4f}",
+            f"Peak gross exposure: {report.peak_gross_exposure:.4f}",
+            f"Avg target gross exposure: {report.avg_target_gross_exposure:.4f}",
+            f"Trades: {report.trade_count}",
+            f"Total turnover: {cls._fmt_money(report.total_turnover_notional)} ({report.total_turnover_ratio:.3f}x)",
+        ]
+        return " | ".join(lines)
+
+    def _export_csv(self, frame: pd.DataFrame) -> None:
+        if frame.empty:
+            QtWidgets.QMessageBox.information(self, "No data", "There is nothing to export yet.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Portfolio Report CSV",
+            f"portfolio_report_{self.run.run_id[:10]}.csv",
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            frame.to_csv(path, index=False)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export error", str(exc))
+
+
+class PortfolioRunChartDialog(QtWidgets.QDialog):
+    _LINE_COLORS = ("#4da3ff", "#27d07d", "#ffcc66", "#ff6b6b", "#8b7bff", "#59c3c3")
+
+    def __init__(self, run: RunRow, portfolio_result, report, parent=None) -> None:
+        super().__init__(parent)
+        self.run = run
+        self.portfolio_result = portfolio_result
+        self.report = report
+        self.chart_data = build_portfolio_chart_data(portfolio_result, max_assets=4)
+        self.setWindowTitle(f"Portfolio Chart | {run.run_id[:10]}")
+        self.resize(1400, 940)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        summary = QtWidgets.QLabel(
+            f"Strategy: {run.strategy} | Timeframe: {run.timeframe} | Dataset: {run.dataset_id}\n"
+            f"Requested: {(run.requested_execution_mode or '—').title()} | "
+            f"Resolved: {(run.resolved_execution_mode or '—').title()} | "
+            f"Engine: {run.engine_impl or '—'} | Duration: {_format_duration(run.run_started_at, run.run_finished_at)}\n"
+            f"{PortfolioReportDialog._summary_text(report)}"
+        )
+        summary.setObjectName("Sub")
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(summary)
+
+        note = QtWidgets.QLabel(
+            "Built-in portfolio fallback viewer. Magellan still provides the richer multi-pane portfolio chart when available."
+        )
+        note.setObjectName("Sub")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        layout.addWidget(splitter, 1)
+
+        chart_panel = QtWidgets.QWidget()
+        chart_layout = QtWidgets.QVBoxLayout(chart_panel)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        self.figure = Figure(figsize=(14, 9), facecolor=PALETTE["panel"])
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        self.toolbar.setMovable(False)
+        chart_layout.addWidget(self.toolbar)
+        chart_layout.addWidget(self.canvas, 1)
+        splitter.addWidget(chart_panel)
+
+        table_panel = QtWidgets.QWidget()
+        table_layout = QtWidgets.QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        attribution = QtWidgets.QLabel("Asset Attribution")
+        attribution.setObjectName("Sub")
+        table_layout.addWidget(attribution)
+        self.report_frame = portfolio_report_frame(report).sort_values(
+            by=["avg_target_weight", "avg_weight", "dataset_id"],
+            ascending=[False, False, True],
+            kind="mergesort",
+        )
+        self.table = QtWidgets.QTableWidget(len(self.report_frame), len(self.report_frame.columns))
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Asset",
+                "Avg Weight",
+                "Avg Target",
+                "Avg |Track Err|",
+                "Final Weight",
+                "Peak Weight",
+                "Active %",
+                "Trades",
+                "Realized PnL",
+                "Turnover $",
+                "Turnover x",
+            ]
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setObjectName("Panel")
+        for row_idx, row in self.report_frame.iterrows():
+            values = [
+                str(row["dataset_id"]),
+                PortfolioReportDialog._fmt(row["avg_weight"]),
+                PortfolioReportDialog._fmt(row["avg_target_weight"]),
+                PortfolioReportDialog._fmt(row["avg_abs_tracking_error"]),
+                PortfolioReportDialog._fmt(row["final_weight"]),
+                PortfolioReportDialog._fmt(row["peak_weight"]),
+                PortfolioReportDialog._fmt_pct(row["active_bar_fraction"]),
+                str(int(row["trade_count"])),
+                PortfolioReportDialog._fmt_money(row["realized_pnl"]),
+                PortfolioReportDialog._fmt_money(row["turnover_notional"]),
+                PortfolioReportDialog._fmt(row["turnover_ratio"], precision=3),
+            ]
+            for col_idx, value in enumerate(values):
+                self.table.setItem(row_idx, col_idx, QtWidgets.QTableWidgetItem(value))
+        table_layout.addWidget(self.table, 1)
+        splitter.addWidget(table_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        buttons = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("Export CSV")
+        export_btn.clicked.connect(self._export_csv)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(export_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self._draw_charts()
+
+    @staticmethod
+    def _display_index(index_like) -> pd.DatetimeIndex:
+        idx = pd.DatetimeIndex(pd.to_datetime(index_like, utc=True, errors="coerce"))
+        return idx.tz_convert("America/New_York").tz_localize(None)
+
+    def _draw_charts(self) -> None:
+        display_index = self._display_index(self.chart_data.equity_curve.index)
+        gs = self.figure.add_gridspec(3, 1, height_ratios=[2.1, 1.0, 1.4], hspace=0.06)
+        ax_equity = self.figure.add_subplot(gs[0, 0])
+        ax_exposure = self.figure.add_subplot(gs[1, 0], sharex=ax_equity)
+        ax_weights = self.figure.add_subplot(gs[2, 0], sharex=ax_equity)
+        for ax in (ax_equity, ax_exposure, ax_weights):
+            ax.set_facecolor(PALETTE["bg"])
+            ax.grid(alpha=0.12, color="0.3")
+
+        equity_values = self.chart_data.equity_curve.to_numpy(dtype=float)
+        ax_equity.plot(display_index, equity_values, color=PALETTE["blue"], linewidth=1.6, label="Equity")
+        ax_equity.axhline(
+            float(self.report.starting_equity),
+            color=PALETTE["muted"],
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.8,
+            label="Starting Equity",
+        )
+        if not self.chart_data.trades.empty:
+            trades = self.chart_data.trades.copy()
+            display_trade_index = self._display_index(trades["timestamp"])
+            buys = trades[trades["side"].str.lower() == "buy"]
+            sells = trades[trades["side"].str.lower() == "sell"]
+            if not buys.empty:
+                buy_pos = display_trade_index[buys.index]
+                ax_equity.scatter(
+                    buy_pos,
+                    buys["equity_after"].to_numpy(dtype=float),
+                    marker="^",
+                    color=PALETTE["green"],
+                    s=28,
+                    alpha=0.8,
+                    label="Buy Fill",
+                    zorder=5,
+                )
+            if not sells.empty:
+                sell_pos = display_trade_index[sells.index]
+                ax_equity.scatter(
+                    sell_pos,
+                    sells["equity_after"].to_numpy(dtype=float),
+                    marker="v",
+                    color="#b38cff",
+                    s=28,
+                    alpha=0.8,
+                    label="Sell Fill",
+                    zorder=5,
+                )
+        ax_equity.set_title("Portfolio Equity")
+        ax_equity.legend(loc="upper left", ncol=3)
+
+        ax_exposure.plot(
+            display_index,
+            self.chart_data.cash_weight.to_numpy(dtype=float),
+            color=PALETTE["muted"],
+            linewidth=1.2,
+            label="Cash Weight",
+        )
+        ax_exposure.plot(
+            display_index,
+            self.chart_data.gross_exposure.to_numpy(dtype=float),
+            color=PALETTE["green"],
+            linewidth=1.4,
+            label="Gross Exposure",
+        )
+        ax_exposure.plot(
+            display_index,
+            self.chart_data.target_gross_exposure.to_numpy(dtype=float),
+            color=PALETTE["amber"],
+            linewidth=1.1,
+            linestyle="--",
+            label="Target Gross Exposure",
+        )
+        ax_exposure.set_title("Cash And Exposure")
+        ax_exposure.legend(loc="upper left", ncol=3)
+
+        if self.chart_data.top_assets:
+            for idx, dataset_id in enumerate(self.chart_data.top_assets):
+                color = self._LINE_COLORS[idx % len(self._LINE_COLORS)]
+                actual = pd.to_numeric(
+                    self.chart_data.asset_weights.get(dataset_id, pd.Series(0.0, index=self.chart_data.equity_curve.index)),
+                    errors="coerce",
+                ).fillna(0.0)
+                target = pd.to_numeric(
+                    self.chart_data.target_weights.get(dataset_id, pd.Series(0.0, index=self.chart_data.equity_curve.index)),
+                    errors="coerce",
+                ).fillna(0.0)
+                ax_weights.plot(
+                    display_index,
+                    actual.to_numpy(dtype=float),
+                    color=color,
+                    linewidth=1.5,
+                    label=f"{dataset_id} actual",
+                )
+                ax_weights.plot(
+                    display_index,
+                    target.to_numpy(dtype=float),
+                    color=color,
+                    linewidth=1.0,
+                    linestyle="--",
+                    alpha=0.9,
+                    label=f"{dataset_id} target",
+                )
+            ax_weights.legend(loc="upper left", ncol=2)
+        else:
+            ax_weights.text(
+                0.01,
+                0.85,
+                "No asset weight history is available for this portfolio run.",
+                transform=ax_weights.transAxes,
+                color=PALETTE["muted"],
+                fontsize=10,
+            )
+        ax_weights.set_title(f"Asset Weights (Top {max(1, len(self.chart_data.top_assets))})")
+
+        self.figure.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.07)
+        plt = __import__("matplotlib.pyplot", fromlist=["setp"])
+        plt.setp(ax_equity.get_xticklabels(), visible=False)
+        plt.setp(ax_exposure.get_xticklabels(), visible=False)
+        self.figure.autofmt_xdate(rotation=20)
+        self.canvas.draw_idle()
+
+    def _export_csv(self) -> None:
+        if self.report_frame.empty:
+            QtWidgets.QMessageBox.information(self, "No data", "There is nothing to export yet.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Portfolio Attribution CSV",
+            f"portfolio_chart_{self.run.run_id[:10]}.csv",
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            self.report_frame.to_csv(path, index=False)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Export error", str(exc))
 
@@ -2821,7 +5523,7 @@ class TickerPickerDialog(QtWidgets.QDialog):
 
 
 class RunChartDialog(QtWidgets.QDialog):
-    def __init__(self, run: RunRow, catalog_path: Path, bt_settings: Dict[str, float | bool | dict], parent=None) -> None:
+    def __init__(self, run: RunRow, catalog_path: Path, bt_settings: Dict[str, float | bool | dict | str], parent=None) -> None:
         super().__init__(parent)
         self.catalog_path = Path(catalog_path)
         self.bt_settings = bt_settings
@@ -2831,6 +5533,9 @@ class RunChartDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         summary = QtWidgets.QLabel(
             f"Strategy: {run.strategy} | Timeframe: {run.timeframe} | Dataset: {run.dataset_id}\n"
+            f"Requested: {(run.requested_execution_mode or '—').title()} | "
+            f"Resolved: {(run.resolved_execution_mode or '—').title()} | "
+            f"Engine: {run.engine_impl or '—'} | Duration: {_format_duration(run.run_started_at, run.run_finished_at)}\n"
             f"Params: {run.params}"
         )
         summary.setObjectName("Sub")
@@ -2852,7 +5557,7 @@ class RunChartDialog(QtWidgets.QDialog):
 
             bars = self._load_bars(run)
             if bars is None or bars.empty:
-                raise ValueError("No bar data available for this run.")
+                raise ValueError(self._missing_run_data_message_static(run))
 
             # Compute indicators for plotting.
             indicators = self._compute_indicators(run, bars)
@@ -2969,11 +5674,36 @@ class RunChartDialog(QtWidgets.QDialog):
         mapping = {
             "SMACrossStrategy": SMACrossStrategy,
             "InverseTurtleStrategy": InverseTurtleStrategy,
+            "ZScoreMeanReversionStrategy": ZScoreMeanReversionStrategy,
         }
         return mapping.get(name, SMACrossStrategy)
 
     def _load_bars(self, run: RunRow) -> pd.DataFrame | None:
         return self._load_bars_static(run)
+
+    @staticmethod
+    def _missing_run_data_message_static(run: RunRow) -> str:
+        store = DuckDBStore()
+        dataset_path = store.dataset_path(run.dataset_id)
+        dataset_text = str(dataset_path.resolve()) if dataset_path.exists() else str(dataset_path)
+        if not dataset_path.exists():
+            detail = (
+                "The parquet dataset file for this run is missing from the current project data store."
+            )
+        else:
+            detail = (
+                "The dataset file exists, but no bars could be reloaded for this run's stored time window."
+            )
+        return (
+            "This saved run cannot be charted from the current data store.\n\n"
+            f"{detail}\n\n"
+            f"Dataset: {run.dataset_id}\n"
+            f"Timeframe: {run.timeframe}\n"
+            f"Start: {run.start}\n"
+            f"End: {run.end}\n"
+            f"Expected parquet file: {dataset_text}\n\n"
+            "This often happens when the historical data files were not copied over from another machine."
+        )
 
     @staticmethod
     def _load_bars_utc_static(run: RunRow) -> pd.DataFrame | None:
@@ -3023,7 +5753,7 @@ class RunChartDialog(QtWidgets.QDialog):
         return self._rerun_static(run, bars, self.bt_settings)
 
     @staticmethod
-    def _rerun_static(run: RunRow, bars: pd.DataFrame, bt_settings: Dict[str, float | bool | dict]):
+    def _rerun_static(run: RunRow, bars: pd.DataFrame, bt_settings: Dict[str, float | bool | dict | str]):
         params = json.loads(run.params) if isinstance(run.params, str) else run.params
         cls = RunChartDialog._strategy_class_static(run.strategy)
         config = BacktestConfig(
@@ -3045,15 +5775,19 @@ class RunChartDialog(QtWidgets.QDialog):
             base_execution=True if run.timeframe != "1 minutes" else False,
             base_timeframe="1 minutes",
         )
-        engine = BacktestEngine(
-            data=bars,
-            dataset_id=run.dataset_id,
-            strategy_cls=cls,
-            catalog=None,
-            config=config,
-            base_data=bars if run.timeframe == "1 minutes" else None,
+        orchestrator = ExecutionOrchestrator()
+        return orchestrator.execute(
+            ExecutionRequest(
+                data=bars,
+                dataset_id=run.dataset_id,
+                strategy_cls=cls,
+                strategy_params=params,
+                catalog=None,
+                config=config,
+                base_data=bars if run.timeframe == "1 minutes" else None,
+                requested_execution_mode=str(bt_settings.get("execution_mode", ExecutionMode.REFERENCE.value)),
+            )
         )
-        return engine.run(params)
 
     def _compute_indicators(self, run: RunRow, bars: pd.DataFrame) -> Dict[str, pd.Series]:
         return self._compute_indicators_static(run, bars)
@@ -3068,6 +5802,10 @@ class RunChartDialog(QtWidgets.QDialog):
             slow = int(params.get("slow", 30))
             out["SMA Fast"] = bars["close"].rolling(fast).mean()
             out["SMA Slow"] = bars["close"].rolling(slow).mean()
+        elif name == "ZScoreMeanReversionStrategy":
+            features = compute_zscore_mean_reversion_features(bars, params)
+            out["Half-Life Mean"] = features["half_life_mean"]
+            out["Z-Score"] = features["z_score"]
         elif name == "InverseTurtleStrategy":
             entry_len = int(params.get("entry_len", 20))
             exit_len = int(params.get("exit_len", 10))
@@ -3100,105 +5838,30 @@ class RunChartDialog(QtWidgets.QDialog):
         return out
 
     @staticmethod
-    def _build_magellan_indicator_defs_static(run: RunRow, bars: pd.DataFrame) -> tuple[list[tuple[str, str, np.ndarray]], list[tuple[str, str, np.ndarray]]]:
+    def _build_snapshot_series_static(run: RunRow, bars: pd.DataFrame) -> tuple[Dict[str, pd.Series], Dict[str, pd.Series], Dict[str, dict]]:
         color_map = {
             "SMA Fast": "#4da3ff",
-            "SMA Slow": "#ffcc66",
-            "Upper": "#4da3ff",
-            "Lower": "#ff4d6d",
+            "SMA Slow": "#ffd166",
+            "Half-Life Mean": "#4da3ff",
+            "Z-Score": "#ffcc66",
+            "Upper": "#27d07d",
+            "Lower": "#ff6b6b",
             "Exit Upper": "#7ee787",
             "Exit Lower": "#a28bff",
             "ATR": "#a28bff",
         }
         indicators = RunChartDialog._compute_indicators_static(run, bars)
-        overlay_defs: list[tuple[str, str, np.ndarray]] = []
-        pane_defs: list[tuple[str, str, np.ndarray]] = []
+        overlays: Dict[str, pd.Series] = {}
+        panes: Dict[str, pd.Series] = {}
+        styles: Dict[str, dict] = {}
         for name, series in indicators.items():
-            values = pd.to_numeric(series.reindex(bars.index), errors="coerce").to_numpy(dtype=float)
-            target = pane_defs if name == "ATR" else overlay_defs
-            target.append((name, color_map.get(name, "#4da3ff"), values))
-        return overlay_defs, pane_defs
-
-    @staticmethod
-    def _build_magellan_trade_payload_static(
-        run: RunRow,
-        catalog_path: Path,
-        bars: pd.DataFrame,
-    ) -> tuple[list[dict], list[dict]]:
-        if bars.empty:
-            return [], []
-
-        catalog = ResultCatalog(catalog_path)
-        trades = catalog.load_trades(run.run_id) or []
-        bar_timestamps_ns = bars.index.view("int64")
-        first_ts = bars.index[0]
-        last_ts = bars.index[-1]
-        starting_cash = float(run.starting_cash) if run.starting_cash is not None else 100_000.0
-        trade_markers: list[dict] = []
-        equity_points_by_bar: dict[int, dict] = {
-            0: {
-                "timestamp_utc_ns": str(int(bar_timestamps_ns[0])),
-                "value": starting_cash,
-                "bar_index": 0,
-            }
-        }
-        position = 0.0
-
-        for seq, trade in enumerate(trades, start=1):
-            trade_ts = pd.to_datetime(trade.get("timestamp"), utc=True, errors="coerce")
-            if pd.isna(trade_ts) or trade_ts < first_ts or trade_ts > last_ts:
-                continue
-            bar_index = int(bars.index.get_indexer([trade_ts], method="nearest")[0])
-            if bar_index < 0:
-                continue
-
-            qty = float(trade.get("qty", 0.0))
-            position_before = position
-            position += qty
-            if position_before * position < 0:
-                event = "flip"
-            elif abs(position) > abs(position_before):
-                event = "entry"
-            elif position == position_before:
-                event = "adjust"
+            aligned = pd.to_numeric(series.reindex(bars.index), errors="coerce")
+            if name in {"ATR", "Z-Score"}:
+                panes[name] = aligned
             else:
-                event = "exit"
-
-            side = "buy" if qty > 0 else "sell"
-            timestamp_ns = int(trade_ts.value)
-            trade_markers.append(
-                {
-                    "timestamp_utc_ns": str(timestamp_ns),
-                    "bar_index": bar_index,
-                    "price": float(trade.get("price", 0.0)),
-                    "quantity": abs(qty),
-                    "side": side,
-                    "event": event,
-                    "label": f"{side.title()} {seq}",
-                }
-            )
-
-            equity_after = trade.get("equity_after")
-            if equity_after is not None:
-                equity_points_by_bar[bar_index] = {
-                    "timestamp_utc_ns": str(timestamp_ns),
-                    "value": float(equity_after),
-                    "bar_index": bar_index,
-                }
-
-        equity_points = [
-            equity_points_by_bar[index]
-            for index in sorted(equity_points_by_bar)
-        ]
-        if len(equity_points) == 1 and len(bars) > 1:
-            equity_points.append(
-                {
-                    "timestamp_utc_ns": str(int(bar_timestamps_ns[-1])),
-                    "value": equity_points[0]["value"],
-                    "bar_index": len(bars) - 1,
-                }
-            )
-        return trade_markers, equity_points
+                overlays[name] = aligned
+            styles[name] = {"color": color_map.get(name, "#4da3ff"), "line_width": 1.0}
+        return overlays, panes, styles
 
     def _on_scroll(self, event, ax_price, ax_atr, ax_equity, canvas) -> None:
         # Zoom on scroll around mouse x (time) and y (price) for price axis.

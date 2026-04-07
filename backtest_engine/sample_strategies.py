@@ -1,8 +1,120 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from .strategy import Strategy
+
+
+def _coerce_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _rma(series: pd.Series, length: int) -> pd.Series:
+    length = max(int(length), 1)
+    return series.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+
+
+def compute_zscore_mean_reversion_features(data: pd.DataFrame, params: dict) -> pd.DataFrame:
+    src = data["close"].astype(float)
+    high = data["high"].astype(float)
+    low = data["low"].astype(float)
+    prev_close = src.shift(1)
+
+    half_life_lookback = max(int(params.get("half_life_lookback", 100)), 10)
+    half_life_factor = max(float(params.get("half_life_factor", 1.5)), 1.0)
+    std_len = max(int(params.get("std_len", 20)), 1)
+    z_smooth_type = str(params.get("z_smooth_type", "None")).strip().lower()
+    z_smooth_len = max(int(params.get("z_smooth_len", 5)), 1)
+    use_vol_norm = _coerce_bool(params.get("use_vol_norm", True), True)
+    vol_type = str(params.get("vol_type", "ATR")).strip().lower()
+    vol_len = max(int(params.get("vol_len", 14)), 1)
+    atr_mult = float(params.get("atr_mult", 1.0))
+    long_entry_z = float(params.get("long_entry_z", -1.0))
+    long_exit_z = float(params.get("long_exit_z", 0.0))
+
+    lag = src.shift(1)
+    delta = src - lag
+    lag_std = lag.rolling(half_life_lookback).std(ddof=0)
+    delta_std = delta.rolling(half_life_lookback).std(ddof=0)
+    corr = lag.rolling(half_life_lookback).corr(delta)
+    beta = (corr * (delta_std / lag_std.replace(0.0, np.nan))).replace([np.inf, -np.inf], np.nan)
+    estimated_half_life = (-np.log(2.0) / beta).where(beta < 0.0)
+
+    fallback_half_life = max(2.0, half_life_lookback / 2.0)
+    base_half_life = estimated_half_life.where((estimated_half_life > 0.0) & estimated_half_life.notna(), fallback_half_life)
+    effective_half_life = np.maximum(2.0, base_half_life.to_numpy(dtype=float) * half_life_factor)
+    half_life_alpha = 1.0 - np.power(0.5, 1.0 / effective_half_life)
+
+    src_values = src.to_numpy(dtype=float)
+    half_life_mean = np.empty(len(src_values), dtype=float)
+    half_life_mean[0] = src_values[0]
+    for i in range(1, len(src_values)):
+        alpha = float(half_life_alpha[i]) if np.isfinite(half_life_alpha[i]) else 1.0
+        half_life_mean[i] = alpha * src_values[i] + (1.0 - alpha) * half_life_mean[i - 1]
+    half_life_mean_series = pd.Series(half_life_mean, index=data.index, name="half_life_mean")
+
+    spread_raw = src - half_life_mean_series
+    true_range = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = _rma(true_range, vol_len) * atr_mult
+    log_returns = np.log(src / prev_close)
+    return_vol = log_returns.rolling(vol_len).std(ddof=0)
+    price_vol = return_vol * src
+    vol = atr if vol_type == "atr" else price_vol
+    if use_vol_norm:
+        spread = spread_raw / vol.replace(0.0, np.nan)
+    else:
+        spread = spread_raw
+
+    spread_mean = spread.rolling(std_len).mean()
+    spread_std = spread.rolling(std_len).std(ddof=0).replace(0.0, np.nan)
+    spread_z_raw = (spread - spread_mean) / spread_std
+    if z_smooth_type == "sma":
+        z_score = spread_z_raw.rolling(z_smooth_len).mean()
+    elif z_smooth_type == "ema":
+        z_score = spread_z_raw.ewm(span=z_smooth_len, adjust=False, min_periods=z_smooth_len).mean()
+    else:
+        z_score = spread_z_raw
+
+    prev_z = z_score.shift(1)
+    long_entry_signal = ((z_score < long_entry_z) & (prev_z >= long_entry_z)).fillna(False)
+    long_exit_signal = ((z_score > long_exit_z) & (prev_z <= long_exit_z)).fillna(False)
+
+    long_state_values = np.zeros(len(data), dtype=bool)
+    in_position = False
+    for i, (exit_now, entry_now) in enumerate(zip(long_exit_signal.to_numpy(dtype=bool), long_entry_signal.to_numpy(dtype=bool))):
+        if exit_now and in_position:
+            in_position = False
+        elif entry_now and not in_position:
+            in_position = True
+        long_state_values[i] = in_position
+
+    return pd.DataFrame(
+        {
+            "half_life_mean": half_life_mean_series,
+            "spread": spread,
+            "z_score": z_score,
+            "long_entry_signal": long_entry_signal.astype(bool),
+            "long_exit_signal": long_exit_signal.astype(bool),
+            "long_state": pd.Series(long_state_values, index=data.index),
+            "estimated_half_life_bars": estimated_half_life,
+            "effective_half_life_bars": pd.Series(effective_half_life, index=data.index),
+            "atr": atr,
+            "vol": vol,
+        },
+        index=data.index,
+    )
 
 
 class SMACrossStrategy(Strategy):
@@ -122,3 +234,28 @@ class InverseTurtleStrategy(Strategy):
             elif broker.position_qty < 0:
                 stop = broker.avg_price + row["atr"] * self.atr_mult
                 broker.buy_stop(abs(broker.position_qty), stop, tag="atr_stop")
+
+
+class ZScoreMeanReversionStrategy(Strategy):
+    """
+    Long-only, fixed-target simplification of the TradingView z-score mean-reversion strategy.
+
+    Intentionally omitted for version 1:
+    - regime filter
+    - dynamic equity / annual-vol sizing
+    - short entries
+    """
+
+    def initialize(self, data: pd.DataFrame) -> None:
+        self.target = float(self.params.get("target", 1.0))
+        if self.target < 0:
+            raise ValueError("target must be >= 0 for long-only z-score mean reversion")
+        self.features = compute_zscore_mean_reversion_features(data, self.params)
+
+    def on_bar(self, timestamp: pd.Timestamp, bar: pd.Series, broker) -> None:
+        row = self.features.loc[timestamp]
+        if bool(row.get("long_exit_signal", False)) and broker.position_qty > 0:
+            broker.target_percent(0.0, bar["close"])
+            return
+        if bool(row.get("long_entry_signal", False)) and broker.position_qty <= 0:
+            broker.target_percent(self.target, bar["close"])
