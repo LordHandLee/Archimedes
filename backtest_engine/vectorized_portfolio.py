@@ -39,6 +39,28 @@ class PortfolioAssetSpec:
     strategy_cls: Type[Strategy]
     strategy_params: Dict[str, Any]
     target_weight: float | None = None
+    display_name: str | None = None
+    strategy_block_id: str | None = None
+    strategy_budget_weight: float | None = None
+    strategy_display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioStrategyBlockAssetSpec:
+    dataset_id: str
+    data: pd.DataFrame
+    target_weight: float | None = None
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioStrategyBlockSpec:
+    block_id: str
+    strategy_cls: Type[Strategy]
+    strategy_params: Dict[str, Any]
+    assets: Sequence[PortfolioStrategyBlockAssetSpec]
+    budget_weight: float | None = None
+    display_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +88,8 @@ class PortfolioTrade:
     fee: float
     realized_pnl: float
     equity_after: float
+    source_dataset_id: str | None = None
+    strategy_block_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,10 +98,17 @@ class VectorizedPortfolioResult:
     asset_market_values: pd.DataFrame
     asset_weights: pd.DataFrame
     target_weights: pd.DataFrame
+    strategy_market_values: pd.DataFrame
+    strategy_weights: pd.DataFrame
+    strategy_target_weights: pd.DataFrame
     positions: pd.DataFrame
     cash_curve: pd.Series
     trades: list[PortfolioTrade]
     metrics: PerformanceMetrics
+    asset_to_strategy_block: Dict[str, str]
+    asset_source_dataset_ids: Dict[str, str]
+    strategy_display_names: Dict[str, str]
+    strategy_budget_weights: Dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -88,25 +119,43 @@ class _PortfolioIntent:
 
 
 @dataclass(frozen=True)
+class _StrategyBlockContext:
+    block_id: str
+    display_name: str
+    budget_weight: float
+    strategy_signature: tuple[str, tuple[tuple[str, str], ...]]
+
+
+@dataclass(frozen=True)
 class VectorizedPortfolioEngine:
     engine_impl: str = "vectorized_portfolio"
     engine_version: str = "1"
     max_gross_exposure: float = 1.0
+
+    def supports_strategy_blocks(
+        self,
+        strategy_blocks: Sequence[PortfolioStrategyBlockSpec],
+        config: BacktestConfig,
+        construction_config: PortfolioConstructionConfig | None = None,
+    ) -> VectorizedSupport:
+        try:
+            flattened_assets = self._flatten_strategy_blocks(strategy_blocks)
+        except ValueError as exc:
+            return VectorizedSupport(False, str(exc))
+        return self.supports(flattened_assets, config, construction_config)
 
     def supports(
         self,
         assets: Sequence[PortfolioAssetSpec],
         config: BacktestConfig,
         construction_config: PortfolioConstructionConfig | None = None,
-    ) -> VectorizedSupport:
+        ) -> VectorizedSupport:
         if not assets:
             return VectorizedSupport(False, "Portfolio vectorization requires at least one asset.")
         if config.base_execution:
             return VectorizedSupport(False, "Portfolio vectorization v1 does not support base_execution.")
         if config.intrabar_sim:
             return VectorizedSupport(False, "Portfolio vectorization v1 does not support intrabar simulation.")
-        if config.allow_short:
-            return VectorizedSupport(False, "Portfolio vectorization v1 is long-only.")
 
         construction = construction_config or PortfolioConstructionConfig()
         ownership = str(construction.allocation_ownership or ALLOCATION_OWNERSHIP_STRATEGY)
@@ -181,9 +230,14 @@ class VectorizedPortfolioEngine:
         ):
             return VectorizedSupport(False, "Drift-threshold portfolio rebalancing requires rebalance_weight_drift_threshold > 0.")
 
+        block_contexts: dict[str, _StrategyBlockContext] = {}
+
         for asset in assets:
             if asset.target_weight is not None and float(asset.target_weight) < 0:
                 return VectorizedSupport(False, f"{asset.dataset_id} has a negative target_weight, which is unsupported.")
+            block_support = self._validate_strategy_block_metadata(asset, block_contexts)
+            if not block_support.supported:
+                return block_support
             adapter = get_vectorized_adapter(asset.strategy_cls)
             if adapter is None:
                 return VectorizedSupport(
@@ -199,6 +253,21 @@ class VectorizedPortfolioEngine:
                     f"Strategy {asset.strategy_cls.__name__} has no portfolio intent builder yet.",
                 )
         return VectorizedSupport(True)
+
+    def run_strategy_blocks(
+        self,
+        strategy_blocks: Sequence[PortfolioStrategyBlockSpec],
+        config: BacktestConfig,
+        *,
+        normalize_weights: bool = True,
+        construction_config: PortfolioConstructionConfig | None = None,
+    ) -> VectorizedPortfolioResult:
+        return self.run(
+            self._flatten_strategy_blocks(strategy_blocks),
+            config,
+            normalize_weights=normalize_weights,
+            construction_config=construction_config,
+        )
 
     def run(
         self,
@@ -218,7 +287,19 @@ class VectorizedPortfolioEngine:
         index = aligned_assets[0][1].index
         n_bars = len(index)
         n_assets = len(aligned_assets)
-        dataset_ids = [asset.dataset_id for asset, _ in aligned_assets]
+        aligned_asset_specs = [asset for asset, _ in aligned_assets]
+        asset_block_ids = self._strategy_block_ids_for_assets(aligned_asset_specs)
+        ordered_blocks = list(dict.fromkeys(asset_block_ids))
+        strategy_contexts = self._strategy_block_contexts(aligned_asset_specs, asset_block_ids, ordered_blocks)
+        asset_labels = self._build_runtime_asset_labels(
+            aligned_asset_specs,
+            asset_block_ids=asset_block_ids,
+            strategy_contexts=strategy_contexts,
+        )
+        asset_source_dataset_ids = {
+            asset_label: asset.dataset_id
+            for asset_label, (asset, _) in zip(asset_labels, aligned_assets)
+        }
 
         opens = np.column_stack([frame["open"].to_numpy(dtype=float) for _, frame in aligned_assets])
         closes = np.column_stack([frame["close"].to_numpy(dtype=float) for _, frame in aligned_assets])
@@ -254,6 +335,7 @@ class VectorizedPortfolioEngine:
         target_weight_history = np.zeros((n_bars, n_assets), dtype=float)
         position_history = np.zeros((n_bars, n_assets), dtype=float)
         trades: list[PortfolioTrade] = []
+        last_timestamp: pd.Timestamp | None = None
 
         for bar_idx, timestamp in enumerate(index):
             execution_prices = closes[bar_idx, :] if config.fill_on_close else opens[bar_idx, :]
@@ -261,6 +343,13 @@ class VectorizedPortfolioEngine:
             reference_prices = execution_prices
             if not config.fill_on_close and bar_idx > 0:
                 reference_prices = closes[bar_idx - 1, :]
+            if last_timestamp is not None and config.borrow_rate > 0:
+                dt_years = max((timestamp - last_timestamp).total_seconds(), 0.0) / (365.25 * 24.0 * 3600.0)
+                if dt_years > 0.0:
+                    short_mask = positions < -1e-12
+                    if np.any(short_mask):
+                        short_notional = np.abs(positions[short_mask]) * reference_prices[short_mask]
+                        cash -= float(np.sum(short_notional * float(config.borrow_rate) * dt_years))
             reference_equity = cash + float(np.dot(positions, reference_prices))
             current_actual_weights = np.zeros(n_assets, dtype=float)
             if reference_equity > 0:
@@ -270,6 +359,8 @@ class VectorizedPortfolioEngine:
                 strategy_weight_matrix=strategy_weight_matrix,
                 candidate_weight_matrix=candidate_weight_matrix,
                 score_matrix=score_matrix,
+                asset_block_ids=asset_block_ids,
+                strategy_contexts=strategy_contexts,
                 normalize_weights=normalize_weights,
                 construction_config=construction,
             )
@@ -290,7 +381,9 @@ class VectorizedPortfolioEngine:
             buy_indices = np.where(deltas > 1e-12)[0]
             for asset_idx in sell_indices:
                 trade = self._execute_order(
-                    dataset_id=dataset_ids[asset_idx],
+                    dataset_id=asset_labels[asset_idx],
+                    source_dataset_id=asset_source_dataset_ids[asset_labels[asset_idx]],
+                    strategy_block_id=asset_block_ids[asset_idx],
                     asset_idx=asset_idx,
                     qty=float(deltas[asset_idx]),
                     timestamp=timestamp,
@@ -304,13 +397,16 @@ class VectorizedPortfolioEngine:
                     buy_slip=buy_slip,
                     sell_slip=sell_slip,
                     fill_ratio=config.fill_ratio,
+                    config=config,
                 )
                 cash = trade.equity_after - float(np.dot(positions, execution_prices)) if trade is not None else cash
                 if trade is not None:
                     trades.append(trade)
             for asset_idx in buy_indices:
                 trade = self._execute_order(
-                    dataset_id=dataset_ids[asset_idx],
+                    dataset_id=asset_labels[asset_idx],
+                    source_dataset_id=asset_source_dataset_ids[asset_labels[asset_idx]],
+                    strategy_block_id=asset_block_ids[asset_idx],
                     asset_idx=asset_idx,
                     qty=float(deltas[asset_idx]),
                     timestamp=timestamp,
@@ -324,6 +420,7 @@ class VectorizedPortfolioEngine:
                     buy_slip=buy_slip,
                     sell_slip=sell_slip,
                     fill_ratio=config.fill_ratio,
+                    config=config,
                 )
                 cash = trade.equity_after - float(np.dot(positions, execution_prices)) if trade is not None else cash
                 if trade is not None:
@@ -337,6 +434,7 @@ class VectorizedPortfolioEngine:
                 actual_weights[bar_idx, :] = market_values[bar_idx, :] / equity
             target_weight_history[bar_idx, :] = target_weights
             position_history[bar_idx, :] = positions
+            last_timestamp = timestamp
 
         equity_series = pd.Series(equity_curve, index=index, name="portfolio_equity")
         session_seconds = config.sharpe_session_seconds_per_day
@@ -350,15 +448,44 @@ class VectorizedPortfolioEngine:
             session_seconds_per_day=session_seconds,
             sharpe_basis=config.sharpe_basis,
         )
+        asset_market_values_df = pd.DataFrame(market_values, index=index, columns=asset_labels)
+        asset_weights_df = pd.DataFrame(actual_weights, index=index, columns=asset_labels)
+        target_weights_df = pd.DataFrame(target_weight_history, index=index, columns=asset_labels)
+        positions_df = pd.DataFrame(position_history, index=index, columns=asset_labels)
+        strategy_market_values_df = self._aggregate_strategy_frame(
+            asset_market_values_df,
+            asset_labels=asset_labels,
+            asset_block_ids=asset_block_ids,
+            ordered_blocks=ordered_blocks,
+        )
+        strategy_weights_df = self._aggregate_strategy_frame(
+            asset_weights_df,
+            asset_labels=asset_labels,
+            asset_block_ids=asset_block_ids,
+            ordered_blocks=ordered_blocks,
+        )
+        strategy_target_weights_df = self._aggregate_strategy_frame(
+            target_weights_df,
+            asset_labels=asset_labels,
+            asset_block_ids=asset_block_ids,
+            ordered_blocks=ordered_blocks,
+        )
         return VectorizedPortfolioResult(
             portfolio_equity_curve=equity_series,
-            asset_market_values=pd.DataFrame(market_values, index=index, columns=dataset_ids),
-            asset_weights=pd.DataFrame(actual_weights, index=index, columns=dataset_ids),
-            target_weights=pd.DataFrame(target_weight_history, index=index, columns=dataset_ids),
-            positions=pd.DataFrame(position_history, index=index, columns=dataset_ids),
+            asset_market_values=asset_market_values_df,
+            asset_weights=asset_weights_df,
+            target_weights=target_weights_df,
+            strategy_market_values=strategy_market_values_df,
+            strategy_weights=strategy_weights_df,
+            strategy_target_weights=strategy_target_weights_df,
+            positions=positions_df,
             cash_curve=pd.Series(cash_curve, index=index, name="cash"),
             trades=trades,
             metrics=metrics,
+            asset_to_strategy_block={asset_label: block_id for asset_label, block_id in zip(asset_labels, asset_block_ids)},
+            asset_source_dataset_ids=asset_source_dataset_ids,
+            strategy_display_names={block_id: strategy_contexts[block_id].display_name for block_id in ordered_blocks},
+            strategy_budget_weights={block_id: strategy_contexts[block_id].budget_weight for block_id in ordered_blocks},
         )
 
     def _align_assets(
@@ -380,6 +507,189 @@ class VectorizedPortfolioEngine:
         if common_index is None or common_index.empty:
             raise ValueError("Portfolio vectorization could not align a non-empty common timestamp index.")
         return [(asset, frame.loc[common_index].copy()) for asset, frame in aligned]
+
+    def _flatten_strategy_blocks(
+        self,
+        strategy_blocks: Sequence[PortfolioStrategyBlockSpec],
+    ) -> list[PortfolioAssetSpec]:
+        flattened: list[PortfolioAssetSpec] = []
+        seen_block_ids: set[str] = set()
+        for block in strategy_blocks:
+            block_id = str(block.block_id or "").strip()
+            if not block_id:
+                raise ValueError("Portfolio strategy blocks require a non-empty block_id.")
+            if block_id in seen_block_ids:
+                raise ValueError(f"Duplicate portfolio strategy block_id: {block_id}.")
+            seen_block_ids.add(block_id)
+            if block.budget_weight is not None and float(block.budget_weight) <= 0.0:
+                raise ValueError(f"Strategy block {block_id} requires budget_weight > 0 when provided.")
+            if not block.assets:
+                raise ValueError(f"Strategy block {block_id} must contain at least one asset.")
+            display_name = str(block.display_name or block_id).strip() or block_id
+            for asset in block.assets:
+                flattened.append(
+                    PortfolioAssetSpec(
+                        dataset_id=asset.dataset_id,
+                        data=asset.data,
+                        strategy_cls=block.strategy_cls,
+                        strategy_params=dict(block.strategy_params),
+                        target_weight=asset.target_weight,
+                        display_name=asset.display_name,
+                        strategy_block_id=block_id,
+                        strategy_budget_weight=block.budget_weight,
+                        strategy_display_name=display_name,
+                    )
+                )
+        return flattened
+
+    @staticmethod
+    def _strategy_signature(asset: PortfolioAssetSpec) -> tuple[str, tuple[tuple[str, str], ...]]:
+        params = tuple(sorted((str(key), repr(value)) for key, value in dict(asset.strategy_params).items()))
+        return (asset.strategy_cls.__name__, params)
+
+    def _strategy_block_ids_for_assets(
+        self,
+        assets: Sequence[PortfolioAssetSpec],
+    ) -> list[str]:
+        ordered: list[str] = []
+        implicit_by_signature: dict[tuple[str, tuple[tuple[str, str], ...]], str] = {}
+        implicit_counts: dict[str, int] = {}
+        for asset in assets:
+            block_id = str(asset.strategy_block_id or "").strip()
+            if not block_id:
+                signature = self._strategy_signature(asset)
+                if signature not in implicit_by_signature:
+                    base = asset.strategy_cls.__name__
+                    count = implicit_counts.get(base, 0) + 1
+                    implicit_counts[base] = count
+                    implicit_by_signature[signature] = base if count == 1 else f"{base}_{count}"
+                block_id = implicit_by_signature[signature]
+            ordered.append(block_id)
+        return ordered
+
+    def _strategy_block_contexts(
+        self,
+        assets: Sequence[PortfolioAssetSpec],
+        asset_block_ids: Sequence[str],
+        ordered_blocks: Sequence[str],
+    ) -> dict[str, _StrategyBlockContext]:
+        contexts: dict[str, _StrategyBlockContext] = {}
+        explicit_support = self._validate_all_strategy_block_metadata(assets, asset_block_ids)
+        if not explicit_support.supported:
+            raise RuntimeError(explicit_support.reason or "Invalid portfolio strategy block metadata.")
+        for asset, block_id in zip(assets, asset_block_ids):
+            if block_id in contexts:
+                continue
+            display_name = str(asset.strategy_display_name or block_id).strip() or block_id
+            budget_weight = (
+                float(asset.strategy_budget_weight)
+                if asset.strategy_budget_weight is not None
+                else 1.0
+            )
+            contexts[block_id] = _StrategyBlockContext(
+                block_id=block_id,
+                display_name=display_name,
+                budget_weight=budget_weight,
+                strategy_signature=self._strategy_signature(asset),
+            )
+        return {block_id: contexts[block_id] for block_id in ordered_blocks}
+
+    def _build_runtime_asset_labels(
+        self,
+        assets: Sequence[PortfolioAssetSpec],
+        *,
+        asset_block_ids: Sequence[str],
+        strategy_contexts: dict[str, _StrategyBlockContext],
+    ) -> list[str]:
+        base_labels = [
+            str(asset.display_name or asset.dataset_id).strip() or str(asset.dataset_id)
+            for asset in assets
+        ]
+        duplicates = {
+            label
+            for label in base_labels
+            if base_labels.count(label) > 1
+        }
+        labels: list[str] = []
+        counts: dict[str, int] = {}
+        for asset, block_id, base_label in zip(assets, asset_block_ids, base_labels):
+            label = base_label
+            if base_label in duplicates:
+                strategy_name = strategy_contexts[block_id].display_name
+                label = f"{strategy_name} | {base_label}"
+            counts[label] = counts.get(label, 0) + 1
+            if counts[label] > 1:
+                label = f"{label} #{counts[label]}"
+            labels.append(label)
+        return labels
+
+    def _validate_all_strategy_block_metadata(
+        self,
+        assets: Sequence[PortfolioAssetSpec],
+        asset_block_ids: Sequence[str],
+    ) -> VectorizedSupport:
+        contexts: dict[str, _StrategyBlockContext] = {}
+        for asset, block_id in zip(assets, asset_block_ids):
+            support = self._validate_strategy_block_metadata(asset, contexts, block_id=block_id)
+            if not support.supported:
+                return support
+        return VectorizedSupport(True)
+
+    def _validate_strategy_block_metadata(
+        self,
+        asset: PortfolioAssetSpec,
+        contexts: dict[str, _StrategyBlockContext],
+        *,
+        block_id: str | None = None,
+    ) -> VectorizedSupport:
+        resolved_block_id = str(block_id or asset.strategy_block_id or "").strip() or asset.strategy_cls.__name__
+        budget_weight = float(asset.strategy_budget_weight) if asset.strategy_budget_weight is not None else 1.0
+        if budget_weight <= 0.0:
+            return VectorizedSupport(False, f"Strategy block {resolved_block_id} requires budget_weight > 0.")
+        display_name = str(asset.strategy_display_name or resolved_block_id).strip() or resolved_block_id
+        if resolved_block_id not in contexts:
+            contexts[resolved_block_id] = _StrategyBlockContext(
+                block_id=resolved_block_id,
+                display_name=display_name,
+                budget_weight=budget_weight,
+                strategy_signature=self._strategy_signature(asset),
+            )
+            return VectorizedSupport(True)
+        existing = contexts[resolved_block_id]
+        if abs(existing.budget_weight - budget_weight) > 1e-12:
+            return VectorizedSupport(
+                False,
+                f"Strategy block {resolved_block_id} has inconsistent budget_weight values across its assets.",
+            )
+        if existing.display_name != display_name:
+            return VectorizedSupport(
+                False,
+                f"Strategy block {resolved_block_id} has inconsistent display names across its assets.",
+            )
+        if existing.strategy_signature != self._strategy_signature(asset):
+            return VectorizedSupport(
+                False,
+                f"Strategy block {resolved_block_id} cannot mix multiple strategy definitions. Use separate blocks instead.",
+            )
+        return VectorizedSupport(True)
+
+    @staticmethod
+    def _aggregate_strategy_frame(
+        frame: pd.DataFrame,
+        *,
+        asset_labels: Sequence[str],
+        asset_block_ids: Sequence[str],
+        ordered_blocks: Sequence[str],
+    ) -> pd.DataFrame:
+        aggregated = pd.DataFrame(index=frame.index)
+        for block_id in ordered_blocks:
+            selected_labels = [
+                asset_label
+                for asset_label, asset_block_id in zip(asset_labels, asset_block_ids)
+                if asset_block_id == block_id
+            ]
+            aggregated[block_id] = frame[selected_labels].sum(axis=1) if selected_labels else 0.0
+        return aggregated
 
     def _build_portfolio_intent(
         self,
@@ -405,7 +715,7 @@ class VectorizedPortfolioEngine:
         params = asset.strategy_params
         fast = int(params.get("fast", 10))
         slow = int(params.get("slow", 30))
-        target = max(float(params.get("target", 1.0)), 0.0)
+        target = abs(float(params.get("target", 1.0)))
         preferred_weight = float(asset.target_weight) if asset.target_weight is not None else 1.0
         close = data["close"].astype(float)
         fast_series = close.rolling(fast).mean()
@@ -413,20 +723,44 @@ class VectorizedPortfolioEngine:
         valid = fast_series.notna() & slow_series.notna()
         enter = (fast_series > slow_series) & valid
         exit_ = (fast_series < slow_series) & valid
-        strategy_weights = self._state_weight_series(
-            enter.to_numpy(dtype=bool),
-            exit_.to_numpy(dtype=bool),
-            base_target=target * preferred_weight,
-            config=config,
-        )
-        candidate_weights = self._state_weight_series(
-            enter.to_numpy(dtype=bool),
-            exit_.to_numpy(dtype=bool),
-            base_target=preferred_weight,
-            config=config,
-        )
+        enter_long = enter.to_numpy(dtype=bool)
+        exit_long = exit_.to_numpy(dtype=bool)
+        if config.allow_short:
+            enter_short = exit_long.copy()
+            exit_short = enter_long.copy()
+            strategy_weights = self._long_short_weight_series(
+                enter_long=enter_long,
+                exit_long=exit_long,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=target * preferred_weight,
+                short_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._long_short_weight_series(
+                enter_long=enter_long,
+                exit_long=exit_long,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=preferred_weight,
+                short_target=preferred_weight,
+                config=config,
+            )
+        else:
+            strategy_weights = self._state_weight_series(
+                enter_long,
+                exit_long,
+                base_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._state_weight_series(
+                enter_long,
+                exit_long,
+                base_target=preferred_weight,
+                config=config,
+            )
         raw_score = ((fast_series - slow_series) / close.replace(0.0, np.nan)).fillna(0.0).to_numpy(dtype=float)
-        scores = np.where(candidate_weights > 0.0, np.maximum(raw_score, 0.0), 0.0)
+        scores = np.where(np.abs(candidate_weights) > 0.0, np.abs(raw_score), 0.0)
         return _PortfolioIntent(strategy_weights=strategy_weights, candidate_weights=candidate_weights, scores=scores)
 
     def _build_zscore_intent(
@@ -437,25 +771,51 @@ class VectorizedPortfolioEngine:
         config: BacktestConfig,
     ) -> _PortfolioIntent:
         params = asset.strategy_params
-        target = max(float(params.get("target", 1.0)), 0.0)
+        target = abs(float(params.get("target", 1.0)))
         preferred_weight = float(asset.target_weight) if asset.target_weight is not None else 1.0
         features = compute_zscore_mean_reversion_features(data, params)
         enter = features["long_entry_signal"].to_numpy(dtype=bool)
         exit_ = features["long_exit_signal"].to_numpy(dtype=bool)
-        strategy_weights = self._state_weight_series(
-            enter,
-            exit_,
-            base_target=target * preferred_weight,
-            config=config,
-        )
-        candidate_weights = self._state_weight_series(
-            enter,
-            exit_,
-            base_target=preferred_weight,
-            config=config,
-        )
+        if config.allow_short:
+            enter_short = features["short_entry_signal"].to_numpy(dtype=bool)
+            exit_short = features["short_exit_signal"].to_numpy(dtype=bool)
+            strategy_weights = self._long_short_weight_series(
+                enter_long=enter,
+                exit_long=exit_,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=target * preferred_weight,
+                short_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._long_short_weight_series(
+                enter_long=enter,
+                exit_long=exit_,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=preferred_weight,
+                short_target=preferred_weight,
+                config=config,
+            )
+        else:
+            strategy_weights = self._state_weight_series(
+                enter,
+                exit_,
+                base_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._state_weight_series(
+                enter,
+                exit_,
+                base_target=preferred_weight,
+                config=config,
+            )
         z_score = features["z_score"].fillna(0.0).to_numpy(dtype=float)
-        scores = np.where(candidate_weights > 0.0, np.maximum(-z_score, 0.0), 0.0)
+        scores = np.where(
+            candidate_weights > 0.0,
+            np.maximum(-z_score, 0.0),
+            np.where(candidate_weights < 0.0, np.maximum(z_score, 0.0), 0.0),
+        )
         return _PortfolioIntent(strategy_weights=strategy_weights, candidate_weights=candidate_weights, scores=scores)
 
     @staticmethod
@@ -483,6 +843,42 @@ class VectorizedPortfolioEngine:
                 state = base_target
         return desired
 
+    @staticmethod
+    def _long_short_weight_series(
+        *,
+        enter_long: np.ndarray,
+        exit_long: np.ndarray,
+        enter_short: np.ndarray,
+        exit_short: np.ndarray,
+        long_target: float,
+        short_target: float,
+        config: BacktestConfig,
+    ) -> np.ndarray:
+        state = 0.0
+        desired = np.zeros(len(enter_long), dtype=float)
+        for bar_idx in range(len(enter_long)):
+            if config.fill_on_close:
+                if exit_long[bar_idx] and state > 0.0:
+                    state = 0.0
+                if exit_short[bar_idx] and state < 0.0:
+                    state = 0.0
+                if enter_long[bar_idx]:
+                    state = float(long_target)
+                elif enter_short[bar_idx]:
+                    state = -float(short_target)
+                desired[bar_idx] = state
+                continue
+            desired[bar_idx] = state
+            if exit_long[bar_idx] and state > 0.0:
+                state = 0.0
+            if exit_short[bar_idx] and state < 0.0:
+                state = 0.0
+            if enter_long[bar_idx]:
+                state = float(long_target)
+            elif enter_short[bar_idx]:
+                state = -float(short_target)
+        return desired
+
     def _construction_weights_for_bar(
         self,
         *,
@@ -490,6 +886,8 @@ class VectorizedPortfolioEngine:
         strategy_weight_matrix: np.ndarray,
         candidate_weight_matrix: np.ndarray,
         score_matrix: np.ndarray,
+        asset_block_ids: Sequence[str],
+        strategy_contexts: dict[str, _StrategyBlockContext],
         normalize_weights: bool,
         construction_config: PortfolioConstructionConfig,
     ) -> np.ndarray:
@@ -524,6 +922,11 @@ class VectorizedPortfolioEngine:
             scores=score_matrix[bar_idx, :],
             weighting_mode=weighting_mode,
         )
+        weight_inputs = self._apply_strategy_block_budgets(
+            raw_weights=weight_inputs,
+            asset_block_ids=asset_block_ids,
+            strategy_contexts=strategy_contexts,
+        )
         return self._resolve_desired_weights(
             raw_weights=weight_inputs,
             normalize_weights=normalize_weights,
@@ -540,11 +943,12 @@ class VectorizedPortfolioEngine:
         ranked = np.zeros_like(raw_weights, dtype=float)
         if max_ranked_assets <= 0:
             return ranked
-        candidate_indices = np.where(raw_weights > 1e-12)[0]
+        candidate_indices = np.where(np.abs(raw_weights) > 1e-12)[0]
         if candidate_indices.size == 0:
             return ranked
         candidate_scores = np.nan_to_num(scores[candidate_indices], nan=-np.inf)
-        order = np.lexsort((-raw_weights[candidate_indices], -candidate_scores))
+        candidate_gross = np.abs(raw_weights[candidate_indices])
+        order = np.lexsort((-candidate_gross, -candidate_scores))
         selected = candidate_indices[order[: min(max_ranked_assets, candidate_indices.size)]]
         ranked[selected] = raw_weights[selected]
         return ranked
@@ -588,23 +992,45 @@ class VectorizedPortfolioEngine:
         scores: np.ndarray,
         weighting_mode: str,
     ) -> np.ndarray:
-        weights = np.maximum(raw_weights.astype(float, copy=True), 0.0)
-        active = weights > 1e-12
+        weights = raw_weights.astype(float, copy=True)
+        signs = np.sign(weights)
+        magnitudes = np.abs(weights)
+        active = magnitudes > 1e-12
         if not np.any(active):
             return weights
         if weighting_mode == WEIGHTING_MODE_PRESERVE:
             return weights
         if weighting_mode == WEIGHTING_MODE_EQUAL_SELECTED:
             equalized = np.zeros_like(weights, dtype=float)
-            equalized[active] = 1.0
+            equalized[active] = signs[active]
             return equalized
         if weighting_mode == WEIGHTING_MODE_SCORE_PROPORTIONAL:
             score_inputs = np.maximum(np.nan_to_num(scores, nan=0.0), 0.0)
             weighted = np.zeros_like(weights, dtype=float)
-            weighted[active] = weights[active] * score_inputs[active]
-            if float(weighted.sum()) > 1e-12:
+            weighted[active] = signs[active] * magnitudes[active] * score_inputs[active]
+            if float(np.abs(weighted).sum()) > 1e-12:
                 return weighted
             return weights
+        return weights
+
+    @staticmethod
+    def _apply_strategy_block_budgets(
+        *,
+        raw_weights: np.ndarray,
+        asset_block_ids: Sequence[str],
+        strategy_contexts: dict[str, _StrategyBlockContext],
+    ) -> np.ndarray:
+        weights = raw_weights.astype(float, copy=True)
+        for block_id, context in strategy_contexts.items():
+            if context.budget_weight <= 0.0:
+                continue
+            block_indices = [idx for idx, asset_block_id in enumerate(asset_block_ids) if asset_block_id == block_id]
+            if not block_indices:
+                continue
+            block_total = float(np.abs(weights[block_indices]).sum())
+            if block_total <= context.budget_weight + 1e-12:
+                continue
+            weights[block_indices] *= context.budget_weight / block_total
         return weights
 
     @staticmethod
@@ -642,8 +1068,8 @@ class VectorizedPortfolioEngine:
         normalize_weights: bool,
         construction_config: PortfolioConstructionConfig,
     ) -> np.ndarray:
-        weights = np.maximum(raw_weights.astype(float, copy=True), 0.0)
-        gross = float(weights.sum())
+        weights = raw_weights.astype(float, copy=True)
+        gross = float(np.abs(weights).sum())
         if gross <= 0:
             return weights
         min_active_weight = (
@@ -671,10 +1097,10 @@ class VectorizedPortfolioEngine:
             return weights
 
         if min_active_weight > 0.0:
-            weights[weights < min_active_weight] = 0.0
+            weights[np.abs(weights) < min_active_weight] = 0.0
         if max_asset_weight is not None:
-            weights = np.minimum(weights, max_asset_weight)
-        gross = float(weights.sum())
+            weights = np.sign(weights) * np.minimum(np.abs(weights), max_asset_weight)
+        gross = float(np.abs(weights).sum())
         if gross <= 0:
             return np.zeros_like(weights, dtype=float)
         if target_gross > 0 and gross > target_gross:
@@ -692,7 +1118,9 @@ class VectorizedPortfolioEngine:
         min_active_weight: float,
         max_asset_weight: float | None,
     ) -> np.ndarray:
-        active_seed = np.maximum(weights.astype(float, copy=True), 0.0)
+        signed_weights = weights.astype(float, copy=True)
+        signs = np.sign(signed_weights)
+        active_seed = np.abs(signed_weights)
         active_seed[active_seed <= 1e-12] = 0.0
         if float(active_seed.sum()) <= 1e-12 or target_gross <= 0.0:
             return np.zeros_like(active_seed, dtype=float)
@@ -705,10 +1133,10 @@ class VectorizedPortfolioEngine:
                 max_asset_weight=max_asset_weight,
             )
             if min_active_weight <= 0.0:
-                return allocated
+                return allocated * signs
             tiny_mask = (allocated > 1e-12) & (allocated < (min_active_weight - 1e-12))
             if not np.any(tiny_mask):
-                return allocated
+                return allocated * signs
             current_seed[tiny_mask] = 0.0
             if float(current_seed.sum()) <= 1e-12:
                 return np.zeros_like(active_seed, dtype=float)
@@ -758,6 +1186,8 @@ class VectorizedPortfolioEngine:
         self,
         *,
         dataset_id: str,
+        source_dataset_id: str,
+        strategy_block_id: str,
         asset_idx: int,
         qty: float,
         timestamp: pd.Timestamp,
@@ -771,49 +1201,68 @@ class VectorizedPortfolioEngine:
         buy_slip: float,
         sell_slip: float,
         fill_ratio: float,
+        config: BacktestConfig,
     ) -> PortfolioTrade | None:
         qty *= max(0.0, min(1.0, float(fill_ratio)))
         if abs(qty) < 1e-12:
             return None
 
         prev_qty = float(positions[asset_idx])
-        if prev_qty <= 0 and qty < 0:
-            return None
-
+        prev_avg_price = float(avg_price[asset_idx])
         side = "buy" if qty > 0 else "sell"
+        if config.prevent_scale_in:
+            if side == "buy" and prev_qty > 0:
+                return None
+            if side == "sell" and prev_qty < 0:
+                return None
         price = float(execution_prices[asset_idx])
         slip = buy_slip if qty > 0 else sell_slip
         adj_price = price * (1.0 + slip if qty > 0 else 1.0 - slip)
         fee_rate = buy_fee if qty > 0 else sell_fee
-        if qty > 0 and adj_price * (1.0 + fee_rate) > 0:
+        buying_to_cover = qty > 0 and prev_qty < 0
+        if qty > 0 and not buying_to_cover and adj_price * (1.0 + fee_rate) > 0:
             max_affordable = max(float(cash_state["cash"]) / (adj_price * (1.0 + fee_rate)), 0.0)
             if qty > max_affordable:
                 qty = max_affordable
                 if qty < 1e-12:
                     return None
 
-        if qty < 0:
-            qty = -min(abs(qty), prev_qty)
+        if side == "sell" and not config.allow_short:
+            qty = -min(abs(qty), max(prev_qty, 0.0))
             if abs(qty) < 1e-12:
                 return None
 
         notional = qty * adj_price
         fee = abs(notional) * fee_rate
         new_qty = prev_qty + qty
-        if qty < 0 and prev_qty > 0:
-            closed = min(abs(qty), prev_qty)
-            realized_pnl[asset_idx] += (adj_price - float(avg_price[asset_idx])) * closed
+        if prev_qty != 0 and (
+            (prev_qty > 0 > new_qty)
+            or (prev_qty < 0 < new_qty)
+            or (prev_qty > 0 and new_qty < prev_qty and new_qty >= 0)
+            or (prev_qty < 0 and new_qty > prev_qty and new_qty <= 0)
+        ):
+            if prev_qty > 0:
+                closed = min(abs(qty), prev_qty)
+                realized_pnl[asset_idx] += (adj_price - float(avg_price[asset_idx])) * closed
+            else:
+                closed = min(abs(qty), abs(prev_qty))
+                realized_pnl[asset_idx] += (float(avg_price[asset_idx]) - adj_price) * closed
 
         positions[asset_idx] = new_qty
         if abs(new_qty) < 1e-12:
             positions[asset_idx] = 0.0
             avg_price[asset_idx] = 0.0
-        elif prev_qty <= 0:
+        elif prev_qty == 0 or (prev_qty > 0 > new_qty) or (prev_qty < 0 < new_qty):
             avg_price[asset_idx] = adj_price
-        elif qty > 0:
+        else:
             prev_abs = abs(prev_qty)
             new_abs = abs(new_qty)
-            avg_price[asset_idx] = ((float(avg_price[asset_idx]) * prev_abs) + (adj_price * abs(qty))) / new_abs
+            if new_abs < prev_abs:
+                # Reducing an existing position should not change the average entry price
+                # of the remaining open size.
+                avg_price[asset_idx] = prev_avg_price
+            else:
+                avg_price[asset_idx] = ((prev_avg_price * prev_abs) + (adj_price * abs(qty))) / new_abs
 
         cash_state["cash"] -= notional
         cash_state["cash"] -= fee
@@ -827,4 +1276,6 @@ class VectorizedPortfolioEngine:
             fee=float(fee),
             realized_pnl=float(realized_pnl[asset_idx]),
             equity_after=float(equity_after),
+            source_dataset_id=source_dataset_id,
+            strategy_block_id=strategy_block_id,
         )

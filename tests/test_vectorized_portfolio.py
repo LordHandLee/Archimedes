@@ -19,9 +19,18 @@ from backtest_engine.execution import (
     ExecutionRequest,
     PortfolioExecutionAsset,
     PortfolioExecutionRequest,
+    PortfolioExecutionStrategyBlock,
+    PortfolioExecutionStrategyBlockAsset,
     UnsupportedExecutionModeError,
 )
-from backtest_engine.grid_search import GridSpec, PortfolioAssetTarget, run_vectorized_portfolio_grid_search
+from backtest_engine.grid_search import (
+    GridSpec,
+    PortfolioAssetTarget,
+    PortfolioStrategyBlockAssetTarget,
+    PortfolioStrategyBlockTarget,
+    run_vectorized_portfolio_grid_search,
+    run_vectorized_strategy_block_portfolio_search,
+)
 from backtest_engine.sample_strategies import SMACrossStrategy, ZScoreMeanReversionStrategy
 from backtest_engine.vectorized_portfolio import (
     ALLOCATION_OWNERSHIP_HYBRID,
@@ -29,6 +38,8 @@ from backtest_engine.vectorized_portfolio import (
     ALLOCATION_OWNERSHIP_STRATEGY,
     PortfolioAssetSpec,
     PortfolioConstructionConfig,
+    PortfolioStrategyBlockAssetSpec,
+    PortfolioStrategyBlockSpec,
     RANKING_MODE_SCORE_THRESHOLD,
     RANKING_MODE_TOP_N,
     RANKING_MODE_TOP_N_OVER_SCORE_THRESHOLD,
@@ -193,7 +204,7 @@ class VectorizedPortfolioTest(unittest.TestCase):
 
         self.assertLessEqual(float(result.target_weights.sum(axis=1).max()), 1.000001)
 
-    def test_support_rejects_shorts_and_base_execution(self) -> None:
+    def test_support_allows_shorts_for_supported_strategies(self) -> None:
         engine = VectorizedPortfolioEngine()
         support = engine.supports(
             [
@@ -206,8 +217,40 @@ class VectorizedPortfolioTest(unittest.TestCase):
             ],
             replace(self.config, allow_short=True),
         )
-        self.assertFalse(support.supported)
-        self.assertIn("long-only", support.reason or "")
+        self.assertTrue(support.supported)
+
+    def test_execute_order_keeps_average_price_on_partial_reduction(self) -> None:
+        engine = VectorizedPortfolioEngine()
+        positions = np.array([10.0], dtype=float)
+        avg_price = np.array([100.0], dtype=float)
+        realized_pnl = np.array([0.0], dtype=float)
+        trade = engine._execute_order(
+            dataset_id="asset_a",
+            source_dataset_id="asset_a",
+            strategy_block_id="block",
+            asset_idx=0,
+            qty=-4.0,
+            timestamp=pd.Timestamp("2024-01-02 14:35", tz="UTC"),
+            execution_prices=np.array([110.0], dtype=float),
+            positions=positions,
+            avg_price=avg_price,
+            realized_pnl=realized_pnl,
+            cash_state={"cash": 0.0},
+            buy_fee=0.0,
+            sell_fee=0.0,
+            buy_slip=0.0,
+            sell_slip=0.0,
+            fill_ratio=1.0,
+            config=self.config,
+        )
+
+        self.assertIsNotNone(trade)
+        self.assertAlmostEqual(float(realized_pnl[0]), 40.0, places=8)
+        self.assertAlmostEqual(float(positions[0]), 6.0, places=8)
+        self.assertAlmostEqual(float(avg_price[0]), 100.0, places=8)
+
+    def test_support_rejects_base_execution(self) -> None:
+        engine = VectorizedPortfolioEngine()
 
         support = engine.supports(
             [
@@ -222,6 +265,53 @@ class VectorizedPortfolioTest(unittest.TestCase):
         )
         self.assertFalse(support.supported)
         self.assertIn("base_execution", support.reason or "")
+
+    def test_short_enabled_portfolio_can_hold_negative_target_weights(self) -> None:
+        engine = VectorizedPortfolioEngine()
+        downtrend = _make_trend_bars(periods=240, slope=-0.18, start=130.0)
+        result = engine.run(
+            [
+                PortfolioAssetSpec(
+                    dataset_id="short_asset",
+                    data=downtrend,
+                    strategy_cls=SMACrossStrategy,
+                    strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+                )
+            ],
+            replace(self.config, allow_short=True),
+            normalize_weights=True,
+        )
+
+        self.assertLess(float(result.target_weights["short_asset"].min()), -0.5)
+        self.assertLess(float(result.positions["short_asset"].min()), -1e-9)
+        self.assertIn("sell", {trade.side for trade in result.trades})
+
+    def test_short_borrow_reduces_portfolio_equity(self) -> None:
+        engine = VectorizedPortfolioEngine()
+        downtrend = _make_trend_bars(periods=240, slope=-0.18, start=130.0)
+        assets = [
+            PortfolioAssetSpec(
+                dataset_id="short_asset",
+                data=downtrend,
+                strategy_cls=SMACrossStrategy,
+                strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+            )
+        ]
+        without_borrow = engine.run(
+            assets,
+            replace(self.config, allow_short=True, borrow_rate=0.0),
+            normalize_weights=True,
+        )
+        with_borrow = engine.run(
+            assets,
+            replace(self.config, allow_short=True, borrow_rate=0.50),
+            normalize_weights=True,
+        )
+
+        self.assertLess(
+            float(with_borrow.portfolio_equity_curve.iloc[-1]),
+            float(without_borrow.portfolio_equity_curve.iloc[-1]),
+        )
 
     def test_support_rejects_ranking_in_strategy_owned_mode(self) -> None:
         engine = VectorizedPortfolioEngine()
@@ -597,6 +687,129 @@ class VectorizedPortfolioTest(unittest.TestCase):
             self.assertTrue((artifact.snapshot_root / "price_bars.feather").exists())
             self.assertTrue((artifact.snapshot_root / "equity.feather").exists())
 
+    def test_portfolio_asset_snapshot_export_creates_one_snapshot_per_source_asset(self) -> None:
+        bars_a = _make_trend_bars(periods=120, slope=0.2)
+        bars_b = _make_trend_bars(periods=120, slope=0.18)
+        engine = VectorizedPortfolioEngine()
+        result = engine.run(
+            [
+                PortfolioAssetSpec(
+                    dataset_id="asset_a",
+                    data=bars_a,
+                    strategy_cls=SMACrossStrategy,
+                    strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+                ),
+                PortfolioAssetSpec(
+                    dataset_id="asset_b",
+                    data=bars_b,
+                    strategy_cls=SMACrossStrategy,
+                    strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+                ),
+            ],
+            self.config,
+            normalize_weights=True,
+            construction_config=PortfolioConstructionConfig(
+                allocation_ownership=ALLOCATION_OWNERSHIP_PORTFOLIO,
+                weighting_mode=WEIGHTING_MODE_EQUAL_SELECTED,
+            ),
+        )
+        run = SimpleNamespace(
+            run_id="portfolio_asset_snapshots_run",
+            dataset_id="Portfolio | asset_a, asset_b",
+            strategy="PortfolioExecution",
+            params={"example": True},
+            timeframe="1 minutes",
+            start=str(result.portfolio_equity_curve.index[0]),
+            end=str(result.portfolio_equity_curve.index[-1]),
+            starting_cash=self.config.starting_cash,
+            metrics=result.metrics.as_dict(),
+        )
+        with TemporaryDirectory() as tmpdir:
+            exporter = ChartSnapshotExporter(tmpdir)
+            artifacts = exporter.export_portfolio_asset_snapshots(
+                run=run,
+                portfolio_result=result,
+                source_bars={"asset_a": bars_a, "asset_b": bars_b},
+            )
+
+            self.assertEqual(len(artifacts), 2)
+            manifest_dataset_ids = []
+            for artifact in artifacts:
+                manifest = json.loads((artifact.snapshot_root / "manifest.json").read_text(encoding="utf-8"))
+                manifest_dataset_ids.append(str(manifest["dataset_id"]))
+                self.assertEqual(int(manifest["counts"]["bars"]), 120)
+                self.assertTrue((artifact.snapshot_root / "price_bars.feather").exists())
+                self.assertTrue((artifact.snapshot_root / "trades.feather").exists())
+            self.assertEqual(sorted(manifest_dataset_ids), ["asset_a", "asset_b"])
+
+    def test_portfolio_asset_snapshot_for_zscore_uses_overlay_and_zscore_pane(self) -> None:
+        bars = _make_bars(periods=220, drift=5.0, phase=0.4)
+        engine = VectorizedPortfolioEngine()
+        result = engine.run(
+            [
+                PortfolioAssetSpec(
+                    dataset_id="asset_a",
+                    data=bars,
+                    strategy_cls=ZScoreMeanReversionStrategy,
+                    strategy_params={
+                        "half_life_lookback": 30,
+                        "half_life_factor": 1.5,
+                        "std_len": 15,
+                        "long_entry_z": -0.8,
+                        "long_exit_z": 0.0,
+                        "target": 1.0,
+                    },
+                ),
+            ],
+            self.config,
+            normalize_weights=True,
+        )
+        run = SimpleNamespace(
+            run_id="portfolio_zscore_asset_snapshot_run",
+            dataset_id="Portfolio | asset_a",
+            strategy="PortfolioExecution",
+            params={"example": True},
+            timeframe="1 minutes",
+            start=str(result.portfolio_equity_curve.index[0]),
+            end=str(result.portfolio_equity_curve.index[-1]),
+            starting_cash=self.config.starting_cash,
+            metrics=result.metrics.as_dict(),
+        )
+        request = PortfolioExecutionRequest(
+            assets=(
+                PortfolioExecutionAsset(
+                    dataset_id="asset_a",
+                    data=bars,
+                    strategy_cls=ZScoreMeanReversionStrategy,
+                    strategy_params={
+                        "half_life_lookback": 30,
+                        "half_life_factor": 1.5,
+                        "std_len": 15,
+                        "long_entry_z": -0.8,
+                        "long_exit_z": 0.0,
+                        "target": 1.0,
+                    },
+                ),
+            ),
+            config=self.config,
+            normalize_weights=True,
+            requested_execution_mode=ExecutionMode.VECTORIZED,
+        )
+        with TemporaryDirectory() as tmpdir:
+            exporter = ChartSnapshotExporter(tmpdir)
+            artifacts = exporter.export_portfolio_asset_snapshots(
+                run=run,
+                portfolio_result=result,
+                source_bars={"asset_a": bars},
+                strategy_contexts=ChartSnapshotExporter.build_portfolio_strategy_contexts(request),
+            )
+
+            self.assertEqual(len(artifacts), 1)
+            overlays = pd.read_feather(artifacts[0].snapshot_root / "overlays.feather")
+            panes = pd.read_feather(artifacts[0].snapshot_root / "panes.feather")
+            self.assertIn("Half_Life_Mean", overlays.columns)
+            self.assertIn("Z_Score", panes.columns)
+
     def test_score_proportional_weighting_favors_stronger_scores(self) -> None:
         engine = VectorizedPortfolioEngine()
         result = engine.run(
@@ -908,6 +1121,106 @@ class VectorizedPortfolioTest(unittest.TestCase):
         self.assertTrue(str(result.dataset_id).startswith("Portfolio | "))
         self.assertEqual(result.result.asset_weights.columns.tolist(), ["asset_a", "asset_b"])
 
+    def test_strategy_blocks_produce_strategy_level_weights_and_budget_caps(self) -> None:
+        engine = VectorizedPortfolioEngine()
+        result = engine.run_strategy_blocks(
+            [
+                PortfolioStrategyBlockSpec(
+                    block_id="trend_block",
+                    strategy_cls=SMACrossStrategy,
+                    strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+                    assets=[
+                        PortfolioStrategyBlockAssetSpec(dataset_id="asset_a", data=self.bars_a),
+                        PortfolioStrategyBlockAssetSpec(dataset_id="asset_b", data=self.bars_b),
+                    ],
+                    budget_weight=0.45,
+                    display_name="Trend",
+                ),
+                PortfolioStrategyBlockSpec(
+                    block_id="mean_rev_block",
+                    strategy_cls=ZScoreMeanReversionStrategy,
+                    strategy_params={
+                        "half_life_lookback": 30,
+                        "std_len": 15,
+                        "long_entry_z": -0.8,
+                        "long_exit_z": 0.0,
+                        "target": 1.0,
+                    },
+                    assets=[
+                        PortfolioStrategyBlockAssetSpec(dataset_id="asset_c", data=_make_bars(drift=8.0, phase=1.4)),
+                    ],
+                    budget_weight=0.35,
+                    display_name="Mean Rev",
+                ),
+            ],
+            self.config,
+            normalize_weights=False,
+            construction_config=PortfolioConstructionConfig(
+                allocation_ownership=ALLOCATION_OWNERSHIP_PORTFOLIO,
+                cash_reserve_weight=0.1,
+            ),
+        )
+
+        self.assertEqual(result.strategy_weights.columns.tolist(), ["trend_block", "mean_rev_block"])
+        self.assertEqual(result.strategy_display_names["trend_block"], "Trend")
+        self.assertAlmostEqual(result.strategy_budget_weights["trend_block"], 0.45, places=10)
+        self.assertLessEqual(float(result.strategy_target_weights["trend_block"].max()), 0.450001)
+        self.assertLessEqual(float(result.strategy_target_weights["mean_rev_block"].max()), 0.350001)
+        self.assertLessEqual(float(result.target_weights.sum(axis=1).max()), 0.900001)
+
+    def test_orchestrator_executes_explicit_strategy_blocks_on_same_asset(self) -> None:
+        orchestrator = ExecutionOrchestrator()
+        result = orchestrator.execute_portfolio(
+            PortfolioExecutionRequest(
+                assets=[],
+                strategy_blocks=[
+                    PortfolioExecutionStrategyBlock(
+                        block_id="trend_fast",
+                        strategy_cls=SMACrossStrategy,
+                        strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+                        assets=[
+                            PortfolioExecutionStrategyBlockAsset(
+                                dataset_id="asset_a",
+                                data=self.bars_a,
+                                display_name="SPY",
+                            )
+                        ],
+                        budget_weight=0.5,
+                        display_name="Trend Fast",
+                    ),
+                    PortfolioExecutionStrategyBlock(
+                        block_id="mean_rev",
+                        strategy_cls=ZScoreMeanReversionStrategy,
+                        strategy_params={
+                            "half_life_lookback": 30,
+                            "std_len": 15,
+                            "long_entry_z": -0.8,
+                            "long_exit_z": 0.0,
+                            "target": 1.0,
+                        },
+                        assets=[
+                            PortfolioExecutionStrategyBlockAsset(
+                                dataset_id="asset_a",
+                                data=self.bars_a,
+                                display_name="SPY",
+                            )
+                        ],
+                        budget_weight=0.3,
+                        display_name="Mean Rev",
+                    ),
+                ],
+                config=self.config,
+                requested_execution_mode=ExecutionMode.VECTORIZED,
+                normalize_weights=False,
+            )
+        )
+
+        self.assertEqual(result.engine_impl, "vectorized_portfolio")
+        self.assertEqual(result.result.strategy_weights.columns.tolist(), ["trend_fast", "mean_rev"])
+        self.assertEqual(set(result.result.asset_source_dataset_ids.values()), {"asset_a"})
+        self.assertEqual(len(result.result.asset_weights.columns), 2)
+        self.assertNotEqual(result.result.asset_weights.columns[0], result.result.asset_weights.columns[1])
+
     def test_orchestrator_rejects_reference_portfolio_request(self) -> None:
         orchestrator = ExecutionOrchestrator()
         with self.assertRaises(UnsupportedExecutionModeError):
@@ -972,6 +1285,59 @@ class VectorizedPortfolioTest(unittest.TestCase):
         benchmarks = frame.attrs.get("batch_benchmarks") or ()
         self.assertEqual(len(benchmarks), 1)
         self.assertEqual(benchmarks[0].engine_impl, "vectorized_portfolio")
+
+    def test_strategy_block_portfolio_search_runs_and_saves(self) -> None:
+        grid = GridSpec(
+            params={},
+            timeframes=["1 minutes"],
+            horizons=[(None, None)],
+            execution_mode=ExecutionMode.VECTORIZED,
+            batch_id="portfolio_blocks_batch",
+        )
+        with TemporaryDirectory() as tmpdir:
+            catalog = ResultCatalog(Path(tmpdir) / "portfolio_blocks.sqlite")
+            frame = run_vectorized_strategy_block_portfolio_search(
+                strategy_blocks=[
+                    PortfolioStrategyBlockTarget(
+                        block_id="trend",
+                        strategy_cls=SMACrossStrategy,
+                        strategy_params={"fast": 5, "slow": 20, "target": 1.0},
+                        assets=[
+                            PortfolioStrategyBlockAssetTarget(dataset_id="asset_a", data_loader=lambda _tf: self.bars_a),
+                        ],
+                        budget_weight=0.5,
+                        display_name="Trend",
+                    ),
+                    PortfolioStrategyBlockTarget(
+                        block_id="mean_rev",
+                        strategy_cls=ZScoreMeanReversionStrategy,
+                        strategy_params={
+                            "half_life_lookback": 30,
+                            "std_len": 15,
+                            "long_entry_z": -0.8,
+                            "long_exit_z": 0.0,
+                            "target": 1.0,
+                        },
+                        assets=[
+                            PortfolioStrategyBlockAssetTarget(dataset_id="asset_b", data_loader=lambda _tf: self.bars_b),
+                        ],
+                        budget_weight=0.25,
+                        display_name="Mean Rev",
+                    ),
+                ],
+                base_config=self.config,
+                grid=grid,
+                catalog=catalog,
+                normalize_weights=False,
+            )
+
+            self.assertEqual(len(frame), 1)
+            self.assertTrue((frame["engine_impl"] == "vectorized_portfolio").all())
+            runs = catalog.load_runs_for_logical_run_id(frame.iloc[0]["logical_run_id"])
+            self.assertTrue(runs)
+            stored_params = json.loads(runs[0].params) if isinstance(runs[0].params, str) else runs[0].params
+            self.assertIn("strategy_blocks", stored_params)
+            self.assertEqual(len(stored_params["strategy_blocks"]), 2)
 
 
 if __name__ == "__main__":

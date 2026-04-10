@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 from .data_loader import REQUIRED_COLUMNS
@@ -121,3 +122,169 @@ class DuckDBStore:
         df = self.conn.execute(sql).df()
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         return df.set_index("timestamp")
+
+    def describe_dataset(self, dataset_id: str) -> dict:
+        path = self.dataset_path(dataset_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Parquet not found for dataset_id={dataset_id}")
+        df = self.load(dataset_id)
+        start_ts = df.index.min() if not df.empty else None
+        end_ts = df.index.max() if not df.empty else None
+        return {
+            "dataset_id": dataset_id,
+            "parquet_path": str(path),
+            "coverage_start": start_ts.isoformat() if start_ts is not None else None,
+            "coverage_end": end_ts.isoformat() if end_ts is not None else None,
+            "bar_count": int(len(df)),
+        }
+
+    @staticmethod
+    def _resolution_to_timedelta(resolution: str) -> pd.Timedelta | None:
+        normalized = str(resolution or "").strip().lower()
+        if not normalized:
+            return None
+        try:
+            if normalized.endswith("m"):
+                return pd.Timedelta(minutes=int(normalized[:-1] or "1"))
+            if normalized.endswith("h"):
+                return pd.Timedelta(hours=int(normalized[:-1] or "1"))
+            if normalized.endswith("d"):
+                return pd.Timedelta(days=int(normalized[:-1] or "1"))
+            if normalized.endswith("w"):
+                return pd.Timedelta(weeks=int(normalized[:-1] or "1"))
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _window_bound_timestamp(value: str | None, *, is_end: bool) -> pd.Timestamp | None:
+        if not value:
+            return None
+        stamp = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(stamp):
+            return None
+        text = str(value).strip()
+        if text and "T" not in text and " " not in text:
+            if is_end:
+                return stamp + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+            return stamp
+        return stamp
+
+    def inspect_dataset_quality(self, dataset_id: str, resolution: str) -> dict:
+        path = self.dataset_path(dataset_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Parquet not found for dataset_id={dataset_id}")
+        df = self.load(dataset_id, columns=("timestamp",))
+        timestamps = pd.DatetimeIndex(df.index).sort_values().unique()
+        expected_interval = self._resolution_to_timedelta(resolution)
+        suspicious_gap_count = 0
+        max_suspicious_gap: pd.Timedelta | None = None
+        quality_state = "unknown"
+        suspicious_gap_ranges: list[dict[str, str]] = []
+        repair_request_start: str | None = None
+        repair_request_end: str | None = None
+
+        if expected_interval is not None and len(timestamps) >= 2:
+            diffs = timestamps[1:] - timestamps[:-1]
+            diff_series = pd.Series(diffs)
+            gap_after_series = pd.Series(pd.Index(timestamps[:-1]))
+            gap_before_series = pd.Series(pd.Index(timestamps[1:]))
+            if expected_interval < pd.Timedelta(days=1):
+                same_day_mask = pd.Series(timestamps[1:].normalize() == timestamps[:-1].normalize())
+                suspicious_mask = same_day_mask & (diff_series > (expected_interval * 3))
+            else:
+                suspicious_mask = diff_series > (expected_interval * 3)
+            suspicious_diffs = diff_series[suspicious_mask]
+            suspicious_gap_count = int(len(suspicious_diffs))
+            if suspicious_gap_count:
+                max_suspicious_gap = suspicious_diffs.max()
+                quality_state = "gappy"
+                suspicious_rows = pd.DataFrame(
+                    {
+                        "gap_after": gap_after_series[suspicious_mask].reset_index(drop=True),
+                        "gap_before": gap_before_series[suspicious_mask].reset_index(drop=True),
+                        "gap_duration": suspicious_diffs.reset_index(drop=True),
+                    }
+                )
+                for _, gap_row in suspicious_rows.iterrows():
+                    gap_after = pd.Timestamp(gap_row["gap_after"])
+                    gap_before = pd.Timestamp(gap_row["gap_before"])
+                    suspicious_gap_ranges.append(
+                        {
+                            "gap_after": gap_after.isoformat(),
+                            "gap_before": gap_before.isoformat(),
+                            "gap_duration": str(gap_row["gap_duration"]),
+                            "request_start": gap_after.strftime("%Y-%m-%d"),
+                            "request_end": gap_before.strftime("%Y-%m-%d"),
+                        }
+                    )
+                repair_request_start = suspicious_gap_ranges[0]["request_start"]
+                repair_request_end = suspicious_gap_ranges[-1]["request_end"]
+            else:
+                quality_state = "gap_free"
+        elif expected_interval is not None:
+            quality_state = "gap_free"
+
+        return {
+            "dataset_id": dataset_id,
+            "resolution": resolution,
+            "quality_state": quality_state,
+            "expected_interval": str(expected_interval) if expected_interval is not None else None,
+            "suspicious_gap_count": suspicious_gap_count,
+            "max_suspicious_gap": str(max_suspicious_gap) if max_suspicious_gap is not None else None,
+            "suspicious_gap_ranges": suspicious_gap_ranges,
+            "repair_request_start": repair_request_start,
+            "repair_request_end": repair_request_end,
+        }
+
+    def compare_dataset_parity(
+        self,
+        primary_dataset_id: str,
+        secondary_dataset_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict:
+        primary = self.load(primary_dataset_id, columns=("timestamp", "close"))
+        secondary = self.load(secondary_dataset_id, columns=("timestamp", "close"))
+        if start:
+            start_ts = self._window_bound_timestamp(start, is_end=False)
+            if start_ts is not None:
+                primary = primary.loc[primary.index >= start_ts]
+                secondary = secondary.loc[secondary.index >= start_ts]
+        if end:
+            end_ts = self._window_bound_timestamp(end, is_end=True)
+            if end_ts is not None:
+                primary = primary.loc[primary.index <= end_ts]
+                secondary = secondary.loc[secondary.index <= end_ts]
+        joined = primary.rename(columns={"close": "primary_close"}).join(
+            secondary.rename(columns={"close": "secondary_close"}),
+            how="inner",
+        )
+        if joined.empty:
+            return {
+                "primary_dataset_id": primary_dataset_id,
+                "secondary_dataset_id": secondary_dataset_id,
+                "parity_state": "no_overlap",
+                "overlap_bar_count": 0,
+                "close_mae": None,
+                "close_mean_abs_bps": None,
+                "close_max_abs_diff": None,
+            }
+        abs_diff = (joined["primary_close"] - joined["secondary_close"]).abs()
+        denominator = joined["primary_close"].abs().replace(0.0, np.nan)
+        abs_bps = (abs_diff / denominator) * 10000.0
+        abs_bps = abs_bps.replace([np.inf, -np.inf], np.nan)
+        close_mae = float(abs_diff.mean())
+        close_mean_abs_bps = float(abs_bps.dropna().mean()) if abs_bps.dropna().size else 0.0
+        close_max_abs_diff = float(abs_diff.max())
+        parity_state = "matching" if close_mean_abs_bps <= 25.0 else "divergent"
+        return {
+            "primary_dataset_id": primary_dataset_id,
+            "secondary_dataset_id": secondary_dataset_id,
+            "parity_state": parity_state,
+            "overlap_bar_count": int(len(joined)),
+            "close_mae": close_mae,
+            "close_mean_abs_bps": close_mean_abs_bps,
+            "close_max_abs_diff": close_max_abs_diff,
+        }

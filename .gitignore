@@ -28,3 +28,6 @@ venv/
 
 # Misc
 *.pdf
+
+# Local installers / large vendor downloads
+ibgateway-*.sh

@@ -62,12 +62,32 @@ class PortfolioExecutionAsset:
     strategy_cls: Type[Strategy]
     strategy_params: Dict[str, Any]
     target_weight: float | None = None
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioExecutionStrategyBlockAsset:
+    dataset_id: str
+    data: pd.DataFrame
+    target_weight: float | None = None
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioExecutionStrategyBlock:
+    block_id: str
+    strategy_cls: Type[Strategy]
+    strategy_params: Dict[str, Any]
+    assets: Sequence[PortfolioExecutionStrategyBlockAsset]
+    budget_weight: float | None = None
+    display_name: str | None = None
 
 
 @dataclass
 class PortfolioExecutionRequest:
     assets: Sequence[PortfolioExecutionAsset]
     config: BacktestConfig
+    strategy_blocks: Sequence[PortfolioExecutionStrategyBlock] = field(default_factory=tuple)
     catalog: Optional[ResultCatalog] = None
     requested_execution_mode: ExecutionMode | str = ExecutionMode.AUTO
     logical_run_id: str | None = None
@@ -282,8 +302,9 @@ class ExecutionOrchestrator:
     def resolve_portfolio(self, request: PortfolioExecutionRequest) -> ExecutionResolution:
         requested_mode = ExecutionMode.from_value(request.requested_execution_mode)
         construction_config = self._normalize_portfolio_construction_config(request.construction_config)
-        support = self._get_vectorized_portfolio_engine().supports(
-            [self._to_portfolio_asset_spec(asset) for asset in request.assets],
+        strategy_blocks = self._normalize_portfolio_strategy_blocks(request)
+        support = self._get_vectorized_portfolio_engine().supports_strategy_blocks(
+            [self._to_portfolio_strategy_block_spec(block) for block in strategy_blocks],
             request.config,
             construction_config,
         )
@@ -311,8 +332,10 @@ class ExecutionOrchestrator:
         resolution = self.resolve_portfolio(request)
         engine = self._get_vectorized_portfolio_engine()
         construction_config = self._normalize_portfolio_construction_config(request.construction_config)
-        dataset_label = request.portfolio_dataset_id or self._portfolio_dataset_label(request.assets)
-        start_bound, end_bound = self._portfolio_index_bounds(request.assets, request.config)
+        strategy_blocks = self._normalize_portfolio_strategy_blocks(request)
+        flattened_assets = self._flatten_portfolio_strategy_blocks(strategy_blocks)
+        dataset_label = request.portfolio_dataset_id or self._portfolio_dataset_label(flattened_assets)
+        start_bound, end_bound = self._portfolio_index_bounds(flattened_assets, request.config)
         identity_payload = {
             "assets": [
                 {
@@ -320,8 +343,27 @@ class ExecutionOrchestrator:
                     "strategy": asset.strategy_cls.__name__,
                     "params": asset.strategy_params,
                     "target_weight": asset.target_weight,
+                    "display_name": asset.display_name,
                 }
-                for asset in request.assets
+                for asset in flattened_assets
+            ],
+            "strategy_blocks": [
+                {
+                    "block_id": block.block_id,
+                    "display_name": block.display_name,
+                    "budget_weight": block.budget_weight,
+                    "strategy": block.strategy_cls.__name__,
+                    "params": block.strategy_params,
+                    "assets": [
+                        {
+                            "dataset_id": asset.dataset_id,
+                            "target_weight": asset.target_weight,
+                            "display_name": asset.display_name,
+                        }
+                        for asset in block.assets
+                    ],
+                }
+                for block in strategy_blocks
             ],
             "normalize_weights": request.normalize_weights,
             "construction_config": {
@@ -346,15 +388,18 @@ class ExecutionOrchestrator:
                 "fee_schedule": request.config.fee_schedule,
                 "slippage": request.config.slippage,
                 "slippage_schedule": request.config.slippage_schedule,
+                "borrow_rate": request.config.borrow_rate,
                 "fill_ratio": request.config.fill_ratio,
                 "fill_on_close": request.config.fill_on_close,
+                "recalc_on_fill": request.config.recalc_on_fill,
+                "allow_short": request.config.allow_short,
                 "prevent_scale_in": request.config.prevent_scale_in,
                 "one_order_per_signal": request.config.one_order_per_signal,
                 "risk_free_rate": request.config.risk_free_rate,
             },
         }
         logical_run_id = request.logical_run_id or compute_portfolio_logical_run_id(
-            dataset_ids=[asset.dataset_id for asset in request.assets],
+            dataset_ids=[asset.dataset_id for asset in flattened_assets],
             strategy="PortfolioExecution",
             params=identity_payload,
             config=request.config,
@@ -377,10 +422,17 @@ class ExecutionOrchestrator:
                 asset_market_values=empty_frame,
                 asset_weights=empty_frame.copy(),
                 target_weights=empty_frame.copy(),
+                strategy_market_values=empty_frame.copy(),
+                strategy_weights=empty_frame.copy(),
+                strategy_target_weights=empty_frame.copy(),
                 positions=empty_frame.copy(),
                 cash_curve=pd.Series(dtype=float, index=empty_index, name="cash"),
                 trades=[],
                 metrics=cached.metrics,
+                asset_to_strategy_block={},
+                asset_source_dataset_ids={},
+                strategy_display_names={},
+                strategy_budget_weights={},
             )
             return PortfolioExecutionResult(
                 run_id=run_id,
@@ -395,19 +447,23 @@ class ExecutionOrchestrator:
                 cached=True,
             )
 
-        from .vectorized_portfolio import PortfolioAssetSpec
+        from .vectorized_portfolio import PortfolioStrategyBlockSpec
 
         run_started_at = pd.Timestamp.now("UTC").isoformat()
-        result = engine.run(
+        result = engine.run_strategy_blocks(
             [
-                PortfolioAssetSpec(
-                    dataset_id=asset.dataset_id,
-                    data=asset.data,
-                    strategy_cls=asset.strategy_cls,
-                    strategy_params=asset.strategy_params,
-                    target_weight=asset.target_weight,
+                PortfolioStrategyBlockSpec(
+                    block_id=block.block_id,
+                    strategy_cls=block.strategy_cls,
+                    strategy_params=block.strategy_params,
+                    assets=[
+                        self._to_portfolio_strategy_block_asset_spec(asset)
+                        for asset in block.assets
+                    ],
+                    budget_weight=block.budget_weight,
+                    display_name=block.display_name,
                 )
-                for asset in request.assets
+                for block in strategy_blocks
             ],
             request.config,
             normalize_weights=request.normalize_weights,
@@ -696,7 +752,101 @@ class ExecutionOrchestrator:
             strategy_cls=asset.strategy_cls,
             strategy_params=asset.strategy_params,
             target_weight=asset.target_weight,
+            display_name=asset.display_name,
         )
+
+    @staticmethod
+    def _to_portfolio_strategy_block_asset_spec(asset: PortfolioExecutionStrategyBlockAsset):
+        from .vectorized_portfolio import PortfolioStrategyBlockAssetSpec
+
+        return PortfolioStrategyBlockAssetSpec(
+            dataset_id=asset.dataset_id,
+            data=asset.data,
+            target_weight=asset.target_weight,
+            display_name=asset.display_name,
+        )
+
+    @staticmethod
+    def _to_portfolio_strategy_block_spec(block: PortfolioExecutionStrategyBlock):
+        from .vectorized_portfolio import PortfolioStrategyBlockSpec
+
+        return PortfolioStrategyBlockSpec(
+            block_id=block.block_id,
+            strategy_cls=block.strategy_cls,
+            strategy_params=block.strategy_params,
+            assets=[
+                ExecutionOrchestrator._to_portfolio_strategy_block_asset_spec(asset)
+                for asset in block.assets
+            ],
+            budget_weight=block.budget_weight,
+            display_name=block.display_name,
+        )
+
+    def _normalize_portfolio_strategy_blocks(
+        self,
+        request: PortfolioExecutionRequest,
+    ) -> list[PortfolioExecutionStrategyBlock]:
+        if request.strategy_blocks:
+            return list(request.strategy_blocks)
+        if not request.assets:
+            raise UnsupportedExecutionModeError(
+                "Portfolio execution requires assets or strategy_blocks to be defined."
+            )
+        blocks: list[PortfolioExecutionStrategyBlock] = []
+        block_lookup: dict[tuple[str, tuple[tuple[str, str], ...]], PortfolioExecutionStrategyBlock] = {}
+        block_counts: dict[str, int] = {}
+        for asset in request.assets:
+            signature = (
+                asset.strategy_cls.__name__,
+                tuple(sorted((str(key), repr(value)) for key, value in dict(asset.strategy_params).items())),
+            )
+            existing = block_lookup.get(signature)
+            if existing is None:
+                base = asset.strategy_cls.__name__
+                block_counts[base] = block_counts.get(base, 0) + 1
+                block_id = base if block_counts[base] == 1 else f"{base}_{block_counts[base]}"
+                existing = PortfolioExecutionStrategyBlock(
+                    block_id=block_id,
+                    strategy_cls=asset.strategy_cls,
+                    strategy_params=dict(asset.strategy_params),
+                    assets=tuple(),
+                    budget_weight=None,
+                    display_name=base,
+                )
+                block_lookup[signature] = existing
+                blocks.append(existing)
+            updated_assets = list(existing.assets)
+            updated_assets.append(
+                PortfolioExecutionStrategyBlockAsset(
+                    dataset_id=asset.dataset_id,
+                    data=asset.data,
+                    target_weight=asset.target_weight,
+                    display_name=asset.display_name,
+                )
+            )
+            updated_block = replace(existing, assets=tuple(updated_assets))
+            block_lookup[signature] = updated_block
+            blocks[blocks.index(existing)] = updated_block
+        return blocks
+
+    @staticmethod
+    def _flatten_portfolio_strategy_blocks(
+        strategy_blocks: Sequence[PortfolioExecutionStrategyBlock],
+    ) -> list[PortfolioExecutionAsset]:
+        assets: list[PortfolioExecutionAsset] = []
+        for block in strategy_blocks:
+            for asset in block.assets:
+                assets.append(
+                    PortfolioExecutionAsset(
+                        dataset_id=asset.dataset_id,
+                        data=asset.data,
+                        strategy_cls=block.strategy_cls,
+                        strategy_params=dict(block.strategy_params),
+                        target_weight=asset.target_weight,
+                        display_name=asset.display_name,
+                    )
+                )
+        return assets
 
     @staticmethod
     def _normalize_portfolio_construction_config(construction_config: Any):

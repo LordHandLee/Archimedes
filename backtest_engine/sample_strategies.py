@@ -36,6 +36,8 @@ def compute_zscore_mean_reversion_features(data: pd.DataFrame, params: dict) -> 
     atr_mult = float(params.get("atr_mult", 1.0))
     long_entry_z = float(params.get("long_entry_z", -1.0))
     long_exit_z = float(params.get("long_exit_z", 0.0))
+    short_entry_z = float(params.get("short_entry_z", 1.0))
+    short_exit_z = float(params.get("short_exit_z", 0.0))
 
     lag = src.shift(1)
     delta = src - lag
@@ -90,15 +92,31 @@ def compute_zscore_mean_reversion_features(data: pd.DataFrame, params: dict) -> 
     prev_z = z_score.shift(1)
     long_entry_signal = ((z_score < long_entry_z) & (prev_z >= long_entry_z)).fillna(False)
     long_exit_signal = ((z_score > long_exit_z) & (prev_z <= long_exit_z)).fillna(False)
+    short_entry_signal = ((z_score > short_entry_z) & (prev_z <= short_entry_z)).fillna(False)
+    short_exit_signal = ((z_score < short_exit_z) & (prev_z >= short_exit_z)).fillna(False)
 
     long_state_values = np.zeros(len(data), dtype=bool)
+    short_state_values = np.zeros(len(data), dtype=bool)
     in_position = False
-    for i, (exit_now, entry_now) in enumerate(zip(long_exit_signal.to_numpy(dtype=bool), long_entry_signal.to_numpy(dtype=bool))):
-        if exit_now and in_position:
+    in_short = False
+    for i, (long_exit_now, long_entry_now, short_exit_now, short_entry_now) in enumerate(
+        zip(
+            long_exit_signal.to_numpy(dtype=bool),
+            long_entry_signal.to_numpy(dtype=bool),
+            short_exit_signal.to_numpy(dtype=bool),
+            short_entry_signal.to_numpy(dtype=bool),
+        )
+    ):
+        if short_exit_now and in_short:
+            in_short = False
+        if long_exit_now and in_position:
             in_position = False
-        elif entry_now and not in_position:
+        if long_entry_now and not in_position and not in_short:
             in_position = True
+        elif short_entry_now and not in_short and not in_position:
+            in_short = True
         long_state_values[i] = in_position
+        short_state_values[i] = in_short
 
     return pd.DataFrame(
         {
@@ -107,7 +125,10 @@ def compute_zscore_mean_reversion_features(data: pd.DataFrame, params: dict) -> 
             "z_score": z_score,
             "long_entry_signal": long_entry_signal.astype(bool),
             "long_exit_signal": long_exit_signal.astype(bool),
+            "short_entry_signal": short_entry_signal.astype(bool),
+            "short_exit_signal": short_exit_signal.astype(bool),
             "long_state": pd.Series(long_state_values, index=data.index),
+            "short_state": pd.Series(short_state_values, index=data.index),
             "estimated_half_life_bars": estimated_half_life,
             "effective_half_life_bars": pd.Series(effective_half_life, index=data.index),
             "atr": atr,

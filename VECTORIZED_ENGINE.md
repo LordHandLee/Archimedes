@@ -662,8 +662,10 @@ Portfolio support should be phased carefully.
 ### Version 1
 
 - allow independent batched runs for research studies
-- allow a narrow shared-capital portfolio mode with same-timeframe, long-only semantics
+- allow a narrow shared-capital portfolio mode with same-timeframe semantics
+- allow short exposure on the vectorized portfolio backend for supported strategies
 - keep portfolio ownership rules explicit so portfolio logic does not silently replace strategy-owned sizing
+- keep the missing portfolio reference-engine fallback explicit until it is actually implemented
 
 ### Later Version
 
@@ -865,7 +867,6 @@ Current implemented portfolio-aware scope:
 
 - shared-cash multi-asset execution in a dedicated vectorized portfolio engine
 - same-timeframe only
-- long-only only
 - adapter-driven signal generation using the existing SMA and z-score vectorized adapters
 - explicit allocation ownership modes: `Strategy-Owned`, `Portfolio-Owned`, and `Hybrid`
 - explicit portfolio weighting modes, currently `Preserve Strategy Weights`, `Equal Weight Selected`, and `Score-Proportional`
@@ -882,6 +883,15 @@ Current implemented portfolio-aware scope:
 - initial portfolio chart artifact support through Magellan snapshot export using synthetic equity-derived bars plus portfolio weight/cash panes
 - initial portfolio attribution/reporting support with per-asset weights, tracking error, realized PnL, turnover, cash-weight, and exposure summaries
 - built-in portfolio fallback viewer with equity, exposure, asset-weight, and attribution-table views when Magellan is unavailable
+- explicit strategy-block portfolio execution under the shared execution contract
+- one or more strategy blocks per portfolio, with one or more assets attached to each block
+- strategy-level budget caps that can constrain block exposure without silently replacing strategy-owned sizing
+- strategy-level attribution frames and reporting alongside the existing asset-level views
+- safe handling of repeated underlying assets across multiple strategy blocks through disambiguated runtime labels
+- portfolio walk-forward support for both shared-strategy and fixed strategy-block portfolios
+- portfolio-specific walk-forward study views with fold analysis, stitched OOS equity, and portfolio-structure reporting
+- portfolio-native optimization viewer polish for shared-strategy portfolio studies, replacing the misleading generic asset-distribution framing
+- fixed strategy-block portfolio candidate promotion / reduced-candidate gating for walk-forward through promoted portfolio-definition queue entries
 
 Allocation ownership rules:
 
@@ -899,14 +909,26 @@ Design rule:
 - Portfolio-owned ranking and rebalance rules should only be enabled through an explicit ownership mode or user override.
 - This matters especially for multi-asset strategies whose alpha depends on their internal sizing logic.
 
+Regime overlay rules:
+
+- regime detection should remain a separate overlay component, not something implicitly fused into the vectorized execution kernel
+- a regime overlay may gate, cap, or scale strategy blocks, but it must respect allocation ownership
+- if a strategy already uses regime-aware sizing internally, a portfolio-owned regime overlay must not silently scale it again
+- the platform should support explicit `Strategy-Owned`, `Portfolio-Owned`, and `Hybrid` regime usage modes, mirroring the allocation-ownership model
+
 Current non-goals inside portfolio v1:
 
 - full portfolio UI/editor
-- shorting inside portfolio mode
 - pending-order portfolio books
 - advanced cross-asset ranking and selection rules beyond the initial explicit `Top N` and `Score Threshold` modes
 - base-execution parity
 - richer portfolio performance decomposition and custom report layouts beyond the initial attribution summary and fallback viewer
+
+Still missing after the current portfolio v1 work:
+
+- a reference-engine portfolio fallback for correctness anchoring and unsupported-portfolio semantics
+- full portfolio `base_execution` parity
+- deeper portfolio Monte Carlo and cross-study robustness tooling
 
 This phase should not be treated as "done" until:
 

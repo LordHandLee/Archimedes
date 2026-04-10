@@ -115,6 +115,16 @@ Version 1 recommended defaults:
 - one asset universe per study
 - one consistent execution model across all folds
 
+Current implemented scope now also includes a narrow portfolio path:
+
+- shared-strategy portfolio walk-forward across multiple assets
+- fixed strategy-block portfolio walk-forward
+- reduced-candidate support for shared-strategy portfolios
+- reduced-candidate support for fixed strategy-block portfolios through promoted fixed definitions
+- portfolio-specific fold analysis/reporting on saved walk-forward studies
+- portfolio validation-chain views that can jump back to promoted portfolio candidates and forward to linked Monte Carlo studies
+- this still depends on the vectorized portfolio backend because a reference-engine portfolio fallback has not been implemented yet
+
 Execution-mode behavior should follow the hybrid-engine design in [VECTORIZED_ENGINE.md](/home/ethan/quant_backtest_engine/VECTORIZED_ENGINE.md).
 
 ## Candidate Source
@@ -368,6 +378,11 @@ Columns:
 - test drawdown
 - test run id
 
+Version 1 implementation should also allow:
+
+- opening the saved train-fold optimization study for the selected fold
+- opening the saved out-of-sample test run for the selected fold
+
 ### 3. Stitched OOS Equity View
 
 Primary use:
@@ -379,12 +394,15 @@ Primary use:
 Primary use:
 
 - see whether chosen parameters remain stable or keep jumping
+- review selected parameter values by fold
+- count parameter switches and total numeric drift by fold
 
 ### 5. Train vs Test Degradation View
 
 Primary use:
 
 - inspect how much performance falls from train to test
+- compare train ranking quality to realized out-of-sample Sharpe
 
 ## Recommended Version 1 Workflow
 

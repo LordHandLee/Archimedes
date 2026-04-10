@@ -8,6 +8,7 @@ The design must support:
 
 - simple single-asset backtests with minimal friction
 - portfolio backtests spanning one or more strategies and one or more assets
+- reusable universes that can drive download, backtest, portfolio, and automation workflows
 - a complete research pipeline from parameter search through robustness testing
 - snapshot-based chart review with a custom C++ stock chart visualizer
 - a future vectorized execution path for large-scale research workloads
@@ -67,12 +68,67 @@ This structure enables:
 - A cleaner normalizes all bars to a canonical OHLCV schema with UTC timestamps.
 - Canonical data is stored in Parquet and registered through DuckDB metadata.
 - Resampling remains centralized so all engines and reports consume the same market data definitions.
+- Data acquisition should eventually support both manual asset selection and reusable named universes.
+- Download should default to a unified `fetch -> normalize -> ingest -> catalog update` pipeline rather than a split raw-download/manual-import workflow.
+- A source-aware acquisition layer should resolve provider choice, provenance, and ingest policy cleanly.
+
+Current implementation note:
+
+- the platform now has an initial provider registry and source-aware download plumbing
+- the current provider registry includes `Massive`, `Stooq`, and `Interactive Brokers`
+- universes and scheduled tasks can carry source preference
+- a durable acquisition catalog now tracks runs, attempts, coverage, and ingest state
+- an initial acquisition policy layer can choose between `download`, `ingest existing CSV`, and `skip fresh`
+- users can explicitly override freshness with a `force refresh` policy when they want a re-download anyway
+- dataset-level acquisition review is now reachable from multiple UI surfaces, not only the Automate tab
+- local datasets now have an initial suspicious-gap quality check, but not a full automatic gap-repair engine yet
+- the acquisition layer now has an initial refresh planner that can recommend `incremental refresh`, `backfill`, or `full rebuild`, but it still remains an early v1 policy layer
+- isolated fresh-but-gappy datasets can now trigger same-source gap-repair refresh windows, including non-contiguous multi-window repair when needed
+- broader `gappy + stale` and `gappy + backfill` cases can now use compound multi-window refresh plans instead of jumping straight to a full rebuild
+- isolated gaps can now also use a first cross-source parity / secondary-source gap-fill path when a matching alternate local dataset exists
+- a first hybrid multi-step repair path now exists for `cross-source gap-fill + primary incremental refresh` when a matching secondary local dataset can repair internal gaps and the primary source still needs a right-edge refresh
+- deeper hybrid multi-step repair remains intentionally deferred and must remain documented as unfinished
+- provider settings now exist as a first-class configuration layer: non-secret provider config such as Interactive Brokers connection settings is stored in SQLite metadata, while secrets such as API keys are supplied from a local secret store at runtime
+- full multi-source provider comparison, gap-fill, and merge logic is still intentionally deferred and must remain documented as future work
 
 ### Historical Store
 
 - DuckDB plus Parquet remains the system of record for historical bar data.
 - Data is organized by dataset and asset, with consistent timeframe derivation rules.
 - The store must evolve to support loading multiple assets efficiently for portfolio and vectorized workloads.
+
+### Universe Layer
+
+The system should include a first-class `Universe` layer between raw datasets and launched workflows.
+
+A universe is a reusable named collection of assets or datasets that can be used by:
+
+- data download requests
+- scheduled acquisition tasks
+- single-strategy multi-asset backtests
+- portfolio construction
+- downstream research workflows that inherit those runs
+
+Design rules:
+
+- a universe is not a portfolio
+- a universe is not a strategy
+- a universe is an input scope that can be reused across workflows
+- manual asset selection must remain available alongside universe-driven workflows
+
+This supports a simpler user path such as:
+
+- `Backtest -> strategy -> universe`
+- `Portfolio -> strategy/s -> universe`
+- `Download -> source -> universe`
+- `Schedule -> source -> universe`
+
+Current implementation note:
+
+- universes can already seed data download, scheduled refresh, backtests, and shared-strategy portfolio studies
+- explicit strategy-block portfolio authoring can now also use universes more directly, including one-block-per-dataset shortcuts inside the strategy block editor
+- the strategy block editor can now also expand the current strategy-template set across a selected universe to build a full strategy-by-dataset block matrix quickly
+- saved reusable strategy-aware universe templates and strategy-block presets attached to universes are still intentionally deferred
 
 ### Metadata, Results, and Artifacts Catalog
 
@@ -85,17 +141,24 @@ It should track at minimum:
 - walk-forward studies
 - Monte Carlo studies
 - portfolio definitions
+- universe definitions
+- scheduled acquisition tasks
+- scheduled task runs
+- acquisition runs and per-symbol acquisition attempts
 - chart snapshots
 - generated reports and visual assets
 
 The catalog should preserve strong lineage so every downstream artifact can be traced back to:
 
 - data selection
+- universe selection if applicable
 - engine mode
 - strategy version
 - parameter set
 - portfolio definition
 - run timestamps
+
+Broader cross-study/data lineage visibility should continue expanding over time so acquisition artifacts, universes, backtests, optimization studies, walk-forward studies, Monte Carlo studies, and deployment artifacts can all be navigated as one connected validation chain.
 
 ### Execution Architecture
 
@@ -180,12 +243,47 @@ Initial portfolio construction modes should stay explicit and simple:
 - allocation constraints such as `Min Active Weight`, `Max Asset Weight`, and `Cash Reserve Weight`
 - rebalance modes such as `On Change`, `On Change + Periodic`, `On Change + Drift Threshold`, and `On Change + Periodic + Drift Threshold`
 
+Current implementation note:
+
+- portfolio execution is available today through the vectorized portfolio backend
+- portfolio short support exists there for supported strategies, but it still uses same-timeframe vectorized semantics
+- a reference-engine portfolio fallback is still intentionally missing and must remain documented as unfinished until it exists
+- unsupported portfolio semantics should continue to fail clearly instead of pretending a hidden fallback exists
+
 Design rule:
 
 - Portfolio ranking or rebalancing must never silently override a strategy that already owns its own allocation logic.
 - Portfolio weighting overrides must never silently replace strategy-owned sizing unless the user explicitly chooses `Portfolio-Owned Allocation`.
 - If a user wants portfolio-level ranking or rebalancing to replace strategy-owned sizing, that must be an explicit mode choice, not an implicit side effect.
 - This distinction is critical for multi-asset strategies whose alpha logic already includes capital-allocation behavior.
+
+### Regime Overlay Layer
+
+Regime detection should be modeled as a reusable overlay layer, not embedded ad hoc into every strategy.
+
+Target responsibilities:
+
+- produce a regime state, confidence, or score series
+- expose that regime output to strategies, portfolio construction, paper execution, and live execution
+- keep regime logic separable from signal generation and portfolio accounting
+
+The system should explicitly support three regime-integration modes:
+
+- `Strategy-Owned Regime Usage`
+  The strategy consumes regime state directly and changes its own sizing or signal behavior.
+- `Portfolio-Owned Regime Overlay`
+  The portfolio layer uses regime state to gate, cap, rank, or scale strategies and blocks.
+- `Hybrid Regime Overlay`
+  Strategies may size internally, while the regime overlay applies top-level throttles, caps, or enable/disable rules.
+
+Design rules:
+
+- a regime detector must never silently double-scale a strategy that is already using regime-aware sizing internally
+- if both the strategy and portfolio layers consume regime state, the ownership boundary must be explicit
+- the portfolio layer may gate or cap strategy-owned sizing, but it must not silently replace it unless the user explicitly chooses a portfolio-owned override
+- regime overlays should work at the portfolio, strategy-block, and asset levels depending on the selected ownership mode
+
+This keeps regime logic composable while preventing accidental leverage stacking or duplicate capital scaling.
 
 ### Charting and Visualization
 
@@ -335,6 +433,8 @@ In practice, the broader research-to-live pipeline is:
 
 For multi-strategy or multi-asset deployment, portfolio construction and sizing should sit between validation and paper/live deployment.
 
+The monitoring and revalidation stage should eventually include explicit strategy health/decay tracking over time so the platform can compare recent live, paper, and out-of-sample behavior against historical validation baselines and surface drift in return, drawdown, turnover, exposure, and other health signals.
+
 ## User Interface Model
 
 The UI should separate workflows into clear tabs while reusing the same underlying catalog and artifact system.
@@ -342,6 +442,7 @@ The UI should separate workflows into clear tabs while reusing the same underlyi
 Recommended top-level tabs:
 
 - `Market`
+- `Universe Builder`
 - `Backtest`
 - `Optimization`
 - `Walk Forward`
@@ -356,11 +457,16 @@ Design rules:
 - Walk-forward optimization and Monte Carlo should be separate tabs.
 - The `Market` tab should let the user browse or search ticker symbols and open them in Magellan.
 - The `Market` tab should combine historical data with live updates and allow user-selected indicators on the chart.
+- The `Universe Builder` tab should let the user create and manage named universes of assets.
+- A universe should be usable from download, scheduling, backtest, and portfolio flows without forcing the user to rebuild the same asset list repeatedly.
 - Single-asset backtests should remain easy to launch from the `Backtest` tab.
+- The `Backtest` tab should allow either manual dataset selection or choosing a saved universe.
 - The `Portfolio` tab should allow the user to define one-strategy/one-asset cases as well as richer multi-strategy, multi-asset structures.
+- The `Portfolio` tab should allow either manual asset selection or choosing a saved universe as the asset scope before applying portfolio logic.
 - The `Paper Engine` tab should allow validated strategies or portfolios to be deployed into paper testing and monitored in real time.
 - The `Live Deployment` tab should be a separate controlled area for live promotion, runtime controls, and health monitoring.
 - All tabs should read and write shared run metadata, snapshots, and study records rather than inventing separate storage paths.
+- Scheduled acquisition should be visible as a first-class managed workflow with start/stop, edit/delete, and historical run tracking.
 
 ## Typical Workflows
 
@@ -372,15 +478,24 @@ Design rules:
 4. Persist results, trades, metrics, and chart snapshot artifacts.
 5. Review performance and open Magellan.
 
+### Universe-Scoped Backtest
+
+1. Select one saved universe or manually choose multiple datasets.
+2. Select one strategy and parameter set.
+3. Choose the execution or study mode appropriate for the workflow.
+4. Run the strategy across the resolved universe.
+5. Persist per-run and aggregated outputs with the selected universe captured in lineage metadata.
+
 ### Portfolio Backtest
 
 1. Define a portfolio.
 2. Attach one or more strategies.
-3. Attach one or more assets to each strategy as allowed by the strategy design.
-4. Choose the allocation ownership mode for the portfolio or strategy block.
-5. Define allocation, ranking, rebalance, and risk rules that are valid for that ownership mode.
-6. Run the portfolio through the portfolio-aware engine.
-7. Persist portfolio, strategy, and asset attribution outputs.
+3. Attach one or more assets manually or choose a saved universe as the portfolio input scope.
+4. Attach one or more assets to each strategy as allowed by the strategy design.
+5. Choose the allocation ownership mode for the portfolio or strategy block.
+6. Define allocation, ranking, rebalance, and risk rules that are valid for that ownership mode.
+7. Run the portfolio through the portfolio-aware engine.
+8. Persist portfolio, strategy, and asset attribution outputs.
 
 Portfolio rule:
 
@@ -392,6 +507,14 @@ Portfolio rule:
 2. Promote selected candidates into walk-forward studies.
 3. Promote robust walk-forward candidates into Monte Carlo analysis.
 4. Compare results at the strategy and portfolio level before adoption.
+
+### Data Acquisition And Refresh
+
+1. Choose a source and either a manual symbol list or a saved universe.
+2. Launch a download / ingest request or schedule it for later execution.
+3. Persist task definitions and task-run history in the metadata catalog.
+4. Update canonical dataset coverage, freshness, and failure metadata.
+5. Reuse the resulting datasets or universes in backtest and portfolio workflows.
 
 ### Market Analysis
 

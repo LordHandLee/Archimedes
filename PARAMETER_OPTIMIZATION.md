@@ -179,6 +179,7 @@ Each optimization study should produce:
 - ranked candidate parameter sets
 - saved heatmap artifacts
 - saved distribution views for selected candidates
+- a persisted candidate queue for manual promotion into later validation
 
 Each promoted candidate should carry:
 
@@ -190,6 +191,16 @@ Each promoted candidate should carry:
 - artifact references
 
 This is the handoff contract to the later walk-forward module described in [WALK_FORWARD_OPTIMIZATION.md](/home/ethan/quant_backtest_engine/WALK_FORWARD_OPTIMIZATION.md).
+
+Version 1 now includes manual candidate promotion in the dashboard. Users can select a parameter set from the optimization study view, record a promotion reason and notes, and persist the candidate for later walk-forward setup.
+
+Portfolio optimization now also includes a portfolio-native validation chain view for portfolio studies:
+
+- promoted portfolio candidates can be reviewed alongside their stored portfolio structure
+- linked walk-forward studies can be compared from the same review flow
+- downstream Monte Carlo studies can be reviewed from the same chain
+
+That keeps portfolio candidate review closer to the actual validation path instead of treating portfolio studies like generic single-asset optimization output.
 
 ## Data Model
 

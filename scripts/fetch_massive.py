@@ -39,7 +39,9 @@ except Exception:  # pragma: no cover
 
 
 API_HOST = "https://api.polygon.io"
-API_KEY_ENV = "AAw8ohj8iAa7ENJ9YFpMmjMBbAZZhGVF"
+API_KEY_ENV = "MASSIVE_API_KEY"
+# Temporary migration note: keep the previous key commented here so it can be copied manually if needed.
+# LEGACY_MASSIVE_API_KEY = "AAw8ohj8iAa7ENJ9YFpMmjMBbAZZhGVF"
 
 
 def _iso_date(dt_obj: dt.datetime) -> str:
@@ -161,14 +163,14 @@ def main() -> None:
     parser.add_argument("--pace", type=float, default=12.5, help="Seconds to sleep between page requests to avoid 429s (default 12.5 ~ 5 calls/min)")
     parser.add_argument("--limit", type=int, default=50000, help="Page size 1-50000 (use 50000 to minimize calls).")
     parser.add_argument("--unadjusted", action="store_true", help="Request unadjusted data (default: adjusted).")
+    parser.add_argument("--api-key", type=str, default="", help=f"Optional Massive/Polygon API key. Falls back to ${API_KEY_ENV}.")
     parser.add_argument("--progress", action="store_true", help="Emit progress JSON on stdout.")
     parser.add_argument("--resume", action="store_true", help="Resume from saved state if present.")
     args = parser.parse_args()
 
-    # api_key = os.getenv(API_KEY_ENV)
-    # if not api_key:
-    #     raise SystemExit(f"Set {API_KEY_ENV} environment variable.")
-    api_key = API_KEY_ENV
+    api_key = str(args.api_key or os.getenv(API_KEY_ENV) or "").strip()
+    if not api_key:
+        raise SystemExit(f"Set {API_KEY_ENV} environment variable or pass --api-key.")
 
     today = dt.datetime.now(dt.UTC).date()
     default_end = today

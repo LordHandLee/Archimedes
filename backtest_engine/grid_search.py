@@ -18,6 +18,8 @@ from .execution import (
     ExecutionOrchestrator,
     PortfolioExecutionAsset,
     PortfolioExecutionRequest,
+    PortfolioExecutionStrategyBlock,
+    PortfolioExecutionStrategyBlockAsset,
     UnsupportedExecutionModeError,
     WorkloadType,
 )
@@ -25,7 +27,13 @@ from .strategy import Strategy
 from .catalog import ResultCatalog
 from .reporting import plot_param_heatmap
 from .vectorized_engine import VectorizedEngine
-from .vectorized_portfolio import PortfolioAssetSpec, PortfolioConstructionConfig, VectorizedPortfolioEngine
+from .vectorized_portfolio import (
+    PortfolioAssetSpec,
+    PortfolioConstructionConfig,
+    PortfolioStrategyBlockAssetSpec,
+    PortfolioStrategyBlockSpec,
+    VectorizedPortfolioEngine,
+)
 
 
 def _hash_heatmap(payload: Dict) -> str:
@@ -56,6 +64,24 @@ class PortfolioAssetTarget:
     dataset_id: str
     data_loader: Callable[[str], pd.DataFrame]
     target_weight: float | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioStrategyBlockAssetTarget:
+    dataset_id: str
+    data_loader: Callable[[str], pd.DataFrame]
+    target_weight: float | None = None
+    display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioStrategyBlockTarget:
+    block_id: str
+    strategy_cls: Type[Strategy]
+    strategy_params: Dict
+    assets: Sequence[PortfolioStrategyBlockAssetTarget]
+    budget_weight: float | None = None
+    display_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +202,11 @@ class GridSearch:
                             "timeframe": timeframe,
                             "start": start,
                             "end": end,
+                            "total_return": metrics.get("total_return"),
+                            "cagr": metrics.get("cagr"),
+                            "max_drawdown": metrics.get("max_drawdown"),
+                            "sharpe": metrics.get("sharpe"),
+                            "rolling_sharpe": metrics.get("rolling_sharpe"),
                             grid.metric: metrics[grid.metric],
                             "run_id": result.run_id,
                             "logical_run_id": result.logical_run_id,
@@ -414,6 +445,11 @@ def run_vectorized_portfolio_grid_search(
                         "timeframe": timeframe,
                         "start": start,
                         "end": end,
+                        "total_return": metrics.get("total_return"),
+                        "cagr": metrics.get("cagr"),
+                        "max_drawdown": metrics.get("max_drawdown"),
+                        "sharpe": metrics.get("sharpe"),
+                        "rolling_sharpe": metrics.get("rolling_sharpe"),
                         grid.metric: metrics[grid.metric],
                         "run_id": portfolio_result.run_id,
                         "logical_run_id": portfolio_result.logical_run_id,
@@ -439,6 +475,200 @@ def run_vectorized_portfolio_grid_search(
                     bars=bars,
                     total_params=len(param_grid),
                     cached_runs=cached_runs,
+                    uncached_runs=uncached_runs,
+                    duration_seconds=perf_counter() - started,
+                    chunk_count=1 if uncached_runs else 0,
+                    chunk_sizes=(uncached_runs,) if uncached_runs else (),
+                    effective_param_batch_size=uncached_runs if uncached_runs else None,
+                    prepared_context_reused=False,
+                )
+            )
+
+    frame = pd.DataFrame(records)
+    frame.attrs["batch_benchmarks"] = tuple(per_batch)
+    return frame
+
+
+def run_vectorized_strategy_block_portfolio_search(
+    *,
+    strategy_blocks: Sequence[PortfolioStrategyBlockTarget],
+    base_config: BacktestConfig,
+    grid: GridSpec,
+    catalog: Optional[ResultCatalog],
+    stop_cb: Optional[Callable[[], bool]] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    normalize_weights: bool = True,
+    construction_config: PortfolioConstructionConfig | None = None,
+) -> pd.DataFrame:
+    if not strategy_blocks:
+        return pd.DataFrame()
+
+    requested_mode = ExecutionMode.from_value(grid.execution_mode)
+    if requested_mode == ExecutionMode.REFERENCE:
+        raise UnsupportedExecutionModeError(
+            "Portfolio strategy-block studies currently require Auto or Vectorized. Reference portfolio execution is not implemented."
+        )
+
+    engine = VectorizedPortfolioEngine()
+    orchestrator = ExecutionOrchestrator()
+    construction = construction_config or PortfolioConstructionConfig()
+    records: List[Dict] = []
+    per_batch: List[BatchExecutionBenchmark] = []
+    tf_list = list(grid.timeframes)
+    horizon_list = list(grid.horizons)
+    total = max(1, len(tf_list) * len(horizon_list))
+    if progress_cb:
+        progress_cb(0, total)
+    done = 0
+    dataset_ids = list(
+        dict.fromkeys(
+            asset.dataset_id
+            for block in strategy_blocks
+            for asset in block.assets
+            if asset.dataset_id
+        )
+    )
+    block_names = [str(block.display_name or block.block_id) for block in strategy_blocks]
+    dataset_label = "Portfolio | " + ", ".join(dataset_ids)
+    batch_id = grid.batch_id or f"portfolio_blocks_{uuid.uuid4().hex[:8]}"
+    helper_engine = VectorizedEngine()
+    placeholder_params = {"portfolio_blocks": len(strategy_blocks)}
+
+    for timeframe in tf_list:
+        loaded_frames = {
+            dataset_id: next(
+                asset.data_loader(timeframe)
+                for block in strategy_blocks
+                for asset in block.assets
+                if asset.dataset_id == dataset_id
+            )
+            for dataset_id in dataset_ids
+        }
+        for (start, end) in horizon_list:
+            config = replace(
+                base_config,
+                batch_id=batch_id,
+                timeframe=timeframe,
+                time_horizon_start=start,
+                time_horizon_end=end,
+                base_execution=False,
+            )
+            sliced_frames = []
+            for block in strategy_blocks:
+                for asset in block.assets:
+                    normalized = helper_engine._normalize_data(loaded_frames[asset.dataset_id])
+                    sliced = helper_engine._slice_data(normalized, config)
+                    sliced_frames.append((block, asset, sliced))
+            if not sliced_frames:
+                continue
+            common_index = sliced_frames[0][2].index
+            for _, _, frame in sliced_frames[1:]:
+                common_index = common_index.intersection(frame.index)
+            if common_index.empty:
+                raise ValueError("Portfolio strategy-block study could not align a non-empty common timestamp index.")
+            bars = len(common_index)
+            support = engine.supports_strategy_blocks(
+                [
+                    PortfolioStrategyBlockSpec(
+                        block_id=block.block_id,
+                        strategy_cls=block.strategy_cls,
+                        strategy_params=block.strategy_params,
+                        assets=[
+                            PortfolioStrategyBlockAssetSpec(
+                                dataset_id=asset.dataset_id,
+                                data=loaded_frames[asset.dataset_id],
+                                target_weight=asset.target_weight,
+                                display_name=asset.display_name,
+                            )
+                            for asset in block.assets
+                        ],
+                        budget_weight=block.budget_weight,
+                        display_name=block.display_name,
+                    )
+                    for block in strategy_blocks
+                ],
+                config,
+                construction,
+            )
+            if not support.supported:
+                raise UnsupportedExecutionModeError(
+                    support.reason or "Portfolio strategy-block vectorization is not available for this study."
+                )
+
+            if stop_cb and stop_cb():
+                frame = pd.DataFrame(records)
+                frame.attrs["batch_benchmarks"] = tuple(per_batch)
+                return frame
+
+            started = perf_counter()
+            portfolio_result = orchestrator.execute_portfolio(
+                PortfolioExecutionRequest(
+                    assets=[],
+                    strategy_blocks=[
+                        PortfolioExecutionStrategyBlock(
+                            block_id=block.block_id,
+                            strategy_cls=block.strategy_cls,
+                            strategy_params=block.strategy_params,
+                            assets=[
+                                PortfolioExecutionStrategyBlockAsset(
+                                    dataset_id=asset.dataset_id,
+                                    data=loaded_frames[asset.dataset_id],
+                                    target_weight=asset.target_weight,
+                                    display_name=asset.display_name,
+                                )
+                                for asset in block.assets
+                            ],
+                            budget_weight=block.budget_weight,
+                            display_name=block.display_name,
+                        )
+                        for block in strategy_blocks
+                    ],
+                    config=config,
+                    catalog=catalog,
+                    requested_execution_mode=requested_mode,
+                    normalize_weights=normalize_weights,
+                    portfolio_dataset_id=dataset_label,
+                    construction_config=construction,
+                )
+            )
+            metrics = portfolio_result.metrics.as_dict()
+            records.append(
+                {
+                    **placeholder_params,
+                    "dataset_id": dataset_label,
+                    "timeframe": timeframe,
+                    "start": start,
+                    "end": end,
+                    "total_return": metrics.get("total_return"),
+                    "cagr": metrics.get("cagr"),
+                    "max_drawdown": metrics.get("max_drawdown"),
+                    "sharpe": metrics.get("sharpe"),
+                    "rolling_sharpe": metrics.get("rolling_sharpe"),
+                    grid.metric: metrics[grid.metric],
+                    "run_id": portfolio_result.run_id,
+                    "logical_run_id": portfolio_result.logical_run_id,
+                    "requested_execution_mode": portfolio_result.requested_execution_mode.value,
+                    "resolved_execution_mode": portfolio_result.resolved_execution_mode.value,
+                    "engine_impl": portfolio_result.engine_impl,
+                    "engine_version": portfolio_result.engine_version,
+                }
+            )
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+            uncached_runs = 0 if portfolio_result.cached else 1
+            per_batch.append(
+                BatchExecutionBenchmark(
+                    dataset_id=dataset_label,
+                    strategy="Portfolio Blocks | " + ", ".join(block_names),
+                    timeframe=timeframe,
+                    requested_execution_mode=requested_mode,
+                    resolved_execution_mode=ExecutionMode.VECTORIZED,
+                    engine_impl=engine.engine_impl,
+                    engine_version=engine.engine_version,
+                    bars=bars,
+                    total_params=1,
+                    cached_runs=1 if portfolio_result.cached else 0,
                     uncached_runs=uncached_runs,
                     duration_seconds=perf_counter() - started,
                     chunk_count=1 if uncached_runs else 0,

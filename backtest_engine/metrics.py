@@ -219,9 +219,9 @@ def _normalize_freq(tf: str) -> str:
     if not num:
         num = "1"
     if unit in ("min", "m"):
-        return f"{num}T"
+        return f"{num}min"
     if unit in ("h", "hr"):
-        return f"{num}H"
+        return f"{num}h"
     return tf
 
 

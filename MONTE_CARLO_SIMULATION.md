@@ -120,6 +120,31 @@ Fallback input sources can include:
 
 But the preferred path is post-walk-forward.
 
+## Portfolio Scope Note
+
+For portfolio sources, version 1 Monte Carlo should stay trade-based.
+
+Current implemented portfolio behavior:
+
+- extract the stitched out-of-sample portfolio trade sequence from walk-forward
+- reshuffle or bootstrap that realized portfolio trade-return sequence
+- rebuild synthetic portfolio equity curves from those resampled portfolio trade outcomes
+
+This means portfolio Monte Carlo v1 is currently answering:
+
+- how sensitive the validated portfolio result is to trade ordering
+- how wide the return and drawdown distribution becomes if the realized portfolio trade distribution repeats in a different sequence
+
+It is **not** yet:
+
+- rebuilding each underlying asset path
+- rerunning each strategy block on each simulated asset path
+- rerunning portfolio ranking, weighting, rebalance, and shared-cash competition inside every simulated path
+
+That fuller version would be a later asset-level or path-level portfolio Monte Carlo mode.
+
+Version 1 should keep this limitation explicit rather than implying that portfolio construction itself has already been re-simulated under alternate market paths.
+
 ## Input Contract
 
 Each Monte Carlo study should define:
@@ -176,8 +201,29 @@ Why trade returns first:
 - simple to compute
 - strategy-agnostic enough for version 1
 - matches how many traders think about path and sequence risk
+- for portfolios, it keeps the first version fast and interpretable without immediately exploding into a full multi-asset path simulator
 
 Future versions can add block-bootstrapped daily returns or more advanced units if needed.
+
+## Why Asset-Level Portfolio Monte Carlo Is Richer Later
+
+A later asset-level portfolio Monte Carlo mode can be richer because it would allow the platform to:
+
+- perturb or simulate the underlying asset paths themselves
+- rerun the strategy logic on those changed paths
+- rerun portfolio construction on top of the changed strategy outputs
+- capture changes in ranking, weighting, rebalance timing, shared-cash competition, and cross-asset interaction
+
+That is more realistic for portfolios because a portfolio is not just a finished trade stream. It is a construction process that can change when the underlying assets and strategies interact differently.
+
+But that later version is also much heavier:
+
+- more complex to implement
+- more expensive to run
+- harder to explain and audit
+- easier to accidentally overbuild before the simpler trade-based robustness layer is already useful
+
+So for version 1, trade-based Monte Carlo is the practical default. It is not "wrong"; it is a narrower robustness test.
 
 ## Equity Reconstruction
 
