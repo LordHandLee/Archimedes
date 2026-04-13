@@ -8,3 +8,5 @@ mplfinance>=0.12
 PyQt6>=6.5
 requests>=2.31
 ibapi>=9.81
+financedatabase>=2.3
+simfin>=1.0

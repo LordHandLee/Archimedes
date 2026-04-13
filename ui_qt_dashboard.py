@@ -86,6 +86,7 @@ from backtest_engine import (
     ACQUISITION_ACTION_INGEST_EXISTING,
     ACQUISITION_ACTION_SKIP_FRESH,
     available_acquisition_providers,
+    backfill_missing_quality_snapshots,
     build_provider_fetch_command,
     build_download_csv_path,
     build_download_dataset_id,
@@ -95,6 +96,7 @@ from backtest_engine import (
     build_portfolio_chart_data,
     build_portfolio_trades_log_frame,
     candidate_param_sets_from_records,
+    compute_and_store_quality_snapshot,
     compute_freshness_state,
     decide_acquisition_policy,
     extract_walk_forward_trade_returns,
@@ -111,6 +113,7 @@ from backtest_engine import (
     MONTE_CARLO_MODE_RESHUFFLE,
     MONTE_CARLO_SOURCE_WALK_FORWARD,
     provider_display_name,
+    provider_fetch_tuning,
     portfolio_drawdown_frame,
     run_walk_forward_study,
     run_walk_forward_portfolio_study,
@@ -134,6 +137,10 @@ from backtest_engine import (
 from backtest_engine.chart_snapshot import ChartSnapshotExporter
 from backtest_engine.magellan import MagellanClient, MagellanError
 from backtest_engine.optimization import compute_robust_score
+from backtest_engine.acquisition import (
+    clear_download_artifact_state,
+    write_download_artifact_state,
+)
 from backtest_engine.provider_config import (
     build_provider_runtime_environment,
     load_provider_secrets,
@@ -141,6 +148,19 @@ from backtest_engine.provider_config import (
     provider_settings_status,
     save_provider_secrets,
     save_provider_settings,
+)
+from backtest_engine.asset_reference import (
+    financedatabase_available,
+    financedatabase_install_hint,
+    import_financedatabase_assets,
+)
+from backtest_engine.asset_provider_ingestion import (
+    defeatbeta_available,
+    defeatbeta_install_hint,
+    simfin_available,
+    simfin_install_hint,
+    sync_defeatbeta_assets,
+    sync_simfin_assets,
 )
 from backtest_engine.reporting import plot_param_heatmap
 from backtest_engine.sample_strategies import compute_zscore_mean_reversion_features
@@ -167,6 +187,7 @@ OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
 EXPECTED_2Y_1M_EQUITY_ROWS = int(2 * 252 * 16 * 60)
 SCHEDULER_SCRIPT = Path("scripts") / "scheduler_service.py"
 DOWNLOAD_LOG_DIR = Path("data") / "download_logs"
+ACTIVE_DOWNLOAD_SESSION_PATH = Path("data") / "active_download_session.json"
 STUDY_MODE_INDEPENDENT = "independent"
 STUDY_MODE_PORTFOLIO = "portfolio"
 PORTFOLIO_ALLOC_EQUAL = "equal"
@@ -198,10 +219,71 @@ def _safe_inspect_dataset_quality(dataset_id: str, resolution: str) -> dict:
         store.close()
 
 
+def _quality_snapshot_from_mapping(mapping: dict | pd.Series | object | None) -> dict:
+    def _missing(value: object) -> bool:
+        return value is None or pd.isna(value)
+
+    def _safe_int(value: object, default: int = 0) -> int:
+        if _missing(value):
+            return default
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(float(value))
+            except Exception:
+                return default
+
+    def _safe_optional(value: object) -> object | None:
+        if _missing(value):
+            return None
+        return value
+
+    if mapping is None:
+        return {
+            "quality_state": "unknown",
+            "suspicious_gap_count": 0,
+            "max_suspicious_gap": None,
+            "repair_request_start": None,
+            "repair_request_end": None,
+            "expected_interval": None,
+            "suspicious_gap_ranges": [],
+            "quality_analyzed_at": None,
+        }
+    if isinstance(mapping, pd.Series):
+        getter = mapping.get
+    elif isinstance(mapping, dict):
+        getter = mapping.get
+    else:
+        getter = lambda key, default=None: getattr(mapping, key, default)
+    ranges_raw = getter("suspicious_gap_ranges_json") or getter("suspicious_gap_ranges")
+    try:
+        if isinstance(ranges_raw, str):
+            suspicious_gap_ranges = list(json.loads(ranges_raw) or [])
+        else:
+            suspicious_gap_ranges = list(ranges_raw or [])
+    except Exception:
+        suspicious_gap_ranges = []
+    return {
+        "quality_state": str(_safe_optional(getter("quality_state")) or "unknown"),
+        "suspicious_gap_count": _safe_int(getter("suspicious_gap_count")),
+        "max_suspicious_gap": _safe_optional(getter("max_suspicious_gap")),
+        "repair_request_start": _safe_optional(getter("repair_request_start")),
+        "repair_request_end": _safe_optional(getter("repair_request_end")),
+        "expected_interval": _safe_optional(getter("quality_expected_interval")) or _safe_optional(getter("expected_interval")),
+        "suspicious_gap_ranges": suspicious_gap_ranges if isinstance(suspicious_gap_ranges, list) else [],
+        "quality_analyzed_at": _safe_optional(getter("quality_analyzed_at")),
+    }
+
+
 def _format_dataset_quality_label(quality: dict) -> str:
     state = str(quality.get("quality_state") or "unknown")
-    gap_count = int(quality.get("suspicious_gap_count") or 0)
-    max_gap = str(quality.get("max_suspicious_gap") or "").strip()
+    try:
+        gap_count = 0 if pd.isna(quality.get("suspicious_gap_count")) else int(quality.get("suspicious_gap_count") or 0)
+    except Exception:
+        gap_count = 0
+    max_gap_value = quality.get("max_suspicious_gap")
+    max_gap = "" if pd.isna(max_gap_value) else str(max_gap_value or "").strip()
     repair_start = str(quality.get("repair_request_start") or "").strip()
     repair_end = str(quality.get("repair_request_end") or "").strip()
     if state == "gappy":
@@ -213,6 +295,10 @@ def _format_dataset_quality_label(quality: dict) -> str:
         if max_gap:
             return f"gappy ({gap_count} suspicious gap(s){repair}, max {max_gap})"
         return f"gappy ({gap_count} suspicious gap(s){repair})"
+    if state == "sparse_intraday":
+        if max_gap:
+            return f"sparse intraday ({gap_count} minor gap(s), max {max_gap})"
+        return f"sparse intraday ({gap_count} minor gap(s))"
     if state == "gap_free":
         return "gap free"
     return "unknown"
@@ -462,6 +548,7 @@ class CatalogReader:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
+        self._result_catalog = ResultCatalog(self.db_path)
 
     def load_runs(self, batch_id: str | None = None) -> List[RunRow]:
         if not self.db_path.exists():
@@ -987,6 +1074,264 @@ class CatalogReader:
             ]
         )
 
+    def load_deployment_targets(self) -> pd.DataFrame:
+        rc = ResultCatalog(self.db_path)
+        rows = rc.load_deployment_targets()
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "target_id",
+                    "name",
+                    "mode",
+                    "broker_scope",
+                    "transport_mode",
+                    "base_url",
+                    "webhook_path",
+                    "status_path",
+                    "dashboard_path",
+                    "logs_path",
+                    "project_root",
+                    "db_path",
+                    "log_db_path",
+                    "secret_ref",
+                    "is_active",
+                    "created_at",
+                    "updated_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "target_id": row.target_id,
+                    "name": row.name,
+                    "mode": row.mode,
+                    "broker_scope": row.broker_scope,
+                    "transport_mode": row.transport_mode,
+                    "base_url": row.base_url,
+                    "webhook_path": row.webhook_path,
+                    "status_path": row.status_path,
+                    "dashboard_path": row.dashboard_path,
+                    "logs_path": row.logs_path,
+                    "project_root": row.project_root,
+                    "db_path": row.db_path,
+                    "log_db_path": row.log_db_path,
+                    "secret_ref": row.secret_ref,
+                    "is_active": row.is_active,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ]
+        )
+
+    def load_manual_deployment_definitions(self) -> pd.DataFrame:
+        rc = ResultCatalog(self.db_path)
+        rows = rc.load_manual_deployment_definitions()
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "manual_definition_id",
+                    "deployment_kind",
+                    "strategy",
+                    "strategy_version",
+                    "dataset_id",
+                    "symbol",
+                    "dataset_scope_json",
+                    "timeframe",
+                    "params_json",
+                    "structure_json",
+                    "target_id",
+                    "mode",
+                    "sizing_json",
+                    "notes",
+                    "created_at",
+                    "updated_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "manual_definition_id": row.manual_definition_id,
+                    "deployment_kind": row.deployment_kind,
+                    "strategy": row.strategy,
+                    "strategy_version": row.strategy_version,
+                    "dataset_id": row.dataset_id,
+                    "symbol": row.symbol,
+                    "dataset_scope_json": row.dataset_scope_json,
+                    "timeframe": row.timeframe,
+                    "params_json": row.params_json,
+                    "structure_json": row.structure_json,
+                    "target_id": row.target_id,
+                    "mode": row.mode,
+                    "sizing_json": row.sizing_json,
+                    "notes": row.notes,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ]
+        )
+
+    def load_deployments(self) -> pd.DataFrame:
+        rc = ResultCatalog(self.db_path)
+        rows = rc.load_deployments()
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "deployment_id",
+                    "parent_deployment_id",
+                    "deployment_kind",
+                    "source_type",
+                    "source_id",
+                    "candidate_id",
+                    "strategy",
+                    "strategy_version",
+                    "dataset_id",
+                    "symbol",
+                    "timeframe",
+                    "params_json",
+                    "structure_json",
+                    "validation_refs_json",
+                    "target_id",
+                    "mode",
+                    "sizing_json",
+                    "status",
+                    "status_reason",
+                    "last_signal_at",
+                    "last_sync_at",
+                    "last_error_at",
+                    "notes",
+                    "created_at",
+                    "updated_at",
+                    "armed_at",
+                    "started_at",
+                    "stopped_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "deployment_id": row.deployment_id,
+                    "parent_deployment_id": row.parent_deployment_id,
+                    "deployment_kind": row.deployment_kind,
+                    "source_type": row.source_type,
+                    "source_id": row.source_id,
+                    "candidate_id": row.candidate_id,
+                    "strategy": row.strategy,
+                    "strategy_version": row.strategy_version,
+                    "dataset_id": row.dataset_id,
+                    "symbol": row.symbol,
+                    "timeframe": row.timeframe,
+                    "params_json": row.params_json,
+                    "structure_json": row.structure_json,
+                    "validation_refs_json": row.validation_refs_json,
+                    "target_id": row.target_id,
+                    "mode": row.mode,
+                    "sizing_json": row.sizing_json,
+                    "status": row.status,
+                    "status_reason": row.status_reason,
+                    "last_signal_at": row.last_signal_at,
+                    "last_sync_at": row.last_sync_at,
+                    "last_error_at": row.last_error_at,
+                    "notes": row.notes,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                    "armed_at": row.armed_at,
+                    "started_at": row.started_at,
+                    "stopped_at": row.stopped_at,
+                }
+                for row in rows
+            ]
+        )
+
+    def load_deployment_child_links(self, parent_deployment_id: str = "") -> pd.DataFrame:
+        rc = ResultCatalog(self.db_path)
+        rows = rc.load_deployment_child_links(parent_deployment_id)
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "parent_deployment_id",
+                    "child_deployment_id",
+                    "child_role",
+                    "dataset_id",
+                    "symbol",
+                    "strategy_block_id",
+                    "created_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "parent_deployment_id": row.parent_deployment_id,
+                    "child_deployment_id": row.child_deployment_id,
+                    "child_role": row.child_role,
+                    "dataset_id": row.dataset_id,
+                    "symbol": row.symbol,
+                    "strategy_block_id": row.strategy_block_id,
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
+        )
+
+    def load_latest_deployment_metric_snapshots(self) -> pd.DataFrame:
+        rc = ResultCatalog(self.db_path)
+        rows = rc.load_latest_deployment_metric_snapshots()
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "deployment_id",
+                    "snapshot_ts",
+                    "realized_pnl",
+                    "open_pnl",
+                    "trade_count",
+                    "win_count",
+                    "loss_count",
+                    "win_rate",
+                    "profit_factor",
+                    "sharpe",
+                    "current_position_json",
+                    "health_json",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "deployment_id": row.deployment_id,
+                    "snapshot_ts": row.snapshot_ts,
+                    "realized_pnl": row.realized_pnl,
+                    "open_pnl": row.open_pnl,
+                    "trade_count": row.trade_count,
+                    "win_count": row.win_count,
+                    "loss_count": row.loss_count,
+                    "win_rate": row.win_rate,
+                    "profit_factor": row.profit_factor,
+                    "sharpe": row.sharpe,
+                    "current_position_json": row.current_position_json,
+                    "health_json": row.health_json,
+                }
+                for row in rows
+            ]
+        )
+
+    def save_deployment_metric_snapshot(self, **kwargs) -> None:
+        ResultCatalog(self.db_path).save_deployment_metric_snapshot(**kwargs)
+
+    def save_deployment_target(self, **kwargs) -> str:
+        return ResultCatalog(self.db_path).save_deployment_target(**kwargs)
+
+    def save_manual_deployment_definition(self, **kwargs) -> str:
+        return ResultCatalog(self.db_path).save_manual_deployment_definition(**kwargs)
+
+    def save_deployment(self, **kwargs) -> str:
+        return ResultCatalog(self.db_path).save_deployment(**kwargs)
+
+    def save_deployment_child_link(self, **kwargs) -> None:
+        ResultCatalog(self.db_path).save_deployment_child_link(**kwargs)
+
+    def update_deployment_status(self, deployment_id: str, **kwargs) -> None:
+        ResultCatalog(self.db_path).update_deployment_status(deployment_id, **kwargs)
+
     def save_optimization_candidate(
         self,
         *,
@@ -1097,7 +1442,191 @@ class CatalogReader:
             )
         return universes
 
-    def load_acquisition_datasets(self) -> pd.DataFrame:
+    def bootstrap_asset_catalog(self) -> int:
+        return self._result_catalog.bootstrap_assets_from_acquisition_datasets()
+
+    def load_asset_catalog(self, *, bootstrap_from_acquisition: bool = True) -> pd.DataFrame:
+        rc = self._result_catalog
+        if bootstrap_from_acquisition:
+            rc.bootstrap_assets_from_acquisition_datasets()
+        rows = rc.load_asset_catalog()
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "asset_id",
+                    "symbol",
+                    "display_symbol",
+                    "name",
+                    "asset_class",
+                    "security_type",
+                    "exchange",
+                    "country",
+                    "currency",
+                    "sector",
+                    "industry",
+                    "dataset_status",
+                    "dataset_count",
+                    "successful_dataset_count",
+                    "latest_dataset_id",
+                    "latest_source",
+                    "latest_download_at",
+                    "latest_success_at",
+                    "latest_failure_at",
+                    "latest_failure_reason",
+                    "coverage_start",
+                    "coverage_end",
+                    "freshness_status",
+                    "first_seen_at",
+                    "last_seen_at",
+                    "created_at",
+                    "updated_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "asset_id": row.asset_id,
+                    "symbol": row.symbol,
+                    "display_symbol": row.display_symbol,
+                    "name": row.name,
+                    "asset_class": row.asset_class,
+                    "security_type": row.security_type,
+                    "exchange": row.exchange,
+                    "country": row.country,
+                    "currency": row.currency,
+                    "sector": row.sector,
+                    "industry": row.industry,
+                    "dataset_status": row.dataset_status,
+                    "dataset_count": row.dataset_count,
+                    "successful_dataset_count": row.successful_dataset_count,
+                    "latest_dataset_id": row.latest_dataset_id,
+                    "latest_source": row.latest_source,
+                    "latest_download_at": row.latest_download_at,
+                    "latest_success_at": row.latest_success_at,
+                    "latest_failure_at": row.latest_failure_at,
+                    "latest_failure_reason": row.latest_failure_reason,
+                    "coverage_start": row.coverage_start,
+                    "coverage_end": row.coverage_end,
+                    "freshness_status": row.freshness_status,
+                    "first_seen_at": row.first_seen_at,
+                    "last_seen_at": row.last_seen_at,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ]
+        )
+
+    def load_asset_identifiers(self, asset_id: str) -> dict[str, str]:
+        return self._result_catalog.load_asset_identifiers(asset_id)
+
+    def load_provider_credential(self, provider: str) -> dict[str, object]:
+        return self._result_catalog.load_provider_credential(provider)
+
+    def save_provider_credential(
+        self,
+        provider: str,
+        *,
+        credential_label: str | None = None,
+        api_key: str | None = None,
+        account_email: str | None = None,
+        base_url: str | None = None,
+        is_active: bool = True,
+        last_validated_at: str | None = None,
+    ) -> None:
+        self._result_catalog.save_provider_credential(
+            provider,
+            credential_label=credential_label,
+            api_key=api_key,
+            account_email=account_email,
+            base_url=base_url,
+            is_active=is_active,
+            last_validated_at=last_validated_at,
+        )
+
+    def load_asset_provider_payload_summary(self, asset_id: str) -> list[dict[str, object]]:
+        return self._result_catalog.load_asset_provider_payload_summary(asset_id)
+
+    def load_asset_screener_enrichment(self) -> pd.DataFrame:
+        if not self.db_path.exists():
+            return pd.DataFrame(
+                columns=[
+                    "asset_id",
+                    "market_cap",
+                    "shares_outstanding",
+                    "beta",
+                    "description",
+                    "website",
+                    "employee_count",
+                    "profile_source",
+                    "profile_as_of_date",
+                    "provider_payload_count",
+                    "simfin_payload_count",
+                    "defeatbeta_payload_count",
+                    "defeatbeta_earnings_count",
+                    "defeatbeta_news_count",
+                    "provider_last_sync_at",
+                    "latest_earnings_date",
+                    "latest_news_date",
+                ]
+            )
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query(
+                """
+                WITH provider_counts AS (
+                    SELECT
+                        asset_id,
+                        COUNT(*) AS provider_payload_count,
+                        SUM(CASE WHEN LOWER(provider)='simfin' THEN 1 ELSE 0 END) AS simfin_payload_count,
+                        SUM(CASE WHEN LOWER(provider)='defeatbeta' THEN 1 ELSE 0 END) AS defeatbeta_payload_count,
+                        MAX(COALESCE(fetched_at, created_at)) AS provider_last_sync_at
+                    FROM provider_raw_payloads
+                    GROUP BY asset_id
+                ),
+                earnings_counts AS (
+                    SELECT
+                        asset_id,
+                        COUNT(*) AS defeatbeta_earnings_count,
+                        MAX(report_date) AS latest_earnings_date
+                    FROM defeatbeta_earnings_calendars
+                    GROUP BY asset_id
+                ),
+                news_counts AS (
+                    SELECT
+                        asset_id,
+                        COUNT(*) AS defeatbeta_news_count,
+                        MAX(report_date) AS latest_news_date
+                    FROM defeatbeta_news_articles
+                    GROUP BY asset_id
+                )
+                SELECT
+                    p.asset_id,
+                    p.market_cap,
+                    p.shares_outstanding,
+                    p.beta,
+                    p.description,
+                    p.website,
+                    p.employee_count,
+                    p.source AS profile_source,
+                    p.as_of_date AS profile_as_of_date,
+                    COALESCE(pc.provider_payload_count, 0) AS provider_payload_count,
+                    COALESCE(pc.simfin_payload_count, 0) AS simfin_payload_count,
+                    COALESCE(pc.defeatbeta_payload_count, 0) AS defeatbeta_payload_count,
+                    COALESCE(ec.defeatbeta_earnings_count, 0) AS defeatbeta_earnings_count,
+                    COALESCE(nc.defeatbeta_news_count, 0) AS defeatbeta_news_count,
+                    pc.provider_last_sync_at,
+                    ec.latest_earnings_date,
+                    nc.latest_news_date
+                FROM asset_profiles p
+                LEFT JOIN provider_counts pc ON pc.asset_id = p.asset_id
+                LEFT JOIN earnings_counts ec ON ec.asset_id = p.asset_id
+                LEFT JOIN news_counts nc ON nc.asset_id = p.asset_id
+                ORDER BY p.asset_id ASC
+                """,
+                conn,
+            )
+
+    def load_acquisition_datasets(self, *, include_untracked_local: bool = False) -> pd.DataFrame:
         rows = ResultCatalog(self.db_path).load_acquisition_datasets()
         frame = pd.DataFrame(
             [
@@ -1120,60 +1649,75 @@ class CatalogReader:
                     "last_error": row.last_error,
                     "last_run_id": row.last_run_id,
                     "last_task_id": row.last_task_id,
+                    "quality_state": row.quality_state,
+                    "quality_expected_interval": row.quality_expected_interval,
+                    "suspicious_gap_count": row.suspicious_gap_count,
+                    "max_suspicious_gap": row.max_suspicious_gap,
+                    "suspicious_gap_ranges_json": row.suspicious_gap_ranges_json,
+                    "repair_request_start": row.repair_request_start,
+                    "repair_request_end": row.repair_request_end,
+                    "quality_analyzed_at": row.quality_analyzed_at,
                     "created_at": row.created_at,
                     "updated_at": row.updated_at,
                 }
                 for row in rows
             ]
         )
-        dataset_map = {str(row["dataset_id"]): row for _, row in frame.iterrows()} if not frame.empty else {}
-        store = DuckDBStore()
-        for path in sorted(store.data_dir.glob("*.parquet")):
-            dataset_id = path.stem
-            if dataset_id in dataset_map:
-                mask = frame["dataset_id"] == dataset_id
-                if not str(frame.loc[mask, "parquet_path"].iloc[0] or "").strip():
-                    frame.loc[mask, "parquet_path"] = str(path)
-                try:
-                    meta = store.describe_dataset(dataset_id)
-                except Exception:
+        if include_untracked_local:
+            dataset_map = {str(row["dataset_id"]): row for _, row in frame.iterrows()} if not frame.empty else {}
+            store = DuckDBStore()
+            for path in sorted(store.data_dir.glob("*.parquet")):
+                dataset_id = path.stem
+                if dataset_id in dataset_map:
+                    mask = frame["dataset_id"] == dataset_id
+                    if not str(frame.loc[mask, "parquet_path"].iloc[0] or "").strip():
+                        frame.loc[mask, "parquet_path"] = str(path)
+                    meta = _cached_local_dataset_meta(store, path)
+                    if meta is None:
+                        continue
+                    if frame.loc[mask, "coverage_start"].isna().all():
+                        frame.loc[mask, "coverage_start"] = meta.get("coverage_start")
+                    if frame.loc[mask, "coverage_end"].isna().all():
+                        frame.loc[mask, "coverage_end"] = meta.get("coverage_end")
+                    if frame.loc[mask, "bar_count"].isna().all():
+                        frame.loc[mask, "bar_count"] = meta.get("bar_count")
+                    if frame.loc[mask, "ingested"].isna().all():
+                        frame.loc[mask, "ingested"] = True
                     continue
-                if frame.loc[mask, "coverage_start"].isna().all():
-                    frame.loc[mask, "coverage_start"] = meta.get("coverage_start")
-                if frame.loc[mask, "coverage_end"].isna().all():
-                    frame.loc[mask, "coverage_end"] = meta.get("coverage_end")
-                if frame.loc[mask, "bar_count"].isna().all():
-                    frame.loc[mask, "bar_count"] = meta.get("bar_count")
-                if frame.loc[mask, "ingested"].isna().all():
-                    frame.loc[mask, "ingested"] = True
-                continue
-            try:
-                meta = store.describe_dataset(dataset_id)
-            except Exception:
-                continue
-            extra = {
-                "dataset_id": dataset_id,
-                "source": None,
-                "symbol": None,
-                "resolution": None,
-                "history_window": None,
-                "csv_path": None,
-                "parquet_path": meta.get("parquet_path"),
-                "coverage_start": meta.get("coverage_start"),
-                "coverage_end": meta.get("coverage_end"),
-                "bar_count": meta.get("bar_count"),
-                "ingested": True,
-                "last_download_attempt_at": None,
-                "last_download_success_at": None,
-                "last_ingest_at": None,
-                "last_status": "ingested",
-                "last_error": None,
-                "last_run_id": None,
-                "last_task_id": None,
-                "created_at": None,
-                "updated_at": None,
-            }
-            frame = pd.concat([frame, pd.DataFrame([extra])], ignore_index=True)
+                meta = _cached_local_dataset_meta(store, path)
+                if meta is None:
+                    continue
+                extra = {
+                    "dataset_id": dataset_id,
+                    "source": None,
+                    "symbol": None,
+                    "resolution": None,
+                    "history_window": None,
+                    "csv_path": None,
+                    "parquet_path": meta.get("parquet_path"),
+                    "coverage_start": meta.get("coverage_start"),
+                    "coverage_end": meta.get("coverage_end"),
+                    "bar_count": meta.get("bar_count"),
+                    "ingested": True,
+                    "last_download_attempt_at": None,
+                    "last_download_success_at": None,
+                    "last_ingest_at": None,
+                    "last_status": "ingested",
+                    "last_error": None,
+                    "last_run_id": None,
+                    "last_task_id": None,
+                    "quality_state": None,
+                    "quality_expected_interval": None,
+                    "suspicious_gap_count": 0,
+                    "max_suspicious_gap": None,
+                    "suspicious_gap_ranges_json": None,
+                    "repair_request_start": None,
+                    "repair_request_end": None,
+                    "quality_analyzed_at": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+                frame = pd.concat([frame, pd.DataFrame([extra])], ignore_index=True)
         if frame.empty:
             return pd.DataFrame(
                 columns=[
@@ -1195,6 +1739,14 @@ class CatalogReader:
                     "last_error",
                     "last_run_id",
                     "last_task_id",
+                    "quality_state",
+                    "quality_expected_interval",
+                    "suspicious_gap_count",
+                    "max_suspicious_gap",
+                    "suspicious_gap_ranges_json",
+                    "repair_request_start",
+                    "repair_request_end",
+                    "quality_analyzed_at",
                     "created_at",
                     "updated_at",
                 ]
@@ -1212,8 +1764,14 @@ class CatalogReader:
         *,
         task_id: str | None = None,
         universe_id: str | None = None,
+        offset: int = 0,
     ) -> pd.DataFrame:
-        rows = ResultCatalog(self.db_path).load_acquisition_runs(limit=limit, task_id=task_id, universe_id=universe_id)
+        rows = ResultCatalog(self.db_path).load_acquisition_runs(
+            limit=limit,
+            task_id=task_id,
+            universe_id=universe_id,
+            offset=offset,
+        )
         if not rows:
             return pd.DataFrame(
                 columns=[
@@ -1261,23 +1819,34 @@ class CatalogReader:
             ]
         )
 
+    def count_acquisition_runs(self, *, task_id: str | None = None, universe_id: str | None = None) -> int:
+        return ResultCatalog(self.db_path).count_acquisition_runs(task_id=task_id, universe_id=universe_id)
+
     def load_acquisition_attempts(
         self,
         *,
         acquisition_run_id: str | None = None,
         dataset_id: str | None = None,
+        dataset_ids: Sequence[str] | None = None,
         symbol: str | None = None,
+        symbols: Sequence[str] | None = None,
         task_id: str | None = None,
         universe_id: str | None = None,
+        statuses: Sequence[str] | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> pd.DataFrame:
         rows = ResultCatalog(self.db_path).load_acquisition_attempts(
             acquisition_run_id=acquisition_run_id,
             dataset_id=dataset_id,
+            dataset_ids=dataset_ids,
             symbol=symbol,
+            symbols=symbols,
             task_id=task_id,
             universe_id=universe_id,
+            statuses=statuses,
             limit=limit,
+            offset=offset,
         )
         if not rows:
             return pd.DataFrame(
@@ -1330,8 +1899,46 @@ class CatalogReader:
             ]
         )
 
-    def load_task_runs(self, *, task_id: str | None = None, limit: int | None = None) -> pd.DataFrame:
-        rows = ResultCatalog(self.db_path).load_task_runs(task_id=task_id, limit=limit)
+    def count_acquisition_attempts(
+        self,
+        *,
+        acquisition_run_id: str | None = None,
+        dataset_id: str | None = None,
+        dataset_ids: Sequence[str] | None = None,
+        symbol: str | None = None,
+        symbols: Sequence[str] | None = None,
+        task_id: str | None = None,
+        universe_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+    ) -> int:
+        return ResultCatalog(self.db_path).count_acquisition_attempts(
+            acquisition_run_id=acquisition_run_id,
+            dataset_id=dataset_id,
+            dataset_ids=dataset_ids,
+            symbol=symbol,
+            symbols=symbols,
+            task_id=task_id,
+            universe_id=universe_id,
+            statuses=statuses,
+        )
+
+    def load_matching_attempt_dataset_ids(
+        self,
+        *,
+        task_id: str | None = None,
+        universe_id: str | None = None,
+        dataset_ids: Sequence[str] | None = None,
+        symbols: Sequence[str] | None = None,
+    ) -> list[str]:
+        return ResultCatalog(self.db_path).load_matching_attempt_dataset_ids(
+            task_id=task_id,
+            universe_id=universe_id,
+            dataset_ids=dataset_ids,
+            symbols=symbols,
+        )
+
+    def load_task_runs(self, *, task_id: str | None = None, limit: int | None = None, offset: int = 0) -> pd.DataFrame:
+        rows = ResultCatalog(self.db_path).load_task_runs(task_id=task_id, limit=limit, offset=offset)
         if not rows:
             return pd.DataFrame(
                 columns=[
@@ -1360,6 +1967,9 @@ class CatalogReader:
                 for row in rows
             ]
         )
+
+    def count_task_runs(self, *, task_id: str | None = None) -> int:
+        return ResultCatalog(self.db_path).count_task_runs(task_id=task_id)
 
     def ensure_catalog(self) -> None:
         # Initialize schema if missing.
@@ -1651,6 +2261,622 @@ class BatchTableModel(QtCore.QAbstractTableModel):
         return None
 
 
+_DATASET_PICKER_ERROR_STATUSES = {"download_error", "ingest_error", "failed", "gap_fill_error"}
+_ACQUISITION_ERROR_ATTEMPT_STATUSES = tuple(sorted(_DATASET_PICKER_ERROR_STATUSES))
+_DOWNLOAD_RECOVERABLE_STATUSES = {"error", "download_error", "failed", "ingest_error", "gap_fill_error"}
+_DOWNLOAD_ARTIFACT_RECOVERY_STATUSES = {
+    "queued",
+    "running",
+    "paused",
+    "interrupted",
+    "retry_wait",
+    "stopped",
+    "downloaded",
+    "finalizing",
+}
+_DATASET_PICKER_PROVIDER_PREFIXES = {
+    "ALPACA",
+    "IB",
+    "INTERACTIVE",
+    "INTERACTIVE_BROKERS",
+    "INTERACTIVEBROKERS",
+    "MASSIVE",
+    "POLYGON",
+    "STOOQ",
+}
+_DATASET_PICKER_STATUS_META = {
+    "ready": {"label": "Ready", "color": PALETTE["green"], "alpha": 0.26},
+    "stale": {"label": "Stale", "color": PALETTE["amber"], "alpha": 0.22},
+    "raw": {"label": "Raw Only", "color": PALETTE["amber"], "alpha": 0.18},
+    "error": {"label": "Error", "color": PALETTE["red"], "alpha": 0.24},
+    "missing": {"label": "Missing", "color": PALETTE["red"], "alpha": 0.18},
+}
+_LOCAL_DATASET_META_CACHE: dict[str, tuple[int, int, dict]] = {}
+_STATUS_ICON_CACHE: dict[str, QtGui.QIcon] = {}
+
+
+def _picker_catalog_path(catalog_path: Path | str | None = None) -> Path:
+    return Path(catalog_path) if catalog_path is not None else Path("backtests.sqlite")
+
+
+def _picker_tint(color_hex: str, alpha: float) -> QtGui.QColor:
+    color = QtGui.QColor(color_hex)
+    color.setAlphaF(alpha)
+    return color
+
+
+def _picker_status_meta(status_code: str) -> dict:
+    return dict(_DATASET_PICKER_STATUS_META.get(status_code, _DATASET_PICKER_STATUS_META["missing"]))
+
+
+def _picker_status_icon(color_hex: str) -> QtGui.QIcon:
+    cached = _STATUS_ICON_CACHE.get(color_hex)
+    if cached is not None:
+        return cached
+    pixmap = QtGui.QPixmap(12, 12)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    painter.setBrush(QtGui.QBrush(QtGui.QColor(color_hex)))
+    painter.drawEllipse(1, 1, 10, 10)
+    painter.end()
+    icon = QtGui.QIcon(pixmap)
+    _STATUS_ICON_CACHE[color_hex] = icon
+    return icon
+
+
+def _picker_css_rgba(color: QtGui.QColor | str, fallback: str = "#000000") -> str:
+    resolved = QtGui.QColor(color)
+    if not resolved.isValid():
+        resolved = QtGui.QColor(fallback)
+    return f"rgba({resolved.red()}, {resolved.green()}, {resolved.blue()}, {resolved.alphaF():.3f})"
+
+
+def _cached_local_dataset_meta(store: DuckDBStore, path: Path) -> dict | None:
+    try:
+        stat = path.stat()
+    except Exception:
+        return None
+    cache_key = str(path.resolve())
+    cached = _LOCAL_DATASET_META_CACHE.get(cache_key)
+    if cached is not None and cached[0] == int(stat.st_mtime_ns) and cached[1] == int(stat.st_size):
+        return dict(cached[2])
+    try:
+        meta = dict(store.describe_dataset(path.stem) or {})
+    except Exception:
+        return None
+    _LOCAL_DATASET_META_CACHE[cache_key] = (int(stat.st_mtime_ns), int(stat.st_size), dict(meta))
+    return dict(meta)
+
+
+def _normalize_picker_ticker(symbol: object) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def _infer_picker_ticker(dataset_id: object, symbol: object = None) -> str:
+    normalized_symbol = _normalize_picker_ticker(symbol)
+    if normalized_symbol:
+        return normalized_symbol
+    dataset_text = str(dataset_id or "").strip()
+    if not dataset_text:
+        return ""
+    tokens = [token for token in re.split(r"[_\s]+", dataset_text) if token]
+    if not tokens:
+        return dataset_text.upper()
+    candidate_idx = 0
+    if tokens[0].upper() in _DATASET_PICKER_PROVIDER_PREFIXES and len(tokens) > 1:
+        candidate_idx = 1
+    candidate = str(tokens[candidate_idx]).strip().split(".")[0]
+    return candidate.upper() if candidate else dataset_text.upper()
+
+
+def _fmt_picker_ts(value: object) -> str:
+    if not value:
+        return "—"
+    try:
+        stamp = pd.to_datetime(value, utc=True, errors="coerce")
+    except Exception:
+        stamp = pd.NaT
+    if pd.isna(stamp):
+        return str(value)
+    try:
+        return stamp.tz_convert("America/New_York").strftime("%Y-%m-%d %I:%M %p ET")
+    except Exception:
+        return stamp.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _picker_coverage_label(record: dict) -> str:
+    start = str(record.get("coverage_start") or "").strip()
+    end = str(record.get("coverage_end") or "").strip()
+    if start and end:
+        return f"{start[:10]} -> {end[:10]}"
+    if end:
+        return end[:10]
+    if start:
+        return start[:10]
+    return "—"
+
+
+def _dataset_variant_status(record: dict) -> dict:
+    dataset_id = str(record.get("dataset_id") or "").strip()
+    resolution = str(record.get("resolution") or "").strip()
+    freshness = compute_freshness_state(record.get("coverage_end"), resolution)
+    freshness_label = freshness.replace("_", " ").title()
+    quality = _quality_snapshot_from_mapping(record)
+    quality_state = str(quality.get("quality_state") or "unknown")
+    last_status = str(record.get("last_status") or "").strip().lower()
+    last_error = str(record.get("last_error") or "").strip()
+    ingested = bool(record.get("ingested"))
+    has_download_artifact = bool(str(record.get("csv_path") or "").strip()) or bool(
+        str(record.get("last_download_success_at") or "").strip()
+    )
+    if ingested:
+        status_code = "ready" if freshness == "fresh" and quality_state != "gappy" else "stale"
+    elif has_download_artifact or last_status in {"downloaded", "success", "gap_filled"}:
+        status_code = "raw"
+    elif last_status in _DATASET_PICKER_ERROR_STATUSES or last_error:
+        status_code = "error"
+    else:
+        status_code = "missing"
+    status_meta = _picker_status_meta(status_code)
+    ticker = _infer_picker_ticker(dataset_id, record.get("symbol"))
+    source = str(record.get("source") or "").strip()
+    source_label = provider_display_name(source) if source else "Local Dataset"
+    history_window = str(record.get("history_window") or "").strip() or "—"
+    quality_label = _format_dataset_quality_label(quality)
+    tooltip_lines = [
+        f"Ticker: {ticker or '—'}",
+        f"Dataset ID: {dataset_id or '—'}",
+        f"Source: {source_label}",
+        f"Resolution: {resolution or '—'}",
+        f"History Window: {history_window}",
+        f"Freshness: {freshness_label}",
+        f"Status: {status_meta['label']}",
+        f"Quality: {quality_label}",
+        f"Coverage: {_picker_coverage_label(record)}",
+        f"Bars: {int(record.get('bar_count') or 0) if pd.notna(record.get('bar_count')) else '—'}",
+        f"Last Download: {_fmt_picker_ts(record.get('last_download_attempt_at'))}",
+        f"Last Ingest: {_fmt_picker_ts(record.get('last_ingest_at'))}",
+        f"Last Status: {record.get('last_status') or '—'}",
+        f"Last Error: {last_error or '—'}",
+    ]
+    return {
+        "dataset_id": dataset_id,
+        "ticker": ticker or (dataset_id or "Dataset"),
+        "source": source,
+        "source_label": source_label,
+        "resolution": resolution or "—",
+        "history_window": history_window,
+        "freshness": freshness,
+        "freshness_label": freshness_label,
+        "quality_label": quality_label,
+        "coverage_label": _picker_coverage_label(record),
+        "status_code": status_code,
+        "status_label": status_meta["label"],
+        "status_color": status_meta["color"],
+        "status_tint": _picker_tint(status_meta["color"], float(status_meta["alpha"])),
+        "tooltip": "\n".join(tooltip_lines),
+    }
+
+
+def _aggregate_ticker_status(variants: Sequence[dict]) -> dict:
+    if any(item.get("status_code") == "ready" for item in variants):
+        status_code = "ready"
+    elif any(item.get("status_code") == "stale" for item in variants):
+        status_code = "stale"
+    elif any(item.get("status_code") == "raw" for item in variants):
+        status_code = "raw"
+    elif any(item.get("status_code") == "error" for item in variants):
+        status_code = "error"
+    else:
+        status_code = "missing"
+    status_meta = _picker_status_meta(status_code)
+    counts = {
+        code: len([item for item in variants if item.get("status_code") == code])
+        for code in ("ready", "stale", "raw", "error", "missing")
+    }
+    return {
+        "status_code": status_code,
+        "status_label": status_meta["label"],
+        "status_color": status_meta["color"],
+        "status_tint": _picker_tint(status_meta["color"], float(status_meta["alpha"])),
+        "counts": counts,
+    }
+
+
+def _dataset_picker_groups(
+    dataset_ids: Sequence[str],
+    *,
+    catalog_path: Path | str | None = None,
+    frame: pd.DataFrame | None = None,
+) -> list[dict]:
+    normalized_ids = [str(item).strip() for item in list(dataset_ids or []) if str(item).strip()]
+    if not normalized_ids:
+        return []
+    resolved_frame = frame if frame is not None else CatalogReader(_picker_catalog_path(catalog_path)).load_acquisition_datasets(include_untracked_local=True)
+    record_map: dict[str, dict] = {}
+    if resolved_frame is not None and not resolved_frame.empty and "dataset_id" in resolved_frame.columns:
+        record_map = {
+            str(record.get("dataset_id") or ""): dict(record)
+            for record in resolved_frame.to_dict("records")
+            if str(record.get("dataset_id") or "").strip()
+        }
+    variants: list[dict] = []
+    for dataset_id in normalized_ids:
+        record = dict(record_map.get(dataset_id) or {})
+        if not record:
+            record = {"dataset_id": dataset_id}
+        variants.append(_dataset_variant_status(record))
+    grouped: dict[str, list[dict]] = {}
+    for variant in variants:
+        grouped.setdefault(str(variant.get("ticker") or "Dataset"), []).append(variant)
+    groups: list[dict] = []
+    for ticker in sorted(grouped):
+        group_variants = sorted(
+            grouped[ticker],
+            key=lambda item: (
+                str(item.get("source_label") or ""),
+                str(item.get("resolution") or ""),
+                str(item.get("history_window") or ""),
+                str(item.get("dataset_id") or ""),
+            ),
+        )
+        aggregate = _aggregate_ticker_status(group_variants)
+        tooltip_lines = [
+            f"{ticker}: {aggregate['status_label']}",
+            f"Variants: {len(group_variants)}",
+            f"Ready: {aggregate['counts']['ready']} | Stale: {aggregate['counts']['stale']} | Raw Only: {aggregate['counts']['raw']} | Error: {aggregate['counts']['error']}",
+        ]
+        for variant in group_variants[:6]:
+            tooltip_lines.append(
+                f"- {variant['source_label']} | {variant['resolution']} | {variant['history_window']} | {variant['status_label']}"
+            )
+        if len(group_variants) > 6:
+            tooltip_lines.append(f"... {len(group_variants) - 6} more variant(s)")
+        groups.append(
+            {
+                "ticker": ticker,
+                "variants": group_variants,
+                "variant_count": len(group_variants),
+                "status_code": aggregate["status_code"],
+                "status_label": aggregate["status_label"],
+                "status_color": aggregate["status_color"],
+                "status_tint": aggregate["status_tint"],
+                "tooltip": "\n".join(tooltip_lines),
+            }
+        )
+    return groups
+
+
+def _ticker_status_map(
+    symbols: Sequence[str],
+    *,
+    catalog_path: Path | str | None = None,
+    frame: pd.DataFrame | None = None,
+) -> dict[str, dict]:
+    normalized_symbols = [_normalize_picker_ticker(symbol) for symbol in list(symbols or []) if _normalize_picker_ticker(symbol)]
+    resolved_frame = frame if frame is not None else CatalogReader(_picker_catalog_path(catalog_path)).load_acquisition_datasets(include_untracked_local=True)
+    grouped: dict[str, list[dict]] = {}
+    if resolved_frame is not None and not resolved_frame.empty:
+        for record in resolved_frame.to_dict("records"):
+            dataset_id = str(record.get("dataset_id") or "").strip()
+            if not dataset_id:
+                continue
+            ticker = _infer_picker_ticker(dataset_id, record.get("symbol"))
+            if not ticker:
+                continue
+            grouped.setdefault(ticker, []).append(_dataset_variant_status(dict(record)))
+    status_map: dict[str, dict] = {}
+    for symbol in normalized_symbols:
+        variants = grouped.get(symbol, [])
+        aggregate = _aggregate_ticker_status(variants)
+        tooltip_lines = [f"{symbol}: {aggregate['status_label']}"]
+        if variants:
+            tooltip_lines.append(
+                f"Ready: {aggregate['counts']['ready']} | Stale: {aggregate['counts']['stale']} | Raw Only: {aggregate['counts']['raw']} | Error: {aggregate['counts']['error']}"
+            )
+            for variant in variants[:5]:
+                tooltip_lines.append(
+                    f"- {variant['source_label']} | {variant['resolution']} | {variant['history_window']} | {variant['status_label']}"
+                )
+            if len(variants) > 5:
+                tooltip_lines.append(f"... {len(variants) - 5} more variant(s)")
+        else:
+            tooltip_lines.append("No downloaded or ingested dataset is tracked for this ticker yet.")
+        status_map[symbol] = {
+            "status_code": aggregate["status_code"],
+            "status_label": aggregate["status_label"],
+            "status_color": aggregate["status_color"],
+            "status_tint": aggregate["status_tint"],
+            "tooltip": "\n".join(tooltip_lines),
+        }
+    return status_map
+
+
+def _format_dataset_scope_label(
+    dataset_ids: Sequence[str],
+    *,
+    catalog_path: Path | str | None = None,
+    frame: pd.DataFrame | None = None,
+) -> str:
+    groups = _dataset_picker_groups(dataset_ids, catalog_path=catalog_path, frame=frame)
+    if not groups:
+        compact = [str(item).strip() for item in list(dataset_ids or []) if str(item).strip()]
+        if not compact:
+            return ""
+        return ", ".join(compact[:3]) if len(compact) <= 3 else f"{len(compact)} datasets selected"
+    if len(groups) <= 3:
+        parts = []
+        for group in groups:
+            variant_count = int(group.get("variant_count") or 0)
+            ticker = str(group.get("ticker") or "Ticker")
+            parts.append(ticker if variant_count <= 1 else f"{ticker} ({variant_count})")
+        return ", ".join(parts)
+    dataset_count = len([str(item).strip() for item in list(dataset_ids or []) if str(item).strip()])
+    return f"{dataset_count} datasets across {len(groups)} tickers"
+
+
+def _style_tree_item_row(item: QtWidgets.QTreeWidgetItem, color: QtGui.QColor, columns: int, *, bold: bool = False) -> None:
+    font = item.font(0)
+    font.setBold(bold)
+    for column in range(columns):
+        item.setBackground(column, color)
+        item.setFont(column, font)
+    if bold:
+        item.setForeground(0, QtGui.QBrush(QtGui.QColor(PALETTE["text"])))
+
+
+def _populate_grouped_dataset_tree(
+    tree: QtWidgets.QTreeWidget,
+    groups: Sequence[dict],
+    *,
+    checked_dataset_ids: Sequence[str] | None = None,
+    current_dataset_id: str = "",
+    checkable: bool = False,
+) -> dict[str, QtWidgets.QTreeWidgetItem]:
+    tree.clear()
+    checked_set = {str(item).strip() for item in list(checked_dataset_ids or []) if str(item).strip()}
+    item_map: dict[str, QtWidgets.QTreeWidgetItem] = {}
+    column_count = tree.columnCount()
+    for group in groups:
+        variant_count = int(group.get("variant_count") or 0)
+        header_item = QtWidgets.QTreeWidgetItem(
+            [
+                f"{str(group.get('ticker') or 'Ticker')} ({variant_count} variant{'s' if variant_count != 1 else ''})",
+                "",
+                "",
+                "",
+                str(group.get("status_label") or "Missing"),
+            ]
+        )
+        header_item.setFlags(header_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsSelectable)
+        header_item.setToolTip(0, str(group.get("tooltip") or ""))
+        header_item.setToolTip(4, str(group.get("tooltip") or ""))
+        _style_tree_item_row(header_item, group.get("status_tint") or QtGui.QColor(), column_count, bold=True)
+        tree.addTopLevelItem(header_item)
+        for variant in list(group.get("variants") or []):
+            child_item = QtWidgets.QTreeWidgetItem(
+                [
+                    str(variant.get("source_label") or "Dataset"),
+                    str(variant.get("resolution") or "—"),
+                    str(variant.get("history_window") or "—"),
+                    str(variant.get("freshness_label") or "Unknown"),
+                    str(variant.get("status_label") or "Missing"),
+                ]
+            )
+            dataset_id = str(variant.get("dataset_id") or "")
+            child_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, dataset_id)
+            tooltip = str(variant.get("tooltip") or "")
+            for column in range(column_count):
+                child_item.setToolTip(column, tooltip)
+            if checkable:
+                child_item.setFlags(child_item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                child_item.setCheckState(
+                    0,
+                    QtCore.Qt.CheckState.Checked if dataset_id in checked_set else QtCore.Qt.CheckState.Unchecked,
+                )
+            _style_tree_item_row(child_item, variant.get("status_tint") or QtGui.QColor(), column_count)
+            header_item.addChild(child_item)
+            item_map[dataset_id] = child_item
+        header_item.setExpanded(True)
+    if current_dataset_id and current_dataset_id in item_map:
+        tree.setCurrentItem(item_map[current_dataset_id])
+    elif tree.topLevelItemCount() > 0 and tree.topLevelItem(0).childCount() > 0:
+        tree.setCurrentItem(tree.topLevelItem(0).child(0))
+    return item_map
+
+
+def _filter_grouped_dataset_tree(tree: QtWidgets.QTreeWidget, text: str) -> None:
+    needle = str(text or "").strip().upper()
+    for parent_idx in range(tree.topLevelItemCount()):
+        header_item = tree.topLevelItem(parent_idx)
+        if header_item is None:
+            continue
+        parent_match = needle in header_item.text(0).upper() or needle in header_item.text(4).upper()
+        visible_children = 0
+        for child_idx in range(header_item.childCount()):
+            child_item = header_item.child(child_idx)
+            haystack = " ".join(child_item.text(column) for column in range(tree.columnCount())).upper()
+            child_match = (not needle) or parent_match or needle in haystack or needle in str(
+                child_item.data(0, QtCore.Qt.ItemDataRole.UserRole) or ""
+            ).upper()
+            child_item.setHidden(not child_match)
+            if child_match:
+                visible_children += 1
+        should_show = (not needle) or parent_match or visible_children > 0
+        header_item.setHidden(not should_show)
+        header_item.setExpanded(bool(needle) or should_show)
+
+
+class AcquisitionSnapshotWorker(QtCore.QThread):
+    loaded = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, catalog_path: Path | str, parent=None) -> None:
+        super().__init__(parent)
+        self.catalog_path = Path(catalog_path)
+
+    def run(self) -> None:
+        try:
+            frame = CatalogReader(self.catalog_path).load_acquisition_datasets(include_untracked_local=True)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        self.loaded.emit(frame)
+
+
+class DownloadFinalizeWorker(QtCore.QThread):
+    result_signal = QtCore.pyqtSignal(object)
+
+    def __init__(self, job: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.job = dict(job or {})
+
+    def run(self) -> None:
+        mode = str(self.job.get("mode") or "").strip()
+        result = dict(self.job)
+        result["artifact"] = None
+        result["error"] = None
+        try:
+            if mode == "ingest_csv":
+                result["artifact"] = ingest_csv_to_store(
+                    self.job["out_path"],
+                    dataset_id=self.job.get("dataset_id"),
+                    merge_existing=bool(self.job.get("merge_existing")),
+                    resolution=self.job.get("resolution"),
+                )
+            elif mode == "gap_fill":
+                artifact = None
+                windows = list(self.job.get("windows") or [])
+                for window_start, window_end in windows:
+                    artifact = gap_fill_dataset_from_secondary(
+                        str(self.job.get("target_dataset_id") or ""),
+                        str(self.job.get("secondary_dataset_id") or ""),
+                        start=window_start,
+                        end=window_end,
+                        resolution=self.job.get("resolution"),
+                    )
+                result["artifact"] = artifact
+            else:
+                result["error"] = f"Unknown finalize mode: {mode or '—'}"
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.result_signal.emit(result)
+
+
+class AcquisitionPolicyWorker(QtCore.QThread):
+    result_signal = QtCore.pyqtSignal(object)
+
+    def __init__(self, job: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.job = dict(job or {})
+
+    def run(self) -> None:
+        result = dict(self.job)
+        result["decision"] = None
+        result["error"] = None
+        try:
+            result["decision"] = decide_acquisition_policy(
+                str(self.job.get("ticker") or ""),
+                source=str(self.job.get("source") or DEFAULT_ACQUISITION_PROVIDER),
+                resolution=str(self.job.get("resolution") or ""),
+                history_window=str(self.job.get("history_window") or ""),
+                catalog=ResultCatalog(Path(str(self.job.get("catalog_path") or ""))),
+                force_refresh=bool(self.job.get("force_refresh")),
+            )
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.result_signal.emit(result)
+
+
+class FinanceDatabaseImportWorker(QtCore.QThread):
+    finished_signal = QtCore.pyqtSignal(object)
+    error_signal = QtCore.pyqtSignal(str)
+    progress_signal = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        *,
+        catalog_path: Path | str,
+        asset_classes: Sequence[str] | None = None,
+        only_primary_listing: bool = False,
+        limit_per_class: int | None = None,
+        store_raw_payloads: bool = False,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.catalog_path = Path(catalog_path)
+        self.asset_classes = [str(item).strip().lower() for item in list(asset_classes or []) if str(item).strip()]
+        self.only_primary_listing = bool(only_primary_listing)
+        self.limit_per_class = int(limit_per_class) if limit_per_class else None
+        self.store_raw_payloads = bool(store_raw_payloads)
+
+    def run(self) -> None:
+        try:
+            payload = import_financedatabase_assets(
+                catalog_path=self.catalog_path,
+                asset_classes=self.asset_classes or None,
+                only_primary_listing=self.only_primary_listing,
+                limit_per_class=self.limit_per_class,
+                store_raw_payloads=self.store_raw_payloads,
+                stop_requested=self.isInterruptionRequested,
+                progress_callback=lambda item: self.progress_signal.emit(dict(item or {})),
+            )
+        except InterruptedError:
+            return
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+            return
+        self.finished_signal.emit(payload)
+
+
+class AssetProviderSyncWorker(QtCore.QThread):
+    finished_signal = QtCore.pyqtSignal(object)
+    error_signal = QtCore.pyqtSignal(str)
+    progress_signal = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        catalog_path: Path | str,
+        symbols: Sequence[str],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.provider = str(provider or "").strip().lower()
+        self.catalog_path = Path(catalog_path)
+        self.symbols = [str(symbol).strip().upper() for symbol in list(symbols or []) if str(symbol).strip()]
+
+    def run(self) -> None:
+        try:
+            if self.provider == "simfin":
+                payload = sync_simfin_assets(
+                    catalog_path=self.catalog_path,
+                    symbols=self.symbols,
+                    store_raw_payloads=True,
+                    stop_requested=self.isInterruptionRequested,
+                    progress_callback=lambda item: self.progress_signal.emit(dict(item or {})),
+                )
+            elif self.provider == "defeatbeta":
+                payload = sync_defeatbeta_assets(
+                    catalog_path=self.catalog_path,
+                    symbols=self.symbols,
+                    store_raw_payloads=True,
+                    stop_requested=self.isInterruptionRequested,
+                    progress_callback=lambda item: self.progress_signal.emit(dict(item or {})),
+                )
+            else:
+                raise ValueError(f"Unsupported asset provider sync: {self.provider or '—'}")
+        except InterruptedError:
+            return
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+            return
+        self.finished_signal.emit(payload)
+
+
 # --- Worker thread for grid orchestration -----------------------------------
 class GridWorker(QtCore.QThread):
     finished_signal = QtCore.pyqtSignal(object)  # payload dict with df/spec/message
@@ -1776,6 +3002,14 @@ class GridWorker(QtCore.QThread):
                 sharpe_debug=self.sharpe_debug,
                 risk_free_rate=self.risk_free_rate,
             )
+            if study_mode != STUDY_MODE_PORTFOLIO and len(dataset_ids) > 1:
+                # Keep multi-asset vectorized studies responsive in the UI by
+                # forcing smaller param batches instead of one giant batch that
+                # only reports progress at the end.
+                base_config = replace(
+                    base_config,
+                    vectorized_param_batch_size=max(1, min(4, param_combo)),
+                )
 
             if not self.strategy_params:
                 raise ValueError("No strategy parameters provided.")
@@ -2684,12 +3918,24 @@ class DashboardDialog(QtWidgets.QDialog):
 
 
 class DatasetSelectionDialog(DashboardDialog):
-    def __init__(self, datasets: Sequence[str], selected: Sequence[str], parent=None) -> None:
+    def __init__(
+        self,
+        datasets: Sequence[str],
+        selected: Sequence[str],
+        parent=None,
+        *,
+        catalog_path: Path | str | None = None,
+        snapshot_frame: pd.DataFrame | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Choose Study Datasets")
-        self.resize(420, 520)
-        self.setMinimumSize(420, 520)
+        self.resize(860, 620)
+        self.setMinimumSize(760, 580)
         self.setObjectName("Panel")
+        self._catalog_path = _picker_catalog_path(catalog_path) if catalog_path is not None else None
+        self._datasets = [str(item).strip() for item in list(datasets or []) if str(item).strip()]
+        self._selected_initial = [str(item).strip() for item in list(selected or []) if str(item).strip()]
+        self._snapshot_worker: AcquisitionSnapshotWorker | None = None
         self.setStyleSheet(
             f"""
             QDialog#Panel {{
@@ -2702,7 +3948,17 @@ class DatasetSelectionDialog(DashboardDialog):
             QLabel#Sub {{
                 color: {PALETTE['muted']};
             }}
-            QListWidget {{
+            QLineEdit {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {PALETTE['text']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
+                border-radius: 10px;
+                padding: 7px 10px;
+            }}
+            QLineEdit:focus {{
+                border-color: {PALETTE['blue']};
+            }}
+            QTreeWidget {{
                 background: {PALETTE['panel2']};
                 color: {PALETTE['text']};
                 border: 1px solid rgba(231, 238, 252, 0.45);
@@ -2710,18 +3966,40 @@ class DatasetSelectionDialog(DashboardDialog):
                 padding: 6px;
                 outline: 0;
             }}
-            QListWidget::item {{
-                color: {PALETTE['text']};
-                background: transparent;
-                padding: 8px 10px;
-                border-radius: 8px;
+            QTreeWidget::item {{
+                padding: 7px 8px;
             }}
-            QListWidget::item:selected {{
+            QTreeWidget::item:selected {{
                 background: rgba(77, 163, 255, 0.24);
                 color: {PALETTE['text']};
             }}
-            QListWidget::item:hover {{
+            QTreeWidget::item:hover {{
                 background: rgba(255, 255, 255, 0.08);
+            }}
+            QHeaderView::section {{
+                background: rgba(255, 255, 255, 0.06);
+                color: {PALETTE['muted']};
+                border: none;
+                border-bottom: 1px solid rgba(231, 238, 252, 0.2);
+                padding: 7px 8px;
+            }}
+            QTreeView::indicator {{
+                width: 20px;
+                height: 20px;
+                border-radius: 5px;
+                border: 1px solid rgba(231, 238, 252, 0.75);
+                background: rgba(255, 255, 255, 0.08);
+            }}
+            QTreeView::indicator:hover {{
+                border-color: {PALETTE['blue']};
+                background: rgba(77, 163, 255, 0.12);
+            }}
+            QTreeView::indicator:checked {{
+                border-color: {PALETTE['blue']};
+                background: {PALETTE['blue']};
+            }}
+            QTreeView::indicator:unchecked {{
+                background: rgba(255, 255, 255, 0.03);
             }}
             QPushButton {{
                 background: rgba(255, 255, 255, 0.08);
@@ -2749,48 +4027,149 @@ class DatasetSelectionDialog(DashboardDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
         label = QtWidgets.QLabel(
-            "Select one or more datasets for an independent multi-dataset study.\n"
-            "Each dataset will be backtested separately under the same study."
+            "Choose one or more dataset variants by ticker.\n"
+            "The engine still stores the selected dataset IDs underneath; this view just keeps the picker ticker-first."
         )
         label.setObjectName("Sub")
         label.setWordWrap(True)
         layout.addWidget(label)
 
-        self.list_widget = QtWidgets.QListWidget()
-        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
-        selected_set = set(selected)
-        for dataset_id in datasets:
-            item = QtWidgets.QListWidgetItem(dataset_id)
-            self.list_widget.addItem(item)
-            if dataset_id in selected_set:
-                item.setSelected(True)
-        layout.addWidget(self.list_widget)
+        self.search_edit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText("Filter tickers, sources, or dataset ids...")
+        self.search_edit.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.search_edit)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Ticker / Source", "Resolution", "Window", "Freshness", "Status"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(False)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setAllColumnsShowFocus(True)
+        self.tree.header().setStretchLastSection(False)
+        header = self.tree.header()
+        header.setStyleSheet(
+            f"""
+            QHeaderView::section {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['muted']};
+                border: none;
+                border-bottom: 1px solid rgba(231, 238, 252, 0.22);
+                padding: 8px 10px;
+                font-weight: 700;
+            }}
+            """
+        )
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 5):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.tree, 1)
+
+        self.loading_label = QtWidgets.QLabel("")
+        self.loading_label.setObjectName("Sub")
+        self.loading_label.setWordWrap(True)
+        layout.addWidget(self.loading_label)
 
         actions = QtWidgets.QHBoxLayout()
-        select_all_btn = QtWidgets.QPushButton("Select All")
-        select_all_btn.clicked.connect(self._select_all)
-        clear_btn = QtWidgets.QPushButton("Clear")
-        clear_btn.clicked.connect(self.list_widget.clearSelection)
-        actions.addWidget(select_all_btn)
-        actions.addWidget(clear_btn)
+        self.select_all_btn = QtWidgets.QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self._select_all)
+        self.clear_btn = QtWidgets.QPushButton("Clear")
+        self.clear_btn.clicked.connect(self._clear_all)
+        actions.addWidget(self.select_all_btn)
+        actions.addWidget(self.clear_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
 
-        buttons = QtWidgets.QDialogButtonBox(
+        self.buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        if snapshot_frame is not None:
+            self._apply_snapshot(snapshot_frame)
+        elif self._catalog_path is not None:
+            self._set_loading_state("Loading dataset status and variants…")
+            self._start_snapshot_worker()
+        else:
+            self._apply_snapshot(pd.DataFrame())
+
+    def _set_loading_state(self, message: str) -> None:
+        loading = bool(message)
+        self.loading_label.setText(message)
+        self.tree.setEnabled(not loading)
+        self.search_edit.setEnabled(not loading)
+        self.select_all_btn.setEnabled(not loading)
+        self.clear_btn.setEnabled(not loading)
+        ok_button = self.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setEnabled(not loading)
+
+    def _start_snapshot_worker(self) -> None:
+        if self._catalog_path is None or self._snapshot_worker is not None:
+            return
+        self._snapshot_worker = AcquisitionSnapshotWorker(self._catalog_path, self)
+        self._snapshot_worker.loaded.connect(self._on_snapshot_loaded)
+        self._snapshot_worker.error.connect(self._on_snapshot_error)
+        self._snapshot_worker.finished.connect(self._snapshot_worker.deleteLater)
+        self._snapshot_worker.start()
+
+    def _apply_snapshot(self, frame: pd.DataFrame) -> None:
+        groups = _dataset_picker_groups(self._datasets, frame=frame)
+        _populate_grouped_dataset_tree(self.tree, groups, checked_dataset_ids=self._selected_initial, checkable=True)
+        self._set_loading_state("")
+
+    def _on_snapshot_loaded(self, frame: object) -> None:
+        self._snapshot_worker = None
+        resolved = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+        self._apply_snapshot(resolved)
+
+    def _on_snapshot_error(self, message: str) -> None:
+        self._snapshot_worker = None
+        self._apply_snapshot(pd.DataFrame())
+        self.loading_label.setText(f"Status loading failed: {message}")
+
+    def _apply_filter(self, text: str) -> None:
+        _filter_grouped_dataset_tree(self.tree, text)
 
     def _select_all(self) -> None:
-        for row in range(self.list_widget.count()):
-            item = self.list_widget.item(row)
-            if item is not None:
-                item.setSelected(True)
+        for parent_idx in range(self.tree.topLevelItemCount()):
+            header_item = self.tree.topLevelItem(parent_idx)
+            if header_item is None or header_item.isHidden():
+                continue
+            for child_idx in range(header_item.childCount()):
+                child_item = header_item.child(child_idx)
+                if child_item is None or child_item.isHidden():
+                    continue
+                child_item.setCheckState(0, QtCore.Qt.CheckState.Checked)
+
+    def _clear_all(self) -> None:
+        for parent_idx in range(self.tree.topLevelItemCount()):
+            header_item = self.tree.topLevelItem(parent_idx)
+            if header_item is None:
+                continue
+            for child_idx in range(header_item.childCount()):
+                child_item = header_item.child(child_idx)
+                if child_item is not None:
+                    child_item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
 
     def selected_datasets(self) -> list[str]:
-        return [item.text() for item in self.list_widget.selectedItems()]
+        selected: list[str] = []
+        for parent_idx in range(self.tree.topLevelItemCount()):
+            header_item = self.tree.topLevelItem(parent_idx)
+            if header_item is None:
+                continue
+            for child_idx in range(header_item.childCount()):
+                child_item = header_item.child(child_idx)
+                if child_item is None:
+                    continue
+                if child_item.checkState(0) == QtCore.Qt.CheckState.Checked:
+                    dataset_id = str(child_item.data(0, QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+                    if dataset_id:
+                        selected.append(dataset_id)
+        return selected
 
     def accept(self) -> None:
         if not self.selected_datasets():
@@ -2800,12 +4179,25 @@ class DatasetSelectionDialog(DashboardDialog):
 
 
 class DatasetPickerDialog(DashboardDialog):
-    def __init__(self, datasets: Sequence[str], selected_dataset: str = "", parent=None, *, title: str = "Choose Dataset") -> None:
+    def __init__(
+        self,
+        datasets: Sequence[str],
+        selected_dataset: str = "",
+        parent=None,
+        *,
+        title: str = "Choose Dataset",
+        catalog_path: Path | str | None = None,
+        snapshot_frame: pd.DataFrame | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(420, 520)
-        self.setMinimumSize(420, 520)
+        self.resize(860, 620)
+        self.setMinimumSize(760, 580)
         self.setObjectName("Panel")
+        self._catalog_path = _picker_catalog_path(catalog_path) if catalog_path is not None else None
+        self._datasets = [str(item).strip() for item in list(datasets or []) if str(item).strip()]
+        self._selected_dataset = str(selected_dataset or "").strip()
+        self._snapshot_worker: AcquisitionSnapshotWorker | None = None
         self.setStyleSheet(
             f"""
             QDialog#Panel {{
@@ -2818,7 +4210,17 @@ class DatasetPickerDialog(DashboardDialog):
             QLabel#Sub {{
                 color: {PALETTE['muted']};
             }}
-            QListWidget {{
+            QLineEdit {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {PALETTE['text']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
+                border-radius: 10px;
+                padding: 7px 10px;
+            }}
+            QLineEdit:focus {{
+                border-color: {PALETTE['blue']};
+            }}
+            QTreeWidget {{
                 background: {PALETTE['panel2']};
                 color: {PALETTE['text']};
                 border: 1px solid rgba(231, 238, 252, 0.45);
@@ -2826,18 +4228,22 @@ class DatasetPickerDialog(DashboardDialog):
                 padding: 6px;
                 outline: 0;
             }}
-            QListWidget::item {{
-                color: {PALETTE['text']};
-                background: transparent;
-                padding: 8px 10px;
-                border-radius: 8px;
+            QTreeWidget::item {{
+                padding: 7px 8px;
             }}
-            QListWidget::item:selected {{
+            QTreeWidget::item:selected {{
                 background: rgba(77, 163, 255, 0.24);
                 color: {PALETTE['text']};
             }}
-            QListWidget::item:hover {{
+            QTreeWidget::item:hover {{
                 background: rgba(255, 255, 255, 0.08);
+            }}
+            QHeaderView::section {{
+                background: rgba(255, 255, 255, 0.06);
+                color: {PALETTE['muted']};
+                border: none;
+                border-bottom: 1px solid rgba(231, 238, 252, 0.2);
+                padding: 7px 8px;
             }}
             QPushButton {{
                 background: rgba(255, 255, 255, 0.08);
@@ -2860,33 +4266,112 @@ class DatasetPickerDialog(DashboardDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
-        label = QtWidgets.QLabel("Choose the dataset whose acquisition metadata and history you want to inspect.")
+        label = QtWidgets.QLabel(
+            "Choose the ticker first, then pick the dataset variant you want.\n"
+            "Dataset IDs stay internal, but the picker now shows the human metadata up front."
+        )
         label.setObjectName("Sub")
         label.setWordWrap(True)
         layout.addWidget(label)
 
-        self.list_widget = QtWidgets.QListWidget()
-        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        current_row = 0
-        for idx, dataset_id in enumerate(datasets):
-            item = QtWidgets.QListWidgetItem(dataset_id)
-            self.list_widget.addItem(item)
-            if dataset_id == selected_dataset:
-                current_row = idx
-        if self.list_widget.count() > 0:
-            self.list_widget.setCurrentRow(current_row)
-        layout.addWidget(self.list_widget)
+        self.search_edit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText("Filter tickers, sources, or dataset ids...")
+        self.search_edit.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.search_edit)
 
-        buttons = QtWidgets.QDialogButtonBox(
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Ticker / Source", "Resolution", "Window", "Freshness", "Status"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setAllColumnsShowFocus(True)
+        self.tree.itemDoubleClicked.connect(self._accept_if_dataset)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setStyleSheet(
+            f"""
+            QHeaderView::section {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['muted']};
+                border: none;
+                border-bottom: 1px solid rgba(231, 238, 252, 0.22);
+                padding: 8px 10px;
+                font-weight: 700;
+            }}
+            """
+        )
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 5):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.tree, 1)
+
+        self.loading_label = QtWidgets.QLabel("")
+        self.loading_label.setObjectName("Sub")
+        self.loading_label.setWordWrap(True)
+        layout.addWidget(self.loading_label)
+
+        self.buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        if snapshot_frame is not None:
+            self._apply_snapshot(snapshot_frame)
+        elif self._catalog_path is not None:
+            self._set_loading_state("Loading dataset status and variants…")
+            self._start_snapshot_worker()
+        else:
+            self._apply_snapshot(pd.DataFrame())
+
+    def _set_loading_state(self, message: str) -> None:
+        loading = bool(message)
+        self.loading_label.setText(message)
+        self.tree.setEnabled(not loading)
+        self.search_edit.setEnabled(not loading)
+        ok_button = self.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setEnabled(not loading)
+
+    def _start_snapshot_worker(self) -> None:
+        if self._catalog_path is None or self._snapshot_worker is not None:
+            return
+        self._snapshot_worker = AcquisitionSnapshotWorker(self._catalog_path, self)
+        self._snapshot_worker.loaded.connect(self._on_snapshot_loaded)
+        self._snapshot_worker.error.connect(self._on_snapshot_error)
+        self._snapshot_worker.finished.connect(self._snapshot_worker.deleteLater)
+        self._snapshot_worker.start()
+
+    def _apply_snapshot(self, frame: pd.DataFrame) -> None:
+        groups = _dataset_picker_groups(self._datasets, frame=frame)
+        _populate_grouped_dataset_tree(self.tree, groups, current_dataset_id=self._selected_dataset, checkable=False)
+        self._set_loading_state("")
+
+    def _on_snapshot_loaded(self, frame: object) -> None:
+        self._snapshot_worker = None
+        resolved = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+        self._apply_snapshot(resolved)
+
+    def _on_snapshot_error(self, message: str) -> None:
+        self._snapshot_worker = None
+        self._apply_snapshot(pd.DataFrame())
+        self.loading_label.setText(f"Status loading failed: {message}")
+
+    def _apply_filter(self, text: str) -> None:
+        _filter_grouped_dataset_tree(self.tree, text)
+
+    def _accept_if_dataset(self, item: QtWidgets.QTreeWidgetItem, *_args) -> None:
+        if item is None:
+            return
+        if str(item.data(0, QtCore.Qt.ItemDataRole.UserRole) or "").strip():
+            self.accept()
 
     def selected_dataset(self) -> str:
-        item = self.list_widget.currentItem()
-        return item.text().strip() if item is not None else ""
+        item = self.tree.currentItem()
+        if item is None:
+            return ""
+        return str(item.data(0, QtCore.Qt.ItemDataRole.UserRole) or "").strip()
 
     def accept(self) -> None:
         if not self.selected_dataset():
@@ -2950,6 +4435,9 @@ class ProviderSettingsDialog(DashboardDialog):
         )
 
         massive_secrets = load_provider_secrets("massive")
+        alpaca_secrets = load_provider_secrets("alpaca")
+        simfin_credential = self.catalog.load_provider_credential("simfin")
+        alpaca_settings = load_provider_settings("alpaca", catalog=self.catalog)
         ib_settings = load_provider_settings("interactive_brokers", catalog=self.catalog)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -2960,12 +4448,26 @@ class ProviderSettingsDialog(DashboardDialog):
         title.setObjectName("Title")
         subtitle = QtWidgets.QLabel(
             "Configure saved provider credentials and connection settings. "
-            "Non-secret settings are saved in SQLite. Secrets are saved locally in the data directory."
+            "Non-secret settings are saved in SQLite. Massive stays in the local secrets file, while SimFin is stored in SQLite for the asset-information sync layer."
         )
         subtitle.setObjectName("Sub")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+
+        simfin_box = QtWidgets.QGroupBox("SimFin")
+        simfin_form = QtWidgets.QFormLayout(simfin_box)
+        self.simfin_api_key_edit = QtWidgets.QLineEdit(str(simfin_credential.get("api_key") or ""))
+        self.simfin_api_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.simfin_api_key_edit.setPlaceholderText("Paste SimFin API key or leave blank for free tier")
+        simfin_form.addRow("API Key", self.simfin_api_key_edit)
+        simfin_note = QtWidgets.QLabel(
+            "Used by the Asset Information provider sync. This key is stored in the SQLite provider_credentials table so the enrichment layer can run without a separate secrets file."
+        )
+        simfin_note.setObjectName("Sub")
+        simfin_note.setWordWrap(True)
+        simfin_form.addRow("", simfin_note)
+        layout.addWidget(simfin_box)
 
         massive_box = QtWidgets.QGroupBox("Massive / Polygon")
         massive_form = QtWidgets.QFormLayout(massive_box)
@@ -2978,6 +4480,32 @@ class ProviderSettingsDialog(DashboardDialog):
         massive_note.setWordWrap(True)
         massive_form.addRow("", massive_note)
         layout.addWidget(massive_box)
+
+        alpaca_box = QtWidgets.QGroupBox("Alpaca")
+        alpaca_form = QtWidgets.QFormLayout(alpaca_box)
+        self.alpaca_api_key_edit = QtWidgets.QLineEdit(str(alpaca_secrets.get("api_key") or ""))
+        self.alpaca_api_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.alpaca_api_key_edit.setPlaceholderText("Paste Alpaca API key")
+        self.alpaca_secret_key_edit = QtWidgets.QLineEdit(str(alpaca_secrets.get("secret_key") or ""))
+        self.alpaca_secret_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.alpaca_secret_key_edit.setPlaceholderText("Paste Alpaca secret key")
+        self.alpaca_base_url_edit = QtWidgets.QLineEdit(
+            str(alpaca_settings.get("base_url") or "https://paper-api.alpaca.markets")
+        )
+        self.alpaca_data_url_edit = QtWidgets.QLineEdit(
+            str(alpaca_settings.get("data_url") or "https://data.alpaca.markets")
+        )
+        alpaca_form.addRow("API Key", self.alpaca_api_key_edit)
+        alpaca_form.addRow("Secret Key", self.alpaca_secret_key_edit)
+        alpaca_form.addRow("Base URL", self.alpaca_base_url_edit)
+        alpaca_form.addRow("Data URL", self.alpaca_data_url_edit)
+        alpaca_note = QtWidgets.QLabel(
+            "Used for live strategy market-data failover and Alpaca-side execution monitoring. Secrets stay in the local provider secrets file."
+        )
+        alpaca_note.setObjectName("Sub")
+        alpaca_note.setWordWrap(True)
+        alpaca_form.addRow("", alpaca_note)
+        layout.addWidget(alpaca_box)
 
         ib_box = QtWidgets.QGroupBox("Interactive Brokers")
         ib_form = QtWidgets.QFormLayout(ib_box)
@@ -3013,9 +4541,30 @@ class ProviderSettingsDialog(DashboardDialog):
         layout.addWidget(buttons)
 
     def accept(self) -> None:
+        self.catalog.save_provider_credential(
+            "simfin",
+            credential_label="SimFin API Key",
+            api_key=self.simfin_api_key_edit.text().strip(),
+            is_active=True,
+        )
         save_provider_secrets(
             "massive",
             {"api_key": self.massive_api_key_edit.text().strip()},
+        )
+        save_provider_secrets(
+            "alpaca",
+            {
+                "api_key": self.alpaca_api_key_edit.text().strip(),
+                "secret_key": self.alpaca_secret_key_edit.text().strip(),
+            },
+        )
+        save_provider_settings(
+            "alpaca",
+            {
+                "base_url": self.alpaca_base_url_edit.text().strip(),
+                "data_url": self.alpaca_data_url_edit.text().strip(),
+            },
+            catalog=self.catalog,
         )
         save_provider_settings(
             "interactive_brokers",
@@ -3384,7 +4933,16 @@ class ScheduledTaskEditorDialog(DashboardDialog):
         if not self.symbols:
             QtWidgets.QMessageBox.warning(self, "Symbols missing", f"Symbols file not found or empty: {NASDAQ_SYMBOLS_PATH}")
             return
-        dlg = TickerPickerDialog(self.symbols, set(self._selected_symbols), self)
+        logical_parent = self.logical_parent() if hasattr(self, "logical_parent") else None
+        snapshot_frame = logical_parent.picker_snapshot_frame() if hasattr(logical_parent, "picker_snapshot_frame") else None
+        catalog_path = getattr(getattr(logical_parent, "catalog", None), "db_path", None)
+        dlg = TickerPickerDialog(
+            self.symbols,
+            set(self._selected_symbols),
+            self,
+            catalog_path=catalog_path,
+            snapshot_frame=snapshot_frame,
+        )
         if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return
         self._selected_symbols = [str(item).upper() for item in list(dlg.selected) if str(item).strip()]
@@ -3435,7 +4993,272 @@ class ScheduledTaskEditorDialog(DashboardDialog):
         super().accept()
 
 
+class _CatalogLoadSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, object)
+    error = QtCore.pyqtSignal(int, str)
+
+
+_ACTIVE_CATALOG_LOAD_TASKS: dict[int, object] = {}
+
+
+class _CatalogLoadTask(QtCore.QRunnable):
+    def __init__(
+        self,
+        token: int,
+        db_path: Path,
+        *,
+        universes: Sequence[Dict],
+        selected_universe_id: str,
+        task_id: str,
+        dataset_id: str,
+        failures_only: bool,
+        page_index: dict[int, int],
+        page_sizes: dict[int, int],
+    ) -> None:
+        super().__init__()
+        self.token = int(token)
+        self.db_path = Path(db_path)
+        self.universes = list(universes or [])
+        self.selected_universe_id = str(selected_universe_id or "").strip()
+        self.task_id = str(task_id or "").strip()
+        self.dataset_id = str(dataset_id or "").strip()
+        self.failures_only = bool(failures_only)
+        self.page_index = {int(key): int(value) for key, value in dict(page_index or {}).items()}
+        self.page_sizes = {int(key): int(value) for key, value in dict(page_sizes or {}).items()}
+        self.signals = _CatalogLoadSignals()
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            reader = CatalogReader(self.db_path)
+            universe = None
+            if self.selected_universe_id:
+                universe = next(
+                    (
+                        item
+                        for item in self.universes
+                        if str(item.get("universe_id") or "").strip() == self.selected_universe_id
+                    ),
+                    None,
+                )
+            universe_dataset_ids = [
+                str(item).strip()
+                for item in list((universe or {}).get("dataset_ids") or [])
+                if str(item).strip()
+            ]
+            universe_symbols = [
+                str(item).strip().upper()
+                for item in list((universe or {}).get("symbols") or [])
+                if str(item).strip()
+            ]
+
+            dataset_frame = reader.load_acquisition_datasets()
+            if self.selected_universe_id and not dataset_frame.empty:
+                dataset_mask = pd.Series(False, index=dataset_frame.index)
+                if universe_dataset_ids and "dataset_id" in dataset_frame.columns:
+                    dataset_mask = dataset_mask | dataset_frame["dataset_id"].astype(str).isin(universe_dataset_ids)
+                if universe_symbols and "symbol" in dataset_frame.columns:
+                    dataset_mask = dataset_mask | dataset_frame["symbol"].astype(str).str.upper().isin(universe_symbols)
+                dataset_frame = dataset_frame[dataset_mask].reset_index(drop=True)
+            if self.task_id and not dataset_frame.empty:
+                task_dataset_ids = set(
+                    reader.load_matching_attempt_dataset_ids(
+                        task_id=self.task_id,
+                        universe_id=self.selected_universe_id or None,
+                        dataset_ids=universe_dataset_ids or None,
+                        symbols=universe_symbols or None,
+                    )
+                )
+                dataset_frame = dataset_frame[
+                    dataset_frame["dataset_id"].astype(str).isin(task_dataset_ids)
+                ].reset_index(drop=True)
+            if self.dataset_id and not dataset_frame.empty:
+                dataset_frame = dataset_frame[
+                    dataset_frame["dataset_id"].astype(str) == self.dataset_id
+                ].reset_index(drop=True)
+
+            run_page_size = max(int(self.page_sizes.get(1, 100)), 1)
+            attempt_page_size = max(int(self.page_sizes.get(2, 200)), 1)
+            task_run_page_size = max(int(self.page_sizes.get(3, 100)), 1)
+            run_offset = max(0, int(self.page_index.get(1, 0))) * run_page_size
+            attempt_offset = max(0, int(self.page_index.get(2, 0))) * attempt_page_size
+            task_run_offset = max(0, int(self.page_index.get(3, 0))) * task_run_page_size
+            failure_statuses = list(_ACQUISITION_ERROR_ATTEMPT_STATUSES)
+            unresolved_dataset_ids: list[str] = []
+            unresolved_symbols: list[str] = []
+            if self.failures_only and not dataset_frame.empty:
+                ingested_mask = dataset_frame["ingested"].fillna(False).astype(bool) if "ingested" in dataset_frame.columns else pd.Series(False, index=dataset_frame.index)
+                status_mask = (
+                    dataset_frame["last_status"].astype(str).str.strip().str.lower().isin(failure_statuses)
+                    if "last_status" in dataset_frame.columns
+                    else pd.Series(False, index=dataset_frame.index)
+                )
+                dataset_frame = dataset_frame[(~ingested_mask) & status_mask].reset_index(drop=True)
+                unresolved_dataset_ids = [
+                    str(item).strip()
+                    for item in dataset_frame.get("dataset_id", pd.Series(dtype="object")).tolist()
+                    if str(item).strip()
+                ]
+                unresolved_symbols = [
+                    str(item).strip().upper()
+                    for item in dataset_frame.get("symbol", pd.Series(dtype="object")).tolist()
+                    if str(item).strip()
+                ]
+            attempt_statuses = failure_statuses if self.failures_only else None
+            attempt_dataset_ids = unresolved_dataset_ids if self.failures_only else universe_dataset_ids
+            attempt_symbols = unresolved_symbols if self.failures_only else universe_symbols
+
+            run_count = reader.count_acquisition_runs(
+                task_id=self.task_id or None,
+                universe_id=self.selected_universe_id or None,
+            )
+            if self.failures_only and not unresolved_dataset_ids and not unresolved_symbols:
+                attempt_count = 0
+            else:
+                attempt_count = reader.count_acquisition_attempts(
+                    dataset_id=self.dataset_id or None,
+                    dataset_ids=attempt_dataset_ids or None,
+                    symbols=attempt_symbols or None,
+                    task_id=self.task_id or None,
+                    universe_id=self.selected_universe_id or None,
+                    statuses=attempt_statuses,
+                )
+            failed_attempt_count = reader.count_acquisition_attempts(
+                dataset_id=self.dataset_id or None,
+                dataset_ids=universe_dataset_ids or None,
+                symbols=universe_symbols or None,
+                task_id=self.task_id or None,
+                universe_id=self.selected_universe_id or None,
+                statuses=failure_statuses,
+            )
+            task_run_count = reader.count_task_runs(task_id=self.task_id or None)
+            payload = {
+                "datasets": dataset_frame,
+                "run_count": run_count,
+                "attempt_count": attempt_count,
+                "failed_attempt_count": failed_attempt_count,
+                "task_run_count": task_run_count,
+                "runs": reader.load_acquisition_runs(
+                    limit=run_page_size,
+                    offset=run_offset,
+                    task_id=self.task_id or None,
+                    universe_id=self.selected_universe_id or None,
+                ),
+                "attempts": (
+                    pd.DataFrame()
+                    if self.failures_only and not unresolved_dataset_ids and not unresolved_symbols
+                    else reader.load_acquisition_attempts(
+                        limit=attempt_page_size,
+                        offset=attempt_offset,
+                        dataset_id=self.dataset_id or None,
+                        dataset_ids=attempt_dataset_ids or None,
+                        symbols=attempt_symbols or None,
+                        task_id=self.task_id or None,
+                        universe_id=self.selected_universe_id or None,
+                        statuses=attempt_statuses,
+                    )
+                ),
+                "task_runs": reader.load_task_runs(
+                    task_id=self.task_id or None,
+                    limit=task_run_page_size,
+                    offset=task_run_offset,
+                ),
+            }
+        except Exception:
+            try:
+                self.signals.error.emit(self.token, traceback.format_exc())
+            except RuntimeError:
+                pass
+            return
+        try:
+            self.signals.finished.emit(self.token, payload)
+        except RuntimeError:
+            pass
+
+
+class _CatalogQualityBackfillSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, int)
+    error = QtCore.pyqtSignal(int, str)
+
+
+class _CatalogQualityBackfillTask(QtCore.QRunnable):
+    def __init__(self, token: int, db_path: Path, dataset_ids: Sequence[str]) -> None:
+        super().__init__()
+        self.token = int(token)
+        self.db_path = Path(db_path)
+        self.dataset_ids = [str(item).strip() for item in list(dataset_ids or []) if str(item).strip()]
+        self.signals = _CatalogQualityBackfillSignals()
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            updated = backfill_missing_quality_snapshots(
+                catalog=ResultCatalog(self.db_path),
+                store=DuckDBStore(),
+                dataset_ids=self.dataset_ids,
+            )
+        except Exception:
+            try:
+                self.signals.error.emit(self.token, traceback.format_exc())
+            except RuntimeError:
+                pass
+            return
+        try:
+            self.signals.finished.emit(self.token, int(updated))
+        except RuntimeError:
+            pass
+
+
+class CatalogFrameTableModel(QtCore.QAbstractTableModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self._frame = pd.DataFrame()
+        self._raw_rows: list[dict] = []
+        self._tooltips: dict[tuple[int, int], str] = {}
+
+    def rowCount(self, parent=None):
+        return len(self._frame.index)
+
+    def columnCount(self, parent=None):
+        return len(self._frame.columns)
+
+    def data(self, index, role=None):
+        if not index.isValid() or self._frame.empty:
+            return None
+        row = index.row()
+        col = index.column()
+        value = self._frame.iat[row, col]
+        if role == QtCore.Qt.ItemDataRole.DisplayRole:
+            return str(value)
+        if role == QtCore.Qt.ItemDataRole.ToolTipRole:
+            return self._tooltips.get((row, col)) or str(value)
+        if role == QtCore.Qt.ItemDataRole.TextAlignmentRole:
+            return int(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def headerData(self, section, orientation, role=None):
+        if role != QtCore.Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == QtCore.Qt.Orientation.Horizontal and section < len(self._frame.columns):
+            return str(self._frame.columns[section])
+        return str(section + 1)
+
+    def set_page(self, frame: pd.DataFrame, *, raw_rows: list[dict] | None = None, tooltips: dict[tuple[int, int], str] | None = None) -> None:
+        self.beginResetModel()
+        self._frame = frame.copy()
+        self._raw_rows = list(raw_rows or [])
+        self._tooltips = dict(tooltips or {})
+        self.endResetModel()
+
+    def row_record(self, row: int) -> dict:
+        if 0 <= row < len(self._raw_rows):
+            return dict(self._raw_rows[row])
+        return {}
+
+
 class AcquisitionCatalogDialog(DashboardDialog):
+    PAGE_SIZES = {0: 100, 1: 100, 2: 200, 3: 100}
+
     def __init__(
         self,
         catalog: CatalogReader,
@@ -3452,15 +5275,25 @@ class AcquisitionCatalogDialog(DashboardDialog):
         self.selected_universe_id = str(selected_universe_id or "")
         self.selected_task_id = str(selected_task_id or "")
         self.selected_dataset_id = str(selected_dataset_id or "")
-        self.dataset_frame_raw = pd.DataFrame()
-        self.run_frame_raw = pd.DataFrame()
-        self.attempt_frame_raw = pd.DataFrame()
-        self.task_run_frame_raw = pd.DataFrame()
         self.dataset_frame = pd.DataFrame()
         self.run_frame = pd.DataFrame()
         self.attempt_frame = pd.DataFrame()
         self.task_run_frame = pd.DataFrame()
-
+        self.run_total_rows = 0
+        self.attempt_total_rows = 0
+        self.failed_attempt_count = 0
+        self.task_run_total_rows = 0
+        self._dataset_quality_cache: dict[tuple[str, str], dict] = {}
+        self._dataset_policy_cache: dict[tuple[str, str, str, str], object] = {}
+        self._failures_only = False
+        self._page_index = {0: 0, 1: 0, 2: 0, 3: 0}
+        self._dirty_tabs: set[int] = {0, 1, 2, 3}
+        self._selected_keys = {0: self.selected_dataset_id, 1: "", 3: ""}
+        self._load_token = 0
+        self._quality_backfill_token = 0
+        self._quality_backfill_inflight = False
+        self._loading = False
+        self._thread_pool = QtCore.QThreadPool.globalInstance()
         self.setWindowTitle("Acquisition Catalog And History")
         self.resize(1480, 920)
         self.setMinimumSize(1240, 780)
@@ -3477,11 +5310,12 @@ class AcquisitionCatalogDialog(DashboardDialog):
             QLabel#Sub {{
                 color: {PALETTE['muted']};
             }}
-            QTableWidget {{
+            QTableView {{
                 background: {PALETTE['panel2']};
                 color: {PALETTE['text']};
                 border: 1px solid {PALETTE['border']};
                 gridline-color: {PALETTE['grid']};
+                alternate-background-color: {PALETTE['panel']};
             }}
             QHeaderView::section {{
                 background: {PALETTE['panel']};
@@ -3498,6 +5332,10 @@ class AcquisitionCatalogDialog(DashboardDialog):
             }}
             """
         )
+
+        self._page_labels: dict[int, QtWidgets.QLabel] = {}
+        self._page_prev_buttons: dict[int, QtWidgets.QPushButton] = {}
+        self._page_next_buttons: dict[int, QtWidgets.QPushButton] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -3522,24 +5360,28 @@ class AcquisitionCatalogDialog(DashboardDialog):
         for universe in self.universes:
             self.universe_filter_combo.addItem(str(universe.get("name") or ""), str(universe.get("universe_id") or ""))
         if self.selected_universe_id:
-            self.universe_filter_combo.blockSignals(True)
             idx = self.universe_filter_combo.findData(self.selected_universe_id)
             self.universe_filter_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.universe_filter_combo.blockSignals(False)
         self.universe_filter_combo.currentIndexChanged.connect(self._apply_filters)
         self.task_filter_edit = QtWidgets.QLineEdit(self.selected_task_id)
         self.task_filter_edit.setPlaceholderText("Optional task id filter")
         self.task_filter_edit.textChanged.connect(self._apply_filters)
+        self.failures_only_chk = QtWidgets.QCheckBox("Never Succeeded Only")
+        self.failures_only_chk.toggled.connect(self._apply_filters)
         clear_filters_btn = QtWidgets.QPushButton("Clear Filters")
         clear_filters_btn.clicked.connect(self._clear_filters)
+        self.backfill_quality_btn = QtWidgets.QPushButton("Analyze Missing Quality")
+        self.backfill_quality_btn.clicked.connect(self._start_quality_backfill)
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         actions.addWidget(QtWidgets.QLabel("Universe"))
         actions.addWidget(self.universe_filter_combo, 1)
         actions.addWidget(QtWidgets.QLabel("Task ID"))
         actions.addWidget(self.task_filter_edit, 1)
+        actions.addWidget(self.failures_only_chk)
         actions.addWidget(clear_filters_btn)
         actions.addWidget(refresh_btn)
+        actions.addWidget(self.backfill_quality_btn)
         actions.addStretch(1)
         actions.addWidget(close_btn)
 
@@ -3549,64 +5391,67 @@ class AcquisitionCatalogDialog(DashboardDialog):
         layout.addLayout(actions)
 
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs, 1)
 
         self._build_dataset_tab()
         self._build_runs_tab()
         self._build_attempts_tab()
         self._build_task_runs_tab()
+        self._reset_detail_views()
         self._reload()
 
-    def _make_table(self, columns: Sequence[str]) -> QtWidgets.QTableWidget:
-        table = QtWidgets.QTableWidget(0, len(columns))
-        table.setHorizontalHeaderLabels(list(columns))
-        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        table.setAlternatingRowColors(True)
-        table.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
-        table.setWordWrap(False)
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setObjectName("Panel")
-        return table
+    def _make_table_view(self, model: CatalogFrameTableModel) -> QtWidgets.QTableView:
+        view = QtWidgets.QTableView()
+        view.setModel(model)
+        view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        view.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        view.setAlternatingRowColors(True)
+        view.setWordWrap(False)
+        view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
+        view.verticalHeader().setVisible(False)
+        view.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        view.horizontalHeader().setStretchLastSection(True)
+        view.setObjectName("Panel")
+        return view
+
+    def _build_page_controls(self, tab_idx: int) -> QtWidgets.QHBoxLayout:
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        prev_btn = QtWidgets.QPushButton("Prev")
+        next_btn = QtWidgets.QPushButton("Next")
+        label = QtWidgets.QLabel("Page 0 / 0")
+        prev_btn.clicked.connect(lambda: self._change_page(tab_idx, -1))
+        next_btn.clicked.connect(lambda: self._change_page(tab_idx, 1))
+        row.addWidget(prev_btn)
+        row.addWidget(label)
+        row.addWidget(next_btn)
+        self._page_prev_buttons[tab_idx] = prev_btn
+        self._page_next_buttons[tab_idx] = next_btn
+        self._page_labels[tab_idx] = label
+        return row
 
     def _build_dataset_tab(self) -> None:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        dataset_actions = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QHBoxLayout()
         self.dataset_detail_btn = QtWidgets.QPushButton("Open Selected Dataset Detail")
         self.dataset_detail_btn.clicked.connect(self._open_selected_dataset_detail)
-        dataset_actions.addWidget(self.dataset_detail_btn)
-        dataset_actions.addStretch(1)
-        self.dataset_table = self._make_table(
-            [
-                "Dataset",
-                "Source",
-                "Symbol",
-                "Coverage",
-                "Bars",
-                "Freshness",
-                "Last Download",
-                "Last Ingest",
-                "Status",
-                "Ingested",
-                "Last Error",
-            ]
-        )
-        self.dataset_table.itemSelectionChanged.connect(self._on_dataset_selected)
-        self.dataset_table.itemDoubleClicked.connect(lambda _item: self._open_selected_dataset_detail())
+        header.addWidget(self.dataset_detail_btn)
+        header.addStretch(1)
+        header.addLayout(self._build_page_controls(0))
+        self.dataset_model = CatalogFrameTableModel()
+        self.dataset_table = self._make_table_view(self.dataset_model)
+        self.dataset_table.selectionModel().selectionChanged.connect(lambda *_: self._on_dataset_selected())
+        self.dataset_table.doubleClicked.connect(lambda _idx: self._open_selected_dataset_detail())
         self.dataset_detail = QtWidgets.QPlainTextEdit()
         self.dataset_detail.setReadOnly(True)
-        self.dataset_detail.setMinimumHeight(140)
-        self.dataset_attempt_table = self._make_table(
-            ["Finished", "Run", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]
-        )
-        self.dataset_table.setColumnWidth(10, 420)
-        self.dataset_attempt_table.setColumnWidth(8, 420)
-        layout.addLayout(dataset_actions)
+        self.dataset_detail.setMinimumHeight(160)
+        self.dataset_attempt_model = CatalogFrameTableModel()
+        self.dataset_attempt_table = self._make_table_view(self.dataset_attempt_model)
+        layout.addLayout(header)
         layout.addWidget(self.dataset_table, 3)
         layout.addWidget(self.dataset_detail, 1)
         layout.addWidget(self.dataset_attempt_table, 2)
@@ -3617,36 +5462,21 @@ class AcquisitionCatalogDialog(DashboardDialog):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        run_actions = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QHBoxLayout()
         self.run_log_btn = QtWidgets.QPushButton("Open Selected Log")
         self.run_log_btn.clicked.connect(self._open_selected_run_log)
-        run_actions.addWidget(self.run_log_btn)
-        run_actions.addStretch(1)
-        self.run_table = self._make_table(
-            [
-                "Run ID",
-                "Type",
-                "Source",
-                "Universe",
-                "Task",
-                "Started",
-                "Finished",
-                "Status",
-                "Symbols",
-                "Success",
-                "Failed",
-                "Ingested",
-            ]
-        )
-        self.run_table.itemSelectionChanged.connect(self._on_run_selected)
+        header.addWidget(self.run_log_btn)
+        header.addStretch(1)
+        header.addLayout(self._build_page_controls(1))
+        self.run_model = CatalogFrameTableModel()
+        self.run_table = self._make_table_view(self.run_model)
+        self.run_table.selectionModel().selectionChanged.connect(lambda *_: self._on_run_selected())
         self.run_notes = QtWidgets.QPlainTextEdit()
         self.run_notes.setReadOnly(True)
-        self.run_notes.setMinimumHeight(100)
-        self.run_attempt_table = self._make_table(
-            ["Seq", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]
-        )
-        self.run_attempt_table.setColumnWidth(7, 420)
-        layout.addLayout(run_actions)
+        self.run_notes.setMinimumHeight(120)
+        self.run_attempt_model = CatalogFrameTableModel()
+        self.run_attempt_table = self._make_table_view(self.run_attempt_model)
+        layout.addLayout(header)
         layout.addWidget(self.run_table, 3)
         layout.addWidget(self.run_notes, 1)
         layout.addWidget(self.run_attempt_table, 2)
@@ -3657,10 +5487,21 @@ class AcquisitionCatalogDialog(DashboardDialog):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        self.attempt_table = self._make_table(
-            ["Finished", "Run", "Symbol", "Dataset", "Source", "Status", "Bars", "Coverage", "Ingested", "Error"]
-        )
-        self.attempt_table.setColumnWidth(9, 420)
+        header = QtWidgets.QHBoxLayout()
+        self.attempt_log_btn = QtWidgets.QPushButton("Open Selected Attempt Log")
+        self.attempt_log_btn.clicked.connect(self._open_selected_attempt_log)
+        self.retry_selected_failed_btn = QtWidgets.QPushButton("Retry Selected Failed")
+        self.retry_selected_failed_btn.clicked.connect(lambda: self._retry_failed_attempts(selected_only=True))
+        self.retry_filtered_failed_btn = QtWidgets.QPushButton("Retry Filtered Failed")
+        self.retry_filtered_failed_btn.clicked.connect(lambda: self._retry_failed_attempts(selected_only=False))
+        header.addWidget(self.attempt_log_btn)
+        header.addWidget(self.retry_selected_failed_btn)
+        header.addWidget(self.retry_filtered_failed_btn)
+        header.addStretch(1)
+        header.addLayout(self._build_page_controls(2))
+        self.attempt_model = CatalogFrameTableModel()
+        self.attempt_table = self._make_table_view(self.attempt_model)
+        layout.addLayout(header)
         layout.addWidget(self.attempt_table)
         self.tabs.addTab(panel, "Attempt History")
 
@@ -3669,296 +5510,688 @@ class AcquisitionCatalogDialog(DashboardDialog):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        run_actions = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QHBoxLayout()
         self.task_run_log_btn = QtWidgets.QPushButton("Open Selected Scheduler Log")
         self.task_run_log_btn.clicked.connect(self._open_selected_task_run_log)
-        run_actions.addWidget(self.task_run_log_btn)
-        run_actions.addStretch(1)
-        self.task_run_table = self._make_table(
-            ["Run ID", "Task", "Started", "Finished", "Status", "Tickers", "Log", "Error"]
-        )
-        self.task_run_table.setColumnWidth(7, 420)
-        self.task_run_table.itemSelectionChanged.connect(self._on_task_run_selected)
+        header.addWidget(self.task_run_log_btn)
+        header.addStretch(1)
+        header.addLayout(self._build_page_controls(3))
+        self.task_run_model = CatalogFrameTableModel()
+        self.task_run_table = self._make_table_view(self.task_run_model)
+        self.task_run_table.selectionModel().selectionChanged.connect(lambda *_: self._on_task_run_selected())
         self.task_run_notes = QtWidgets.QPlainTextEdit()
         self.task_run_notes.setReadOnly(True)
-        self.task_run_notes.setMinimumHeight(120)
-        layout.addLayout(run_actions)
+        self.task_run_notes.setMinimumHeight(140)
+        layout.addLayout(header)
         layout.addWidget(self.task_run_table, 3)
         layout.addWidget(self.task_run_notes, 1)
         self.tabs.addTab(panel, "Scheduler Runs")
 
     def _reload(self) -> None:
-        self.dataset_frame_raw = self.catalog.load_acquisition_datasets()
-        self.run_frame_raw = self.catalog.load_acquisition_runs(limit=250)
-        self.attempt_frame_raw = self.catalog.load_acquisition_attempts(limit=500)
-        self.task_run_frame_raw = self.catalog.load_task_runs(limit=250)
-        self._apply_filters()
+        self._loading = True
+        self.summary_label.setText("Loading acquisition metadata…")
+        self._load_token += 1
+        token = self._load_token
+        selected_universe_id = (
+            str(self.universe_filter_combo.currentData() or "").strip()
+            if hasattr(self, "universe_filter_combo")
+            else self.selected_universe_id
+        )
+        task_id = str(self.task_filter_edit.text() or "").strip() if hasattr(self, "task_filter_edit") else self.selected_task_id
+        self._failures_only = bool(self.failures_only_chk.isChecked()) if hasattr(self, "failures_only_chk") else False
+        task = _CatalogLoadTask(
+            token,
+            Path(self.catalog.db_path),
+            universes=self.universes,
+            selected_universe_id=selected_universe_id,
+            task_id=task_id,
+            dataset_id=str(self.selected_dataset_id or ""),
+            failures_only=self._failures_only,
+            page_index=self._page_index,
+            page_sizes=self.PAGE_SIZES,
+        )
+        task.signals.finished.connect(self._on_load_finished)
+        task.signals.error.connect(self._on_load_error)
+        _ACTIVE_CATALOG_LOAD_TASKS[token] = task
+        self._thread_pool.start(task)
+
+    def _on_load_finished(self, token: int, payload: object) -> None:
+        if token != self._load_token:
+            _ACTIVE_CATALOG_LOAD_TASKS.pop(token, None)
+            return
+        self._loading = False
+        _ACTIVE_CATALOG_LOAD_TASKS.pop(token, None)
+        payload = dict(payload or {})
+        self.selected_universe_id = (
+            str(self.universe_filter_combo.currentData() or "").strip()
+            if hasattr(self, "universe_filter_combo")
+            else self.selected_universe_id
+        )
+        self.selected_task_id = str(self.task_filter_edit.text() or "").strip() if hasattr(self, "task_filter_edit") else self.selected_task_id
+        self.dataset_frame = payload.get("datasets") if isinstance(payload.get("datasets"), pd.DataFrame) else pd.DataFrame()
+        self.run_frame = payload.get("runs") if isinstance(payload.get("runs"), pd.DataFrame) else pd.DataFrame()
+        self.attempt_frame = payload.get("attempts") if isinstance(payload.get("attempts"), pd.DataFrame) else pd.DataFrame()
+        self.task_run_frame = payload.get("task_runs") if isinstance(payload.get("task_runs"), pd.DataFrame) else pd.DataFrame()
+        self.run_total_rows = int(payload.get("run_count") or 0)
+        self.attempt_total_rows = int(payload.get("attempt_count") or 0)
+        self.failed_attempt_count = int(payload.get("failed_attempt_count") or 0)
+        self.task_run_total_rows = int(payload.get("task_run_count") or 0)
+        dataset_count = len(self.dataset_frame)
+        ingested_count = int(self.dataset_frame["ingested"].fillna(False).astype(bool).sum()) if not self.dataset_frame.empty else 0
+        attempt_label = "Unresolved failed attempts shown" if self._failures_only else "Recorded attempts"
+        self.summary_label.setText(
+            f"Datasets: {dataset_count} | Ingested datasets: {ingested_count} | "
+            f"Recorded runs: {self.run_total_rows} | {attempt_label}: {self.attempt_total_rows} | "
+            f"Scheduler runs: {self.task_run_total_rows} | Failed attempts: {self.failed_attempt_count}"
+        )
+        self._dirty_tabs = {0, 1, 2, 3}
+        self._reset_detail_views()
+        self._refresh_current_tab(force=True)
+
+    def _on_load_error(self, token: int, details: str) -> None:
+        if token != self._load_token:
+            _ACTIVE_CATALOG_LOAD_TASKS.pop(token, None)
+            return
+        self._loading = False
+        _ACTIVE_CATALOG_LOAD_TASKS.pop(token, None)
+        self.summary_label.setText("Failed to load acquisition metadata.")
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Acquisition Catalog Error",
+            f"Unable to load acquisition metadata.\n\n{details.splitlines()[-1] if details else 'Unknown error.'}",
+        )
 
     def _clear_filters(self) -> None:
         self.selected_dataset_id = ""
+        self._selected_keys[0] = ""
         self.task_filter_edit.blockSignals(True)
         self.task_filter_edit.clear()
         self.task_filter_edit.blockSignals(False)
         self.universe_filter_combo.blockSignals(True)
         self.universe_filter_combo.setCurrentIndex(0)
         self.universe_filter_combo.blockSignals(False)
+        self.failures_only_chk.blockSignals(True)
+        self.failures_only_chk.setChecked(False)
+        self.failures_only_chk.blockSignals(False)
         self._apply_filters()
 
-    def _apply_filters(self) -> None:
-        selected_universe_id = str(self.universe_filter_combo.currentData() or "").strip() if hasattr(self, "universe_filter_combo") else ""
-        task_id = str(self.task_filter_edit.text() or "").strip() if hasattr(self, "task_filter_edit") else ""
-        dataset_id = str(self.selected_dataset_id or "").strip()
+    def _apply_filters(self, *_args, reset_pages: bool = True) -> None:
+        if self._loading:
+            return
+        if reset_pages:
+            self._page_index = {0: 0, 1: 0, 2: 0, 3: 0}
+        self._reload()
 
-        self.dataset_frame = self.dataset_frame_raw.copy()
-        self.run_frame = self.run_frame_raw.copy()
-        self.attempt_frame = self.attempt_frame_raw.copy()
-        self.task_run_frame = self.task_run_frame_raw.copy()
+    def _reset_detail_views(self) -> None:
+        self.dataset_detail.setPlainText("Select a dataset to inspect details.")
+        self.dataset_attempt_model.set_page(pd.DataFrame(columns=["Finished", "Run", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]))
+        self.run_notes.setPlainText("Select a run to inspect details.")
+        self.run_attempt_model.set_page(pd.DataFrame(columns=["Seq", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]))
+        self.task_run_notes.setPlainText("Select a scheduler run to inspect details.")
 
-        universe = None
-        if selected_universe_id:
-            universe = next(
-                (item for item in self.universes if str(item.get("universe_id") or "") == selected_universe_id),
-                None,
+    def _start_quality_backfill(self) -> None:
+        if self._quality_backfill_inflight or self.dataset_frame.empty:
+            return
+        missing = [
+            str(record.get("dataset_id") or "")
+            for record in self.dataset_frame.to_dict("records")
+            if str(record.get("dataset_id") or "").strip()
+            and bool(record.get("ingested"))
+            and str(record.get("resolution") or "").strip()
+            and not str(record.get("quality_analyzed_at") or "").strip()
+        ]
+        if not missing:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Quality Snapshots",
+                "There are no missing quality snapshots in the current filtered dataset view.",
             )
-        universe_dataset_ids = {
-            str(item)
-            for item in list((universe or {}).get("dataset_ids") or [])
-            if str(item).strip()
-        }
-        universe_symbols = {
-            str(item).upper()
-            for item in list((universe or {}).get("symbols") or [])
-            if str(item).strip()
-        }
-
-        if selected_universe_id:
-            if not self.run_frame.empty and "universe_id" in self.run_frame.columns:
-                self.run_frame = self.run_frame[self.run_frame["universe_id"].astype(str) == selected_universe_id].reset_index(drop=True)
-            if not self.attempt_frame.empty:
-                attempt_mask = pd.Series(False, index=self.attempt_frame.index)
-                if "universe_id" in self.attempt_frame.columns:
-                    attempt_mask = attempt_mask | (self.attempt_frame["universe_id"].astype(str) == selected_universe_id)
-                if universe_dataset_ids and "dataset_id" in self.attempt_frame.columns:
-                    attempt_mask = attempt_mask | self.attempt_frame["dataset_id"].astype(str).isin(universe_dataset_ids)
-                if universe_symbols and "symbol" in self.attempt_frame.columns:
-                    attempt_mask = attempt_mask | self.attempt_frame["symbol"].astype(str).str.upper().isin(universe_symbols)
-                self.attempt_frame = self.attempt_frame[attempt_mask].reset_index(drop=True)
-            if not self.dataset_frame.empty:
-                dataset_mask = pd.Series(False, index=self.dataset_frame.index)
-                if universe_dataset_ids and "dataset_id" in self.dataset_frame.columns:
-                    dataset_mask = dataset_mask | self.dataset_frame["dataset_id"].astype(str).isin(universe_dataset_ids)
-                if universe_symbols and "symbol" in self.dataset_frame.columns:
-                    dataset_mask = dataset_mask | self.dataset_frame["symbol"].astype(str).str.upper().isin(universe_symbols)
-                self.dataset_frame = self.dataset_frame[dataset_mask].reset_index(drop=True)
-
-        if task_id:
-            if not self.run_frame.empty and "task_id" in self.run_frame.columns:
-                self.run_frame = self.run_frame[self.run_frame["task_id"].astype(str) == task_id].reset_index(drop=True)
-            if not self.attempt_frame.empty and "task_id" in self.attempt_frame.columns:
-                self.attempt_frame = self.attempt_frame[self.attempt_frame["task_id"].astype(str) == task_id].reset_index(drop=True)
-            if not self.task_run_frame.empty and "task_id" in self.task_run_frame.columns:
-                self.task_run_frame = self.task_run_frame[self.task_run_frame["task_id"].astype(str) == task_id].reset_index(drop=True)
-            if not self.dataset_frame.empty and not self.attempt_frame.empty:
-                task_dataset_ids = {
-                    str(item)
-                    for item in list(self.attempt_frame.get("dataset_id", pd.Series(dtype=object)).dropna().astype(str))
-                    if item.strip()
-                }
-                if task_dataset_ids:
-                    self.dataset_frame = self.dataset_frame[
-                        self.dataset_frame["dataset_id"].astype(str).isin(task_dataset_ids)
-                    ].reset_index(drop=True)
-
-        if dataset_id and not self.dataset_frame.empty:
-            self.dataset_frame = self.dataset_frame[self.dataset_frame["dataset_id"].astype(str) == dataset_id].reset_index(drop=True)
-        if dataset_id and not self.attempt_frame.empty:
-            self.attempt_frame = self.attempt_frame[self.attempt_frame["dataset_id"].astype(str) == dataset_id].reset_index(drop=True)
-
-        dataset_count = len(self.dataset_frame)
-        ingested_count = int(self.dataset_frame["ingested"].fillna(False).astype(bool).sum()) if not self.dataset_frame.empty else 0
-        failed_attempts = (
-            int(self.attempt_frame["status"].isin(["download_error", "ingest_error", "failed"]).sum())
-            if not self.attempt_frame.empty
-            else 0
-        )
+            return
+        self._quality_backfill_inflight = True
+        self._quality_backfill_token += 1
+        token = self._quality_backfill_token
+        self.backfill_quality_btn.setEnabled(False)
         self.summary_label.setText(
-            f"Datasets: {dataset_count} | Ingested datasets: {ingested_count} | "
-            f"Recorded runs: {len(self.run_frame)} | Recorded attempts: {len(self.attempt_frame)} | "
-            f"Scheduler runs: {len(self.task_run_frame)} | Failed attempts: {failed_attempts}"
+            f"Analyzing {len(missing)} dataset(s) with missing quality snapshots in the background…"
         )
-        self._refresh_dataset_table()
-        self._refresh_run_table()
-        self._refresh_attempt_table()
-        self._refresh_task_run_table()
+        task = _CatalogQualityBackfillTask(token, Path(self.catalog.db_path), missing)
+        task.signals.finished.connect(self._on_quality_backfill_finished)
+        task.signals.error.connect(self._on_quality_backfill_error)
+        _ACTIVE_CATALOG_LOAD_TASKS[1000000 + token] = task
+        self._thread_pool.start(task)
 
-    def _refresh_dataset_table(self) -> None:
-        table = self.dataset_table
-        table.setRowCount(0)
-        for _, row in self.dataset_frame.iterrows():
-            idx = table.rowCount()
-            table.insertRow(idx)
-            coverage = "—"
-            if row.get("coverage_start") and row.get("coverage_end"):
-                coverage = f"{str(row['coverage_start'])[:10]} → {str(row['coverage_end'])[:10]}"
-            freshness = compute_freshness_state(row.get("coverage_end"), str(row.get("resolution") or ""))
-            values = [
-                str(row.get("dataset_id") or ""),
-                str(row.get("source") or "—"),
-                str(row.get("symbol") or "—"),
-                coverage,
-                str(int(row.get("bar_count") or 0)) if pd.notna(row.get("bar_count")) else "—",
-                freshness,
-                self._fmt_ts(row.get("last_download_attempt_at")),
-                self._fmt_ts(row.get("last_ingest_at")),
-                str(row.get("last_status") or "—"),
-                "Yes" if bool(row.get("ingested")) else "No",
-                str(row.get("last_error") or "—"),
-            ]
-            for col, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                if col == 0:
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("dataset_id") or ""))
-                if col == 10:
-                    item.setToolTip(str(row.get("last_error") or ""))
-                table.setItem(idx, col, item)
-        if table.rowCount() > 0:
-            table.selectRow(0)
-
-    def _refresh_run_table(self) -> None:
-        table = self.run_table
-        table.setRowCount(0)
-        for _, row in self.run_frame.iterrows():
-            idx = table.rowCount()
-            table.insertRow(idx)
-            values = [
-                str(row.get("acquisition_run_id") or ""),
-                str(row.get("trigger_type") or ""),
-                str(row.get("source") or "—"),
-                str(row.get("universe_name") or row.get("universe_id") or "—"),
-                str(row.get("task_id") or "—"),
-                self._fmt_ts(row.get("started_at")),
-                self._fmt_ts(row.get("finished_at")),
-                str(row.get("status") or ""),
-                str(int(row.get("symbol_count") or 0)),
-                str(int(row.get("success_count") or 0)),
-                str(int(row.get("failed_count") or 0)),
-                str(int(row.get("ingested_count") or 0)),
-            ]
-            for col, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                if col == 0:
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("acquisition_run_id") or ""))
-                table.setItem(idx, col, item)
-        if table.rowCount() > 0:
-            table.selectRow(0)
-
-    def _refresh_attempt_table(self) -> None:
-        self._populate_attempt_table(self.attempt_table, self.attempt_frame, include_source=True)
-
-    def _refresh_task_run_table(self) -> None:
-        table = self.task_run_table
-        table.setRowCount(0)
-        for _, row in self.task_run_frame.iterrows():
-            idx = table.rowCount()
-            table.insertRow(idx)
-            values = [
-                str(row.get("run_id") or ""),
-                str(row.get("task_id") or "—"),
-                self._fmt_ts(row.get("started_at")),
-                self._fmt_ts(row.get("finished_at")),
-                str(row.get("status") or "—"),
-                str(int(row.get("ticker_count") or 0)) if pd.notna(row.get("ticker_count")) else "—",
-                str(Path(str(row.get("log_path") or "")).name or "—"),
-                str(row.get("error_message") or "—"),
-            ]
-            for col, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                if col == 0:
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("run_id") or ""))
-                if col == 7:
-                    item.setToolTip(str(row.get("error_message") or ""))
-                table.setItem(idx, col, item)
-        if table.rowCount() > 0:
-            table.selectRow(0)
-
-    def _populate_attempt_table(
-        self,
-        table: QtWidgets.QTableWidget,
-        frame: pd.DataFrame,
-        *,
-        include_source: bool,
-    ) -> None:
-        table.setRowCount(0)
-        for _, row in frame.iterrows():
-            idx = table.rowCount()
-            table.insertRow(idx)
-            coverage = "—"
-            if row.get("coverage_start") and row.get("coverage_end"):
-                coverage = f"{str(row['coverage_start'])[:10]} → {str(row['coverage_end'])[:10]}"
-            values = [
-                self._fmt_ts(row.get("finished_at")),
-                str(row.get("acquisition_run_id") or ""),
-                str(row.get("symbol") or "—"),
-                str(row.get("dataset_id") or "—"),
-            ]
-            if include_source:
-                values.append(str(row.get("source") or "—"))
-            values.extend(
-                [
-                    str(row.get("status") or ""),
-                    str(int(row.get("bar_count") or 0)) if pd.notna(row.get("bar_count")) else "—",
-                    coverage,
-                    "Yes" if bool(row.get("ingested")) else "No",
-                    str(row.get("error_message") or "—"),
-                ]
+    def _on_quality_backfill_finished(self, token: int, updated: int) -> None:
+        _ACTIVE_CATALOG_LOAD_TASKS.pop(1000000 + token, None)
+        if token != self._quality_backfill_token:
+            return
+        self._quality_backfill_inflight = False
+        self.backfill_quality_btn.setEnabled(True)
+        if int(updated or 0) > 0:
+            self._reload()
+            QtWidgets.QMessageBox.information(
+                self,
+                "Quality Snapshots",
+                f"Stored {int(updated)} missing quality snapshot(s).",
             )
-            for col, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                if col == len(values) - 1:
-                    item.setToolTip(str(row.get("error_message") or ""))
-                table.setItem(idx, col, item)
+        else:
+            self.summary_label.setText("No missing quality snapshots were updated.")
+
+    def _on_quality_backfill_error(self, token: int, details: str) -> None:
+        _ACTIVE_CATALOG_LOAD_TASKS.pop(1000000 + token, None)
+        if token != self._quality_backfill_token:
+            return
+        self._quality_backfill_inflight = False
+        self.backfill_quality_btn.setEnabled(True)
+        self.summary_label.setText("Quality snapshot analysis failed.")
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Quality Snapshots",
+            f"Unable to analyze missing quality snapshots.\n\n{details.splitlines()[-1] if details else 'Unknown error.'}",
+        )
+
+    def _on_tab_changed(self, _idx: int) -> None:
+        self._refresh_current_tab()
+
+    def _change_page(self, tab_idx: int, delta: int) -> None:
+        frame = self._frame_for_tab(tab_idx)
+        total_rows = self._total_rows_for_tab(tab_idx)
+        total_pages = max(1, int(np.ceil(total_rows / max(self.PAGE_SIZES.get(tab_idx, 100), 1)))) if total_rows else 1
+        current_page = int(self._page_index.get(tab_idx, 0))
+        next_page = max(0, min(total_pages - 1, current_page + delta))
+        if next_page == current_page:
+            return
+        self._page_index[tab_idx] = next_page
+        self._apply_filters(reset_pages=False)
+
+    def _frame_for_tab(self, tab_idx: int) -> pd.DataFrame:
+        if tab_idx == 0:
+            return self.dataset_frame
+        if tab_idx == 1:
+            return self.run_frame
+        if tab_idx == 2:
+            return self.attempt_frame
+        if tab_idx == 3:
+            return self.task_run_frame
+        return pd.DataFrame()
+
+    def _total_rows_for_tab(self, tab_idx: int) -> int:
+        if tab_idx == 0:
+            return len(self.dataset_frame.index)
+        if tab_idx == 1:
+            return int(self.run_total_rows)
+        if tab_idx == 2:
+            return int(self.attempt_total_rows)
+        if tab_idx == 3:
+            return int(self.task_run_total_rows)
+        return 0
+
+    def _update_page_controls(self, tab_idx: int, total_rows: int) -> None:
+        page_size = max(self.PAGE_SIZES.get(tab_idx, 100), 1)
+        total_pages = max(1, int(np.ceil(total_rows / page_size))) if total_rows else 1
+        current_page = min(int(self._page_index.get(tab_idx, 0)), total_pages - 1)
+        self._page_index[tab_idx] = current_page
+        if tab_idx in self._page_labels:
+            start = (current_page * page_size) + 1 if total_rows else 0
+            end = min((current_page + 1) * page_size, total_rows) if total_rows else 0
+            self._page_labels[tab_idx].setText(f"Page {current_page + 1} / {total_pages}  ({start}-{end} of {total_rows})")
+        if tab_idx in self._page_prev_buttons:
+            self._page_prev_buttons[tab_idx].setEnabled(current_page > 0)
+        if tab_idx in self._page_next_buttons:
+            self._page_next_buttons[tab_idx].setEnabled(total_rows > ((current_page + 1) * page_size))
+
+    def _page_frame(self, frame: pd.DataFrame, tab_idx: int, *, key_column: str | None = None) -> pd.DataFrame:
+        if tab_idx in {1, 2, 3}:
+            self._update_page_controls(tab_idx, self._total_rows_for_tab(tab_idx))
+            return frame.reset_index(drop=True)
+        if frame.empty:
+            self._update_page_controls(tab_idx, 0)
+            return frame
+        selected_key = str(self._selected_keys.get(tab_idx) or "").strip()
+        if key_column and selected_key and key_column in frame.columns:
+            matches = frame.index[frame[key_column].astype(str) == selected_key]
+            if len(matches):
+                self._page_index[tab_idx] = int(matches[0]) // max(self.PAGE_SIZES.get(tab_idx, 100), 1)
+        self._update_page_controls(tab_idx, len(frame))
+        start = self._page_index[tab_idx] * self.PAGE_SIZES.get(tab_idx, 100)
+        end = start + self.PAGE_SIZES.get(tab_idx, 100)
+        return frame.iloc[start:end].reset_index(drop=True)
+
+    def _refresh_current_tab(self, *, force: bool = False) -> None:
+        current_idx = self.tabs.currentIndex()
+        if current_idx < 0:
+            return
+        if not force and current_idx not in self._dirty_tabs:
+            return
+        if current_idx == 0:
+            self._render_dataset_tab()
+        elif current_idx == 1:
+            self._render_run_tab()
+        elif current_idx == 2:
+            self._render_attempt_tab()
+        elif current_idx == 3:
+            self._render_task_run_tab()
+        self._dirty_tabs.discard(current_idx)
+
+    def _apply_model_page(
+        self,
+        *,
+        model: CatalogFrameTableModel,
+        view: QtWidgets.QTableView,
+        display_rows: list[dict],
+        raw_rows: list[dict],
+        tooltips: dict[tuple[int, int], str] | None = None,
+        selected_key: str = "",
+        key_field: str = "",
+        empty_columns: Sequence[str] | None = None,
+    ) -> None:
+        frame = pd.DataFrame(display_rows) if display_rows else pd.DataFrame(columns=list(empty_columns or []))
+        model.set_page(frame, raw_rows=raw_rows, tooltips=tooltips)
+        if not frame.empty:
+            header = view.horizontalHeader()
+            if header is not None:
+                header.resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+                header.setStretchLastSection(True)
+        selected_row = -1
+        if selected_key and key_field:
+            for idx, record in enumerate(raw_rows):
+                if str(record.get(key_field) or "") == selected_key:
+                    selected_row = idx
+                    break
+        if selected_row >= 0:
+            view.selectRow(selected_row)
+        else:
+            view.clearSelection()
+            view.setCurrentIndex(QtCore.QModelIndex())
+
+    def _render_dataset_tab(self) -> None:
+        page = self._page_frame(self.dataset_frame, 0, key_column="dataset_id")
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        tooltips: dict[tuple[int, int], str] = {}
+        for idx, record in enumerate(page.to_dict("records")):
+            quality = _quality_snapshot_from_mapping(record)
+            coverage = "—"
+            if record.get("coverage_start") and record.get("coverage_end"):
+                coverage = f"{str(record['coverage_start'])[:10]} → {str(record['coverage_end'])[:10]}"
+            display_rows.append(
+                {
+                    "Dataset": str(record.get("dataset_id") or "—"),
+                    "Source": str(record.get("source") or "—"),
+                    "Symbol": str(record.get("symbol") or "—"),
+                    "Coverage": coverage,
+                    "Bars": str(int(record.get("bar_count") or 0)) if pd.notna(record.get("bar_count")) else "—",
+                    "Freshness": compute_freshness_state(record.get("coverage_end"), str(record.get("resolution") or "")),
+                    "Quality": _format_dataset_quality_label(quality),
+                    "Last Download": self._fmt_ts(record.get("last_download_attempt_at")),
+                    "Last Ingest": self._fmt_ts(record.get("last_ingest_at")),
+                    "Status": str(record.get("last_status") or "—"),
+                    "Ingested": "Yes" if bool(record.get("ingested")) else "No",
+                    "Last Error": str(record.get("last_error") or "—"),
+                }
+            )
+            raw_rows.append(record)
+            tooltips[(idx, 11)] = str(record.get("last_error") or "")
+        self._apply_model_page(
+            model=self.dataset_model,
+            view=self.dataset_table,
+            display_rows=display_rows,
+            raw_rows=raw_rows,
+            tooltips=tooltips,
+            selected_key=str(self._selected_keys.get(0) or ""),
+            key_field="dataset_id",
+            empty_columns=["Dataset", "Source", "Symbol", "Coverage", "Bars", "Freshness", "Quality", "Last Download", "Last Ingest", "Status", "Ingested", "Last Error"],
+        )
+        if not raw_rows:
+            self._on_dataset_selected()
+
+    def _render_run_tab(self) -> None:
+        page = self._page_frame(self.run_frame, 1, key_column="acquisition_run_id")
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        for record in page.to_dict("records"):
+            display_rows.append(
+                {
+                    "Run ID": str(record.get("acquisition_run_id") or "—"),
+                    "Type": str(record.get("trigger_type") or "—"),
+                    "Source": str(record.get("source") or "—"),
+                    "Universe": str(record.get("universe_name") or record.get("universe_id") or "—"),
+                    "Task": str(record.get("task_id") or "—"),
+                    "Started": self._fmt_ts(record.get("started_at")),
+                    "Finished": self._fmt_ts(record.get("finished_at")),
+                    "Status": str(record.get("status") or "—"),
+                    "Symbols": str(int(record.get("symbol_count") or 0)) if pd.notna(record.get("symbol_count")) else "—",
+                    "Success": str(int(record.get("success_count") or 0)),
+                    "Failed": str(int(record.get("failed_count") or 0)),
+                    "Ingested": str(int(record.get("ingested_count") or 0)),
+                }
+            )
+            raw_rows.append(record)
+        self._apply_model_page(
+            model=self.run_model,
+            view=self.run_table,
+            display_rows=display_rows,
+            raw_rows=raw_rows,
+            selected_key=str(self._selected_keys.get(1) or ""),
+            key_field="acquisition_run_id",
+            empty_columns=["Run ID", "Type", "Source", "Universe", "Task", "Started", "Finished", "Status", "Symbols", "Success", "Failed", "Ingested"],
+        )
+        if not raw_rows:
+            self._on_run_selected()
+
+    def _render_attempt_tab(self) -> None:
+        page = self._page_frame(self.attempt_frame, 2)
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        tooltips: dict[tuple[int, int], str] = {}
+        for idx, record in enumerate(page.to_dict("records")):
+            coverage = "—"
+            if record.get("coverage_start") and record.get("coverage_end"):
+                coverage = f"{str(record['coverage_start'])[:10]} → {str(record['coverage_end'])[:10]}"
+            display_rows.append(
+                {
+                    "Finished": self._fmt_ts(record.get("finished_at")),
+                    "Run": str(record.get("acquisition_run_id") or "—"),
+                    "Symbol": str(record.get("symbol") or "—"),
+                    "Dataset": str(record.get("dataset_id") or "—"),
+                    "Source": str(record.get("source") or "—"),
+                    "Status": str(record.get("status") or "—"),
+                    "Bars": str(int(record.get("bar_count") or 0)) if pd.notna(record.get("bar_count")) else "—",
+                    "Coverage": coverage,
+                    "Ingested": "Yes" if bool(record.get("ingested")) else "No",
+                    "Error": str(record.get("error_message") or "—"),
+                }
+            )
+            raw_rows.append(record)
+            tooltips[(idx, 9)] = str(record.get("error_message") or "")
+        self._apply_model_page(
+            model=self.attempt_model,
+            view=self.attempt_table,
+            display_rows=display_rows,
+            raw_rows=raw_rows,
+            tooltips=tooltips,
+            empty_columns=["Finished", "Run", "Symbol", "Dataset", "Source", "Status", "Bars", "Coverage", "Ingested", "Error"],
+        )
+
+    def _render_task_run_tab(self) -> None:
+        page = self._page_frame(self.task_run_frame, 3, key_column="run_id")
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        tooltips: dict[tuple[int, int], str] = {}
+        for idx, record in enumerate(page.to_dict("records")):
+            display_rows.append(
+                {
+                    "Run ID": str(record.get("run_id") or "—"),
+                    "Task": str(record.get("task_id") or "—"),
+                    "Started": self._fmt_ts(record.get("started_at")),
+                    "Finished": self._fmt_ts(record.get("finished_at")),
+                    "Status": str(record.get("status") or "—"),
+                    "Tickers": str(int(record.get("ticker_count") or 0)) if pd.notna(record.get("ticker_count")) else "—",
+                    "Log": str(Path(str(record.get("log_path") or "")).name or "—"),
+                    "Error": str(record.get("error_message") or "—"),
+                }
+            )
+            raw_rows.append(record)
+            tooltips[(idx, 7)] = str(record.get("error_message") or "")
+        self._apply_model_page(
+            model=self.task_run_model,
+            view=self.task_run_table,
+            display_rows=display_rows,
+            raw_rows=raw_rows,
+            tooltips=tooltips,
+            selected_key=str(self._selected_keys.get(3) or ""),
+            key_field="run_id",
+            empty_columns=["Run ID", "Task", "Started", "Finished", "Status", "Tickers", "Log", "Error"],
+        )
+        if not raw_rows:
+            self._on_task_run_selected()
+
+    def _selected_record(self, view: QtWidgets.QTableView, model: CatalogFrameTableModel) -> dict:
+        selection_model = view.selectionModel()
+        if selection_model is None:
+            return {}
+        rows = selection_model.selectedRows()
+        if not rows:
+            return {}
+        return model.row_record(rows[0].row())
+
+    def _current_catalog_membership_filters(self) -> tuple[list[str], list[str]]:
+        universe_id = (
+            str(self.universe_filter_combo.currentData() or "").strip()
+            if hasattr(self, "universe_filter_combo")
+            else str(self.selected_universe_id or "").strip()
+        )
+        if not universe_id:
+            return [], []
+        universe = next(
+            (
+                item
+                for item in self.universes
+                if str(item.get("universe_id") or "").strip() == universe_id
+            ),
+            None,
+        )
+        if universe is None:
+            return [], []
+        dataset_ids = [
+            str(item).strip()
+            for item in list(universe.get("dataset_ids") or [])
+            if str(item).strip()
+        ]
+        symbols = [
+            str(item).strip().upper()
+            for item in list(universe.get("symbols") or [])
+            if str(item).strip()
+        ]
+        return dataset_ids, symbols
+
+    def _load_filtered_failed_attempt_records(self) -> list[dict]:
+        if self._failures_only and not self.dataset_frame.empty:
+            dataset_ids = [
+                str(item).strip()
+                for item in self.dataset_frame.get("dataset_id", pd.Series(dtype="object")).tolist()
+                if str(item).strip()
+            ]
+            symbols = [
+                str(item).strip().upper()
+                for item in self.dataset_frame.get("symbol", pd.Series(dtype="object")).tolist()
+                if str(item).strip()
+            ]
+        else:
+            dataset_ids, symbols = self._current_catalog_membership_filters()
+        attempts = self.catalog.load_acquisition_attempts(
+            dataset_id=str(self.selected_dataset_id or "").strip() or None,
+            dataset_ids=dataset_ids or None,
+            symbols=symbols or None,
+            task_id=str(self.task_filter_edit.text() or "").strip() or None,
+            universe_id=str(self.universe_filter_combo.currentData() or "").strip() or None,
+            statuses=list(_ACQUISITION_ERROR_ATTEMPT_STATUSES),
+        )
+        return attempts.to_dict("records") if isinstance(attempts, pd.DataFrame) else []
+
+    def _open_selected_attempt_log(self) -> None:
+        record = self._selected_record(self.attempt_table, self.attempt_model)
+        log_path_text = str(record.get("log_path") or "").strip()
+        symbol = str(record.get("symbol") or "").strip() or "Attempt"
+        if not log_path_text:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Attempt Log",
+                "No log path is recorded for the selected acquisition attempt.",
+            )
+            return
+        self._open_log_dialog(
+            f"Acquisition Attempt Log {symbol}",
+            Path(log_path_text),
+            empty_message="No log file is available for the selected acquisition attempt.",
+        )
+
+    def _retry_failed_attempts(self, *, selected_only: bool) -> None:
+        if selected_only:
+            selected = self._selected_record(self.attempt_table, self.attempt_model)
+            records = [selected] if selected else []
+        else:
+            records = self._load_filtered_failed_attempt_records()
+        failed_records = [
+            record
+            for record in records
+            if str(record.get("status") or "").strip().lower() in _ACQUISITION_ERROR_ATTEMPT_STATUSES
+        ]
+        if not failed_records:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Retry Failed Attempts",
+                "There are no failed acquisition attempts in the current selection/filter.",
+            )
+            return
+        sources = sorted(
+            {
+                str(record.get("source") or "").strip().lower()
+                for record in failed_records
+                if str(record.get("source") or "").strip()
+            }
+        )
+        if len(sources) != 1:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Retry Failed Attempts",
+                "Retrying failed attempts in bulk requires a single provider source. Narrow the filters or selected rows to one source first.",
+            )
+            return
+        symbols: list[str] = []
+        for record in failed_records:
+            symbol = str(record.get("symbol") or "").strip().upper()
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+        parent = self.logical_parent()
+        if parent is None or not hasattr(parent, "_retry_download_symbols"):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Retry Failed Attempts",
+                "The main dashboard is not available to queue a retry right now.",
+            )
+            return
+        retried, message = parent._retry_download_symbols(symbols, source=sources[0])
+        if retried <= 0:
+            QtWidgets.QMessageBox.information(self, "Retry Failed Attempts", message)
+            return
+        self.summary_label.setText(message)
+        QtWidgets.QMessageBox.information(self, "Retry Failed Attempts", message)
+
+    def _populate_dataset_attempts(self, dataset_id: str) -> None:
+        attempt_frame = self.catalog.load_acquisition_attempts(dataset_id=dataset_id, limit=100)
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        tooltips: dict[tuple[int, int], str] = {}
+        for idx, record in enumerate(attempt_frame.to_dict("records")):
+            coverage = "—"
+            if record.get("coverage_start") and record.get("coverage_end"):
+                coverage = f"{str(record['coverage_start'])[:10]} → {str(record['coverage_end'])[:10]}"
+            display_rows.append(
+                {
+                    "Finished": self._fmt_ts(record.get("finished_at")),
+                    "Run": str(record.get("acquisition_run_id") or "—"),
+                    "Symbol": str(record.get("symbol") or "—"),
+                    "Dataset": str(record.get("dataset_id") or "—"),
+                    "Status": str(record.get("status") or "—"),
+                    "Bars": str(int(record.get("bar_count") or 0)) if pd.notna(record.get("bar_count")) else "—",
+                    "Coverage": coverage,
+                    "Ingested": "Yes" if bool(record.get("ingested")) else "No",
+                    "Error": str(record.get("error_message") or "—"),
+                }
+            )
+            raw_rows.append(record)
+            tooltips[(idx, 8)] = str(record.get("error_message") or "")
+        self.dataset_attempt_model.set_page(
+            pd.DataFrame(display_rows) if display_rows else pd.DataFrame(columns=["Finished", "Run", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]),
+            raw_rows=raw_rows,
+            tooltips=tooltips,
+        )
+
+    def _populate_run_attempts(self, run_id: str) -> None:
+        attempt_frame = self.catalog.load_acquisition_attempts(acquisition_run_id=run_id, limit=250)
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        tooltips: dict[tuple[int, int], str] = {}
+        for idx, record in enumerate(attempt_frame.to_dict("records")):
+            coverage = "—"
+            if record.get("coverage_start") and record.get("coverage_end"):
+                coverage = f"{str(record['coverage_start'])[:10]} → {str(record['coverage_end'])[:10]}"
+            display_rows.append(
+                {
+                    "Seq": str(int(record.get("seq") or 0)),
+                    "Symbol": str(record.get("symbol") or "—"),
+                    "Dataset": str(record.get("dataset_id") or "—"),
+                    "Status": str(record.get("status") or "—"),
+                    "Bars": str(int(record.get("bar_count") or 0)) if pd.notna(record.get("bar_count")) else "—",
+                    "Coverage": coverage,
+                    "Ingested": "Yes" if bool(record.get("ingested")) else "No",
+                    "Error": str(record.get("error_message") or "—"),
+                }
+            )
+            raw_rows.append(record)
+            tooltips[(idx, 7)] = str(record.get("error_message") or "")
+        self.run_attempt_model.set_page(
+            pd.DataFrame(display_rows) if display_rows else pd.DataFrame(columns=["Seq", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]),
+            raw_rows=raw_rows,
+            tooltips=tooltips,
+        )
 
     def _on_dataset_selected(self) -> None:
-        current = self.dataset_table.currentRow()
-        if current < 0 or self.dataset_frame.empty:
-            self.dataset_detail.setPlainText("")
-            self.dataset_attempt_table.setRowCount(0)
+        record = self._selected_record(self.dataset_table, self.dataset_model)
+        if not record:
+            self.dataset_detail.setPlainText("Select a dataset to inspect details.")
+            self.dataset_attempt_model.set_page(pd.DataFrame(columns=["Finished", "Run", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]))
             return
-        dataset_item = self.dataset_table.item(current, 0)
-        dataset_id = str(dataset_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if dataset_item else ""
-        match = self.dataset_frame[self.dataset_frame["dataset_id"] == dataset_id]
-        if match.empty:
-            return
-        row = match.iloc[0]
-        quality = _safe_inspect_dataset_quality(dataset_id, str(row.get("resolution") or ""))
+        dataset_id = str(record.get("dataset_id") or "")
+        self._selected_keys[0] = dataset_id
+        quality = _quality_snapshot_from_mapping(record)
+        if str(quality.get("quality_state") or "unknown") == "unknown" and dataset_id and record.get("resolution"):
+            quality_key = (dataset_id, str(record.get("resolution") or ""))
+            quality = self._dataset_quality_cache.get(quality_key) or compute_and_store_quality_snapshot(
+                dataset_id,
+                resolution=quality_key[1],
+                catalog=ResultCatalog(self.catalog.db_path),
+                store=DuckDBStore(),
+            ) or _safe_inspect_dataset_quality(dataset_id, quality_key[1])
+            self._dataset_quality_cache[quality_key] = quality
         related_universes = [
             str(item.get("name") or "")
             for item in self.universes
             if dataset_id in list(item.get("dataset_ids") or [])
-            or (row.get("symbol") and str(row.get("symbol")) in list(item.get("symbols") or []))
+            or (record.get("symbol") and str(record.get("symbol")) in list(item.get("symbols") or []))
         ]
         next_action = None
-        if row.get("symbol") and row.get("source") and row.get("resolution") and row.get("history_window"):
+        if record.get("symbol") and record.get("source") and record.get("resolution") and record.get("history_window"):
+            policy_key = (
+                str(record.get("symbol") or ""),
+                str(record.get("source") or ""),
+                str(record.get("resolution") or ""),
+                str(record.get("history_window") or ""),
+            )
             try:
-                next_action = decide_acquisition_policy(
-                    str(row.get("symbol")),
-                    source=str(row.get("source")),
-                    resolution=str(row.get("resolution")),
-                    history_window=str(row.get("history_window")),
-                    catalog=self.catalog,
-                )
+                next_action = self._dataset_policy_cache.get(policy_key)
+                if next_action is None:
+                    next_action = decide_acquisition_policy(
+                        policy_key[0],
+                        source=policy_key[1],
+                        resolution=policy_key[2],
+                        history_window=policy_key[3],
+                        catalog=ResultCatalog(self.catalog.db_path),
+                    )
+                    self._dataset_policy_cache[policy_key] = next_action
             except Exception:
                 next_action = None
         details = [
             f"Dataset: {dataset_id}",
-            f"Source: {row.get('source') or '—'}",
-            f"Symbol: {row.get('symbol') or '—'}",
-            f"Resolution: {row.get('resolution') or '—'}",
-            f"History Window: {row.get('history_window') or '—'}",
-            f"Coverage: {(row.get('coverage_start') or '—')} -> {(row.get('coverage_end') or '—')}",
-            f"Freshness: {compute_freshness_state(row.get('coverage_end'), str(row.get('resolution') or ''))}",
+            f"Source: {record.get('source') or '—'}",
+            f"Symbol: {record.get('symbol') or '—'}",
+            f"Resolution: {record.get('resolution') or '—'}",
+            f"History Window: {record.get('history_window') or '—'}",
+            f"Coverage: {(record.get('coverage_start') or '—')} -> {(record.get('coverage_end') or '—')}",
+            f"Freshness: {compute_freshness_state(record.get('coverage_end'), str(record.get('resolution') or ''))}",
             f"Quality: {_format_dataset_quality_label(quality)}",
             f"Suggested Gap Repair Window: {(quality.get('repair_request_start') or '—')} -> {(quality.get('repair_request_end') or '—')}",
+            f"Quality Analyzed At: {self._fmt_ts(quality.get('quality_analyzed_at'))}",
             f"Recommended Action: {next_action.action if next_action else '—'}",
             f"Acquisition Plan: {next_action.plan_type if next_action else '—'}",
             f"Planned Request Window: {(next_action.request_start or 'provider default') if next_action else '—'} -> {(next_action.request_end or 'provider default') if next_action else '—'}",
@@ -3968,78 +6201,67 @@ class AcquisitionCatalogDialog(DashboardDialog):
             f"Secondary Gap-Fill Source: {f'{next_action.secondary_source} / {next_action.secondary_dataset_id}' if next_action and next_action.secondary_dataset_id else '—'}",
             f"Secondary Parity: {f'{next_action.parity_state} | overlap {next_action.parity_overlap_bars} | mean abs {next_action.parity_close_mean_abs_bps:.2f} bps' if next_action and next_action.secondary_dataset_id and next_action.parity_close_mean_abs_bps is not None else '—'}",
             f"Policy Reason: {next_action.reason if next_action else '—'}",
-            f"Bars: {int(row.get('bar_count') or 0) if pd.notna(row.get('bar_count')) else '—'}",
-            f"Last Download Attempt: {self._fmt_ts(row.get('last_download_attempt_at'))}",
-            f"Last Download Success: {self._fmt_ts(row.get('last_download_success_at'))}",
-            f"Last Ingest: {self._fmt_ts(row.get('last_ingest_at'))}",
-            f"Status: {row.get('last_status') or '—'}",
-            f"Ingested: {'Yes' if bool(row.get('ingested')) else 'No'}",
-            f"CSV Path: {row.get('csv_path') or '—'}",
-            f"Parquet Path: {row.get('parquet_path') or '—'}",
-            f"Last Error: {row.get('last_error') or '—'}",
+            f"Bars: {int(record.get('bar_count') or 0) if pd.notna(record.get('bar_count')) else '—'}",
+            f"Last Download Attempt: {self._fmt_ts(record.get('last_download_attempt_at'))}",
+            f"Last Download Success: {self._fmt_ts(record.get('last_download_success_at'))}",
+            f"Last Ingest: {self._fmt_ts(record.get('last_ingest_at'))}",
+            f"Status: {record.get('last_status') or '—'}",
+            f"Ingested: {'Yes' if bool(record.get('ingested')) else 'No'}",
+            f"CSV Path: {record.get('csv_path') or '—'}",
+            f"Parquet Path: {record.get('parquet_path') or '—'}",
+            f"Last Error: {record.get('last_error') or '—'}",
             f"Linked Universes: {', '.join(related_universes) if related_universes else '—'}",
         ]
         self.dataset_detail.setPlainText("\n".join(details))
-        attempts = self.catalog.load_acquisition_attempts(dataset_id=dataset_id, limit=100)
-        self._populate_attempt_table(self.dataset_attempt_table, attempts, include_source=False)
+        self._populate_dataset_attempts(dataset_id)
 
     def _on_run_selected(self) -> None:
-        current = self.run_table.currentRow()
-        if current < 0 or self.run_frame.empty:
-            self.run_notes.setPlainText("")
-            self.run_attempt_table.setRowCount(0)
+        record = self._selected_record(self.run_table, self.run_model)
+        if not record:
+            self.run_notes.setPlainText("Select a run to inspect details.")
+            self.run_attempt_model.set_page(pd.DataFrame(columns=["Seq", "Symbol", "Dataset", "Status", "Bars", "Coverage", "Ingested", "Error"]))
             return
-        run_item = self.run_table.item(current, 0)
-        run_id = str(run_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if run_item else ""
-        match = self.run_frame[self.run_frame["acquisition_run_id"] == run_id]
-        if match.empty:
-            return
-        row = match.iloc[0]
+        run_id = str(record.get("acquisition_run_id") or "")
+        self._selected_keys[1] = run_id
         details = [
             f"Run ID: {run_id}",
-            f"Trigger: {row.get('trigger_type') or '—'}",
-            f"Source: {row.get('source') or '—'}",
-            f"Universe: {row.get('universe_name') or row.get('universe_id') or '—'}",
-            f"Task ID: {row.get('task_id') or '—'}",
-            f"Started: {self._fmt_ts(row.get('started_at'))}",
-            f"Finished: {self._fmt_ts(row.get('finished_at'))}",
-            f"Status: {row.get('status') or '—'}",
-            f"Symbols: {int(row.get('symbol_count') or 0)}",
-            f"Success: {int(row.get('success_count') or 0)} | Failed: {int(row.get('failed_count') or 0)} | Ingested: {int(row.get('ingested_count') or 0)}",
-            f"Log Path: {row.get('log_path') or '—'}",
-            f"Notes: {row.get('notes') or '—'}",
+            f"Trigger: {record.get('trigger_type') or '—'}",
+            f"Source: {record.get('source') or '—'}",
+            f"Universe: {record.get('universe_name') or record.get('universe_id') or '—'}",
+            f"Task ID: {record.get('task_id') or '—'}",
+            f"Started: {self._fmt_ts(record.get('started_at'))}",
+            f"Finished: {self._fmt_ts(record.get('finished_at'))}",
+            f"Status: {record.get('status') or '—'}",
+            f"Symbols: {int(record.get('symbol_count') or 0) if pd.notna(record.get('symbol_count')) else '—'}",
+            f"Success: {int(record.get('success_count') or 0)} | Failed: {int(record.get('failed_count') or 0)} | Ingested: {int(record.get('ingested_count') or 0)}",
+            f"Log Path: {record.get('log_path') or '—'}",
+            f"Notes: {record.get('notes') or '—'}",
         ]
         self.run_notes.setPlainText("\n".join(details))
-        attempts = self.catalog.load_acquisition_attempts(acquisition_run_id=run_id, limit=500)
-        self.run_attempt_table.setRowCount(0)
-        for _, attempt in attempts.iterrows():
-            idx = self.run_attempt_table.rowCount()
-            self.run_attempt_table.insertRow(idx)
-            coverage = "—"
-            if attempt.get("coverage_start") and attempt.get("coverage_end"):
-                coverage = f"{str(attempt['coverage_start'])[:10]} → {str(attempt['coverage_end'])[:10]}"
-            values = [
-                str(int(attempt.get("seq") or 0)),
-                str(attempt.get("symbol") or "—"),
-                str(attempt.get("dataset_id") or "—"),
-                str(attempt.get("status") or ""),
-                str(int(attempt.get("bar_count") or 0)) if pd.notna(attempt.get("bar_count")) else "—",
-                coverage,
-                "Yes" if bool(attempt.get("ingested")) else "No",
-                str(attempt.get("error_message") or "—"),
-            ]
-            for col, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                if col == 7:
-                    item.setToolTip(str(attempt.get("error_message") or ""))
-                self.run_attempt_table.setItem(idx, col, item)
+        self._populate_run_attempts(run_id)
+
+    def _on_task_run_selected(self) -> None:
+        record = self._selected_record(self.task_run_table, self.task_run_model)
+        if not record:
+            self.task_run_notes.setPlainText("Select a scheduler run to inspect details.")
+            return
+        run_id = str(record.get("run_id") or "")
+        self._selected_keys[3] = run_id
+        details = [
+            f"Run ID: {run_id}",
+            f"Task ID: {record.get('task_id') or '—'}",
+            f"Started: {self._fmt_ts(record.get('started_at'))}",
+            f"Finished: {self._fmt_ts(record.get('finished_at'))}",
+            f"Status: {record.get('status') or '—'}",
+            f"Ticker Count: {int(record.get('ticker_count') or 0) if pd.notna(record.get('ticker_count')) else '—'}",
+            f"Log Path: {record.get('log_path') or '—'}",
+            f"Error: {record.get('error_message') or '—'}",
+        ]
+        self.task_run_notes.setPlainText("\n".join(details))
 
     def _open_selected_dataset_detail(self) -> None:
-        current = self.dataset_table.currentRow()
-        if current < 0 or self.dataset_frame.empty:
-            return
-        dataset_item = self.dataset_table.item(current, 0)
-        dataset_id = str(dataset_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if dataset_item else ""
+        record = self._selected_record(self.dataset_table, self.dataset_model)
+        dataset_id = str(record.get("dataset_id") or "")
         if not dataset_id:
             return
         dlg = AcquisitionDatasetDetailDialog(
@@ -4051,18 +6273,9 @@ class AcquisitionCatalogDialog(DashboardDialog):
         )
         dlg.exec()
 
-    def _open_selected_run_log(self) -> None:
-        current = self.run_table.currentRow()
-        if current < 0 or self.run_frame.empty:
-            return
-        run_item = self.run_table.item(current, 0)
-        run_id = str(run_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if run_item else ""
-        match = self.run_frame[self.run_frame["acquisition_run_id"] == run_id]
-        if match.empty:
-            return
-        log_path = Path(str(match.iloc[0].get("log_path") or ""))
+    def _open_log_dialog(self, title: str, log_path: Path, *, empty_message: str) -> None:
         if not log_path.exists():
-            QtWidgets.QMessageBox.information(self, "Log", "No log file is available for the selected run.")
+            QtWidgets.QMessageBox.information(self, "Log", empty_message)
             return
         try:
             content = log_path.read_text(encoding="utf-8")
@@ -4070,7 +6283,7 @@ class AcquisitionCatalogDialog(DashboardDialog):
             QtWidgets.QMessageBox.warning(self, "Log", f"Unable to read log: {exc}")
             return
         dlg = DashboardDialog(self)
-        dlg.setWindowTitle(f"Acquisition Log {run_id}")
+        dlg.setWindowTitle(title)
         dlg.resize(960, 640)
         dlg.setObjectName("Panel")
         layout = QtWidgets.QVBoxLayout(dlg)
@@ -4085,63 +6298,27 @@ class AcquisitionCatalogDialog(DashboardDialog):
         layout.addWidget(text)
         dlg.exec()
 
-    def _on_task_run_selected(self) -> None:
-        current = self.task_run_table.currentRow()
-        if current < 0 or self.task_run_frame.empty:
-            self.task_run_notes.setPlainText("")
+    def _open_selected_run_log(self) -> None:
+        record = self._selected_record(self.run_table, self.run_model)
+        run_id = str(record.get("acquisition_run_id") or "")
+        if not run_id:
             return
-        run_item = self.task_run_table.item(current, 0)
-        run_id = str(run_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if run_item else ""
-        match = self.task_run_frame[self.task_run_frame["run_id"] == run_id]
-        if match.empty:
-            self.task_run_notes.setPlainText("")
-            return
-        row = match.iloc[0]
-        details = [
-            f"Run ID: {run_id}",
-            f"Task ID: {row.get('task_id') or '—'}",
-            f"Started: {self._fmt_ts(row.get('started_at'))}",
-            f"Finished: {self._fmt_ts(row.get('finished_at'))}",
-            f"Status: {row.get('status') or '—'}",
-            f"Ticker Count: {int(row.get('ticker_count') or 0) if pd.notna(row.get('ticker_count')) else '—'}",
-            f"Log Path: {row.get('log_path') or '—'}",
-            f"Error: {row.get('error_message') or '—'}",
-        ]
-        self.task_run_notes.setPlainText("\n".join(details))
+        self._open_log_dialog(
+            f"Acquisition Log {run_id}",
+            Path(str(record.get("log_path") or "")),
+            empty_message="No log file is available for the selected run.",
+        )
 
     def _open_selected_task_run_log(self) -> None:
-        current = self.task_run_table.currentRow()
-        if current < 0 or self.task_run_frame.empty:
+        record = self._selected_record(self.task_run_table, self.task_run_model)
+        run_id = str(record.get("run_id") or "")
+        if not run_id:
             return
-        run_item = self.task_run_table.item(current, 0)
-        run_id = str(run_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if run_item else ""
-        match = self.task_run_frame[self.task_run_frame["run_id"] == run_id]
-        if match.empty:
-            return
-        log_path = Path(str(match.iloc[0].get("log_path") or ""))
-        if not log_path.exists():
-            QtWidgets.QMessageBox.information(self, "Log", "No scheduler log file is available for the selected run.")
-            return
-        try:
-            content = log_path.read_text(encoding="utf-8")
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Log", f"Unable to read log: {exc}")
-            return
-        dlg = DashboardDialog(self)
-        dlg.setWindowTitle(f"Scheduler Log {run_id}")
-        dlg.resize(960, 640)
-        dlg.setObjectName("Panel")
-        layout = QtWidgets.QVBoxLayout(dlg)
-        path_label = QtWidgets.QLabel(str(log_path))
-        path_label.setObjectName("Sub")
-        layout.addWidget(path_label)
-        text = QtWidgets.QPlainTextEdit()
-        text.setObjectName("Panel")
-        text.setReadOnly(True)
-        text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
-        text.setPlainText(content)
-        layout.addWidget(text)
-        dlg.exec()
+        self._open_log_dialog(
+            f"Scheduler Log {run_id}",
+            Path(str(record.get("log_path") or "")),
+            empty_message="No scheduler log file is available for the selected run.",
+        )
 
     @staticmethod
     def _fmt_ts(value: object) -> str:
@@ -4152,13 +6329,6 @@ class AcquisitionCatalogDialog(DashboardDialog):
             return ts.tz_convert("America/New_York").strftime("%Y-%m-%d %I:%M %p ET")
         except Exception:
             return str(value)
-
-    @staticmethod
-    def _clip_text(text: str, max_chars: int) -> str:
-        text = str(text or "")
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 1] + "…"
 
 
 class AcquisitionDatasetDetailDialog(DashboardDialog):
@@ -4177,7 +6347,6 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
         self.dataset_ids = [str(item).strip() for item in dataset_ids if str(item).strip()]
         self.initial_dataset_id = str(initial_dataset_id or "").strip()
         self.dataset_frame = pd.DataFrame(self.catalog.load_acquisition_datasets())
-        self.attempt_frame = pd.DataFrame(self.catalog.load_acquisition_attempts(limit=500))
 
         self.setWindowTitle("Dataset Acquisition Detail")
         self.resize(1180, 860)
@@ -4209,6 +6378,9 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
                 self.dataset_combo.setCurrentIndex(idx)
         self.dataset_combo.currentIndexChanged.connect(self._refresh_view)
         selector_row.addWidget(self.dataset_combo, 1)
+        choose_btn = QtWidgets.QPushButton("Choose")
+        choose_btn.clicked.connect(self._choose_dataset)
+        selector_row.addWidget(choose_btn)
         refresh_btn = QtWidgets.QPushButton("Refresh")
         refresh_btn.clicked.connect(self._reload)
         close_btn = QtWidgets.QPushButton("Close")
@@ -4222,10 +6394,9 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
         self.summary_text.setMinimumHeight(220)
         layout.addWidget(self.summary_text)
 
-        self.attempt_table = QtWidgets.QTableWidget(0, 10)
-        self.attempt_table.setHorizontalHeaderLabels(
-            ["Finished", "Run", "Symbol", "Source", "Status", "Bars", "Coverage", "Ingested", "Task", "Error"]
-        )
+        self.attempt_model = CatalogFrameTableModel()
+        self.attempt_table = QtWidgets.QTableView()
+        self.attempt_table.setModel(self.attempt_model)
         self.attempt_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.attempt_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.attempt_table.setAlternatingRowColors(True)
@@ -4235,28 +6406,51 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
         self.attempt_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
         self.attempt_table.horizontalHeader().setStretchLastSection(True)
         self.attempt_table.setObjectName("Panel")
-        self.attempt_table.setColumnWidth(9, 420)
         layout.addWidget(self.attempt_table, 1)
 
         self._refresh_view()
 
     def _reload(self) -> None:
         self.dataset_frame = pd.DataFrame(self.catalog.load_acquisition_datasets())
-        self.attempt_frame = pd.DataFrame(self.catalog.load_acquisition_attempts(limit=500))
         self._refresh_view()
+
+    def _choose_dataset(self) -> None:
+        current_dataset_id = str(self.dataset_combo.currentData() or "").strip()
+        logical_parent = self.logical_parent() if hasattr(self, "logical_parent") else None
+        snapshot_frame = logical_parent.picker_snapshot_frame() if hasattr(logical_parent, "picker_snapshot_frame") else None
+        dlg = DatasetPickerDialog(
+            self.dataset_ids,
+            current_dataset_id,
+            self,
+            title="Choose Dataset Detail",
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=snapshot_frame,
+        )
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        dataset_id = dlg.selected_dataset()
+        if not dataset_id:
+            return
+        idx = self.dataset_combo.findData(dataset_id)
+        if idx >= 0:
+            self.dataset_combo.setCurrentIndex(idx)
 
     def _refresh_view(self) -> None:
         dataset_id = str(self.dataset_combo.currentData() or "").strip()
         if not dataset_id:
             self.summary_text.setPlainText("No dataset selected.")
-            self.attempt_table.setRowCount(0)
+            self.attempt_model.set_page(
+                pd.DataFrame(columns=["Finished", "Run", "Symbol", "Source", "Status", "Bars", "Coverage", "Ingested", "Task", "Error"])
+            )
             return
         match = self.dataset_frame[self.dataset_frame["dataset_id"].astype(str) == dataset_id] if not self.dataset_frame.empty else pd.DataFrame()
         if match.empty:
             self.summary_text.setPlainText(
                 f"Dataset '{dataset_id}' does not currently have acquisition metadata in the catalog."
             )
-            self.attempt_table.setRowCount(0)
+            self.attempt_model.set_page(
+                pd.DataFrame(columns=["Finished", "Run", "Symbol", "Source", "Status", "Bars", "Coverage", "Ingested", "Task", "Error"])
+            )
             return
         row = match.iloc[0]
         symbol = str(row.get("symbol") or "").strip()
@@ -4267,7 +6461,14 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
             or (symbol and symbol in [str(entry).upper() for entry in list(item.get("symbols") or []) if str(entry).strip()])
         ]
         freshness = compute_freshness_state(row.get("coverage_end"), str(row.get("resolution") or ""))
-        quality = _safe_inspect_dataset_quality(dataset_id, str(row.get("resolution") or ""))
+        quality = _quality_snapshot_from_mapping(row)
+        if str(quality.get("quality_state") or "unknown") == "unknown" and dataset_id and row.get("resolution"):
+            quality = compute_and_store_quality_snapshot(
+                dataset_id,
+                resolution=str(row.get("resolution") or ""),
+                catalog=ResultCatalog(self.catalog.db_path),
+                store=DuckDBStore(),
+            ) or _safe_inspect_dataset_quality(dataset_id, str(row.get("resolution") or ""))
         next_action = None
         if row.get("symbol") and row.get("source") and row.get("resolution") and row.get("history_window"):
             try:
@@ -4276,7 +6477,7 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
                     source=str(row.get("source")),
                     resolution=str(row.get("resolution")),
                     history_window=str(row.get("history_window")),
-                    catalog=self.catalog,
+                    catalog=ResultCatalog(self.catalog.db_path),
                 )
             except Exception:
                 next_action = None
@@ -4298,6 +6499,7 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
             f"Freshness: {freshness}",
             f"Quality: {_format_dataset_quality_label(quality)}",
             f"Suggested Gap Repair Window: {(quality.get('repair_request_start') or '—')} -> {(quality.get('repair_request_end') or '—')}",
+            f"Quality Analyzed At: {_fmt_ts(quality.get('quality_analyzed_at'))}",
             f"Recommended Action: {next_action.action if next_action else '—'}",
             f"Acquisition Plan: {next_action.plan_type if next_action else '—'}",
             f"Planned Request Window: {(next_action.request_start or 'provider default') if next_action else '—'} -> {(next_action.request_end or 'provider default') if next_action else '—'}",
@@ -4320,35 +6522,39 @@ class AcquisitionDatasetDetailDialog(DashboardDialog):
         ]
         self.summary_text.setPlainText("\n".join(details))
 
-        attempt_frame = (
-            self.attempt_frame[self.attempt_frame["dataset_id"].astype(str) == dataset_id].copy()
-            if not self.attempt_frame.empty
-            else pd.DataFrame()
-        )
-        self.attempt_table.setRowCount(0)
-        for _, attempt in attempt_frame.iterrows():
-            idx = self.attempt_table.rowCount()
-            self.attempt_table.insertRow(idx)
+        attempt_frame = self.catalog.load_acquisition_attempts(dataset_id=dataset_id, limit=250)
+        display_rows: list[dict] = []
+        raw_rows: list[dict] = []
+        tooltips: dict[tuple[int, int], str] = {}
+        for idx, (_row_idx, attempt) in enumerate(attempt_frame.iterrows()):
             coverage = "—"
             if attempt.get("coverage_start") and attempt.get("coverage_end"):
                 coverage = f"{str(attempt['coverage_start'])[:10]} → {str(attempt['coverage_end'])[:10]}"
-            values = [
-                _fmt_ts(attempt.get("finished_at")),
-                str(attempt.get("acquisition_run_id") or "—"),
-                str(attempt.get("symbol") or "—"),
-                str(attempt.get("source") or "—"),
-                str(attempt.get("status") or "—"),
-                str(int(attempt.get("bar_count") or 0)) if pd.notna(attempt.get("bar_count")) else "—",
-                coverage,
-                "Yes" if bool(attempt.get("ingested")) else "No",
-                str(attempt.get("task_id") or "—"),
-                str(attempt.get("error_message") or "—"),
-            ]
-            for col_idx, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                if col_idx == 9:
-                    item.setToolTip(str(attempt.get("error_message") or ""))
-                self.attempt_table.setItem(idx, col_idx, item)
+            display_rows.append(
+                {
+                    "Finished": _fmt_ts(attempt.get("finished_at")),
+                    "Run": str(attempt.get("acquisition_run_id") or "—"),
+                    "Symbol": str(attempt.get("symbol") or "—"),
+                    "Source": str(attempt.get("source") or "—"),
+                    "Status": str(attempt.get("status") or "—"),
+                    "Bars": str(int(attempt.get("bar_count") or 0)) if pd.notna(attempt.get("bar_count")) else "—",
+                    "Coverage": coverage,
+                    "Ingested": "Yes" if bool(attempt.get("ingested")) else "No",
+                    "Task": str(attempt.get("task_id") or "—"),
+                    "Error": str(attempt.get("error_message") or "—"),
+                }
+            )
+            raw_rows.append(dict(attempt))
+            tooltips[(idx, 9)] = str(attempt.get("error_message") or "")
+        self.attempt_model.set_page(
+            pd.DataFrame(display_rows) if display_rows else pd.DataFrame(columns=["Finished", "Run", "Symbol", "Source", "Status", "Bars", "Coverage", "Ingested", "Task", "Error"]),
+            raw_rows=raw_rows,
+            tooltips=tooltips,
+        )
+        header = self.attempt_table.horizontalHeader()
+        if header is not None:
+            header.resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            header.setStretchLastSection(True)
 
 
 class StrategyBlockEditorDialog(DashboardDialog):
@@ -4686,11 +6892,9 @@ class StrategyBlockEditorDialog(DashboardDialog):
             self.block_assets_summary.setText("No assets selected")
             self.block_assets_summary.setToolTip("")
             return
-        if len(dataset_ids) <= 3:
-            self.block_assets_summary.setText(", ".join(dataset_ids))
-            self.block_assets_summary.setToolTip("\n".join(dataset_ids))
-            return
-        self.block_assets_summary.setText(f"{len(dataset_ids)} assets selected")
+        logical_parent = self.logical_parent() if hasattr(self, "logical_parent") else None
+        snapshot_frame = logical_parent.picker_snapshot_frame() if hasattr(logical_parent, "picker_snapshot_frame") else None
+        self.block_assets_summary.setText(_format_dataset_scope_label(dataset_ids, frame=snapshot_frame))
         self.block_assets_summary.setToolTip("\n".join(dataset_ids))
 
     def _render_block_params(self, strategy_name: str, values: dict | None = None) -> None:
@@ -4803,7 +7007,10 @@ class StrategyBlockEditorDialog(DashboardDialog):
         if row < 0 or row >= len(self.blocks):
             return
         initial = list(self.blocks[row].get("asset_dataset_ids") or [])
-        dlg = DatasetSelectionDialog(self.datasets, initial, self)
+        logical_parent = self.logical_parent() if hasattr(self, "logical_parent") else None
+        snapshot_frame = logical_parent.picker_snapshot_frame() if hasattr(logical_parent, "picker_snapshot_frame") else None
+        catalog_path = getattr(getattr(logical_parent, "catalog", None), "db_path", None)
+        dlg = DatasetSelectionDialog(self.datasets, initial, self, catalog_path=catalog_path, snapshot_frame=snapshot_frame)
         dlg.setWindowTitle("Choose Strategy Block Assets")
         if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return
@@ -5183,7 +7390,15 @@ class WalkForwardSetupDialog(DashboardDialog):
         self.dataset_combo = QtWidgets.QComboBox()
         for dataset_id in list(self.study_row.get("dataset_scope") or []):
             self.dataset_combo.addItem(str(dataset_id), str(dataset_id))
-        form.addRow("Dataset", self.dataset_combo)
+        dataset_row = QtWidgets.QHBoxLayout()
+        dataset_row.setContentsMargins(0, 0, 0, 0)
+        dataset_row.addWidget(self.dataset_combo, 1)
+        choose_dataset_btn = QtWidgets.QPushButton("Choose")
+        choose_dataset_btn.clicked.connect(self._choose_dataset)
+        dataset_row.addWidget(choose_dataset_btn)
+        dataset_widget = QtWidgets.QWidget()
+        dataset_widget.setLayout(dataset_row)
+        form.addRow("Dataset", dataset_widget)
 
         self.timeframe_combo = QtWidgets.QComboBox()
         for timeframe in list(self.study_row.get("timeframes") or []):
@@ -5253,6 +7468,29 @@ class WalkForwardSetupDialog(DashboardDialog):
         self.num_folds_spin.valueChanged.connect(self._refresh_preview)
         self.test_window_spin.valueChanged.connect(self._refresh_preview)
         self._refresh_preview()
+
+    def _choose_dataset(self) -> None:
+        datasets = [str(item) for item in list(self.study_row.get("dataset_scope") or []) if str(item).strip()]
+        if not datasets:
+            return
+        logical_parent = self.logical_parent() if hasattr(self, "logical_parent") else None
+        snapshot_frame = logical_parent.picker_snapshot_frame() if hasattr(logical_parent, "picker_snapshot_frame") else None
+        dlg = DatasetPickerDialog(
+            datasets,
+            str(self.dataset_combo.currentData() or ""),
+            self,
+            title="Choose Walk-Forward Dataset",
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=snapshot_frame,
+        )
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        dataset_id = dlg.selected_dataset()
+        if not dataset_id:
+            return
+        idx = self.dataset_combo.findData(dataset_id)
+        if idx >= 0:
+            self.dataset_combo.setCurrentIndex(idx)
 
     def _refresh_preview(self) -> None:
         dataset_id = str(self.dataset_combo.currentData() or "")
@@ -7273,18 +9511,49 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.download_queue: list[str] = []
         self.download_proc: QtCore.QProcess | None = None
         self.download_procs: list[QtCore.QProcess] = []
+        self.download_policy_workers: dict[str, AcquisitionPolicyWorker] = {}
+        self.download_policy_metas: dict[str, dict] = {}
+        self.download_finalize_workers: dict[str, DownloadFinalizeWorker] = {}
+        self.download_finalize_metas: dict[str, dict] = {}
         self.download_paused = False
+        self._download_stop_requested = False
+        self._active_download_source: str | None = None
         self.download_active_ticker: str | None = None
         self.download_progress_rows: dict[str, dict] = {}
         self.download_proc_meta: dict[int, dict] = {}
+        self._paused_download_launch_metas: list[dict] = []
         self.current_acquisition_run_id: str | None = None
         self.current_acquisition_attempts: dict[str, str] = {}
+        self._picker_snapshot_frame: pd.DataFrame | None = None
+        self._picker_snapshot_worker: AcquisitionSnapshotWorker | None = None
+        self._picker_snapshot_refresh_pending = False
         self.scheduled_tasks: list[dict] = []
         self.universes: list[dict] = []
+        self.asset_catalog_frame = pd.DataFrame()
+        self.asset_catalog_filtered_frame = pd.DataFrame()
+        self.asset_information_enrichment_frame = pd.DataFrame()
+        self.asset_information_bulk_selected_asset_ids: list[str] = []
+        self.asset_provider_sync_queue: list[str] = []
+        self.asset_provider_sync_provider: str | None = None
+        self.asset_provider_sync_active_symbol: str | None = None
+        self.asset_provider_sync_total: int = 0
+        self.asset_provider_sync_completed_symbols: list[str] = []
+        self.asset_provider_sync_failed_items: list[tuple[str, str]] = []
+        self._asset_information_programmatic_selection = False
+        self.asset_screener_frame = pd.DataFrame()
+        self.asset_screener_filtered_frame = pd.DataFrame()
+        self.correlation_matrix_frame = pd.DataFrame()
+        self.asset_reference_worker: FinanceDatabaseImportWorker | None = None
+        self.asset_provider_worker: AssetProviderSyncWorker | None = None
         self.study_universe_id: str = ""
         self.download_universe_id: str = ""
         self._editing_universe_id: str = ""
         self._editing_universe_dataset_ids: list[str] = []
+        self.deployment_targets_frame = pd.DataFrame()
+        self.manual_deployment_definitions_frame = pd.DataFrame()
+        self.deployments_frame = pd.DataFrame()
+        self.deployment_metric_snapshots_frame = pd.DataFrame()
+        self.deployment_child_links_frame = pd.DataFrame()
         self.magellan = MagellanClient(self)
         self.snapshot_exporter = ChartSnapshotExporter()
         self._closing = False
@@ -7311,12 +9580,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_home_tab(), "Home")
         self.tabs.addTab(self._build_universe_tab(), "Universe Builder")
+        self.tabs.addTab(self._build_asset_information_tab(), "Asset Information")
+        self.tabs.addTab(self._build_asset_screener_tab(), "Asset Screener")
         self.tabs.addTab(self._build_optimization_tab(), "Optimization")
         self.tabs.addTab(self._build_walk_forward_tab(), "Walk Forward")
         self.tabs.addTab(self._build_monte_carlo_tab(), "Monte Carlo")
+        self.tabs.addTab(self._build_deployment_tab(), "Deployment")
+        self.tabs.addTab(self._build_live_monitor_tab(), "Live Monitor")
+        self.tabs.addTab(self._build_correlation_matrix_tab(), "Correlation Matrix")
         self.tabs.addTab(self._build_heatmap_tab(), "Heatmaps")
         self.tabs.addTab(self._build_control_panel(), "Orchestrate")
-        self.tabs.addTab(self._build_automate_tab(), "Automate")
+        self.tabs.addTab(self._build_automate_tab(), "Data Collection")
 
         layout.addWidget(self.tabs)
 
@@ -7325,8 +9599,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.refresh_timer.setInterval(2000)
         self.refresh_timer.timeout.connect(self._refresh_batches_live)
         self.refresh_timer.start()
+        self._ensure_default_deployment_targets()
         self._load_universes()
         self.refresh()
+        self._request_picker_snapshot_refresh(force=True)
+        QtCore.QTimer.singleShot(0, self._restore_download_session_if_available)
         self._magellan_warm_timer.start(0)
 
     # -- sections ------------------------------------------------------------
@@ -7485,16 +9762,20 @@ class DashboardWindow(QtWidgets.QMainWindow):
         add_btn.clicked.connect(self._add_csv_clicked)
         main_layout.addWidget(add_btn)
 
-        main_layout.addWidget(QtWidgets.QLabel("Dataset ID"))
+        main_layout.addWidget(QtWidgets.QLabel("Dataset"))
         dataset_id_row = QtWidgets.QHBoxLayout()
         self.dataset_combo = QtWidgets.QComboBox()
         self.dataset_combo.setEditable(True)
         self.dataset_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         self.dataset_combo.setMinimumContentsLength(12)
+        self.dataset_combo.setToolTip("The selected dataset ID still drives the engine, but you can now choose it from a ticker-first picker.")
         self.dataset_combo.currentTextChanged.connect(lambda _: self._update_study_dataset_summary())
+        choose_current_dataset_btn = QtWidgets.QPushButton("Choose Dataset")
+        choose_current_dataset_btn.clicked.connect(self._choose_current_dataset)
         current_dataset_acq_btn = QtWidgets.QPushButton("View Acquisition")
         current_dataset_acq_btn.clicked.connect(self._open_current_dataset_acquisition_detail)
         dataset_id_row.addWidget(self.dataset_combo, 3)
+        dataset_id_row.addWidget(choose_current_dataset_btn, 1)
         dataset_id_row.addWidget(current_dataset_acq_btn, 1)
         main_layout.addLayout(dataset_id_row)
         main_layout.addWidget(QtWidgets.QLabel("Study Datasets"))
@@ -7929,6 +10210,1842 @@ class DashboardWindow(QtWidgets.QMainWindow):
         layout.addLayout(top_row)
         return tab
 
+    def _build_asset_information_tab(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        self.asset_information_tab = panel
+        panel.setObjectName("Panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Asset Information")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel(
+            "Browse the local asset master and per-symbol acquisition coverage. "
+            "This view starts with tracked acquisition symbols, then layers in provider-native enrichment from FinanceDatabase, SimFin, and defeatbeta without mixing their raw records together."
+        )
+        subtitle.setObjectName("Sub")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self.asset_information_summary_label = QtWidgets.QLabel("No asset records have been cataloged yet.")
+        self.asset_information_summary_label.setObjectName("Sub")
+        self.asset_information_summary_label.setWordWrap(True)
+        self.asset_information_summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.asset_information_summary_label)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(8)
+        self.asset_information_search_edit = QtWidgets.QLineEdit()
+        self.asset_information_search_edit.setPlaceholderText("Filter symbols, names, exchanges, countries, sectors...")
+        self.asset_information_search_edit.textChanged.connect(self._apply_asset_information_filters)
+        controls.addWidget(self.asset_information_search_edit, 2)
+
+        self.asset_information_class_combo = QtWidgets.QComboBox()
+        self.asset_information_class_combo.addItem("All Classes", "")
+        self.asset_information_class_combo.currentIndexChanged.connect(self._apply_asset_information_filters)
+        controls.addWidget(self.asset_information_class_combo, 1)
+
+        self.asset_information_status_combo = QtWidgets.QComboBox()
+        self.asset_information_status_combo.addItem("All Statuses", "")
+        self.asset_information_status_combo.addItem("Ready", "Ready")
+        self.asset_information_status_combo.addItem("Error", "Error")
+        self.asset_information_status_combo.addItem("Tracked", "Tracked")
+        self.asset_information_status_combo.currentIndexChanged.connect(self._apply_asset_information_filters)
+        controls.addWidget(self.asset_information_status_combo, 1)
+
+        self.asset_information_provider_combo = QtWidgets.QComboBox()
+        self.asset_information_provider_combo.addItem("All Provider States", "")
+        self.asset_information_provider_combo.addItem("Has SimFin", "simfin")
+        self.asset_information_provider_combo.addItem("Has defeatbeta", "defeatbeta")
+        self.asset_information_provider_combo.addItem("Has SimFin or defeatbeta", "simfin_or_defeatbeta")
+        self.asset_information_provider_combo.addItem("Has Earnings Calendar", "earnings")
+        self.asset_information_provider_combo.addItem("Has News", "news")
+        self.asset_information_provider_combo.currentIndexChanged.connect(self._apply_asset_information_filters)
+        controls.addWidget(self.asset_information_provider_combo, 1)
+
+        refresh_btn = QtWidgets.QPushButton("Refresh / Bootstrap")
+        refresh_btn.clicked.connect(lambda: self._refresh_asset_information_tab(announce=True))
+        controls.addWidget(refresh_btn)
+        provider_settings_btn = QtWidgets.QPushButton("Provider Settings")
+        provider_settings_btn.clicked.connect(self._open_provider_settings_dialog)
+        controls.addWidget(provider_settings_btn)
+        self.asset_information_select_all_btn = QtWidgets.QPushButton("Select All Filtered")
+        self.asset_information_select_all_btn.clicked.connect(self._select_all_filtered_asset_information_rows)
+        controls.addWidget(self.asset_information_select_all_btn)
+        self.asset_information_clear_selection_btn = QtWidgets.QPushButton("Clear Selection")
+        self.asset_information_clear_selection_btn.clicked.connect(self._clear_asset_information_selection)
+        controls.addWidget(self.asset_information_clear_selection_btn)
+        self.asset_information_import_btn = QtWidgets.QPushButton("Import FinanceDatabase")
+        self.asset_information_import_btn.clicked.connect(self._start_financedatabase_import)
+        controls.addWidget(self.asset_information_import_btn)
+        self.asset_information_sync_simfin_btn = QtWidgets.QPushButton("Sync SimFin Selected")
+        self.asset_information_sync_simfin_btn.clicked.connect(lambda: self._start_asset_provider_sync("simfin"))
+        controls.addWidget(self.asset_information_sync_simfin_btn)
+        self.asset_information_sync_defeatbeta_btn = QtWidgets.QPushButton("Sync defeatbeta Selected")
+        self.asset_information_sync_defeatbeta_btn.clicked.connect(
+            lambda: self._start_asset_provider_sync("defeatbeta")
+        )
+        controls.addWidget(self.asset_information_sync_defeatbeta_btn)
+        layout.addLayout(controls)
+
+        self.asset_information_import_note = QtWidgets.QLabel("")
+        self.asset_information_import_note.setObjectName("Sub")
+        self.asset_information_import_note.setWordWrap(True)
+        layout.addWidget(self.asset_information_import_note)
+
+        self.asset_information_provider_note = QtWidgets.QLabel(
+            "Provider sync can queue one or many selected assets. Use filters plus `Select All Filtered` to stage a sequential SimFin or defeatbeta batch without parallel downloads."
+        )
+        self.asset_information_provider_note.setObjectName("Sub")
+        self.asset_information_provider_note.setWordWrap(True)
+        layout.addWidget(self.asset_information_provider_note)
+
+        self.asset_information_progress_label = QtWidgets.QLabel("")
+        self.asset_information_progress_label.setObjectName("Sub")
+        self.asset_information_progress_label.setWordWrap(True)
+        self.asset_information_progress_label.setVisible(False)
+        layout.addWidget(self.asset_information_progress_label)
+
+        self.asset_information_progress_bar = QtWidgets.QProgressBar()
+        self.asset_information_progress_bar.setRange(0, 100)
+        self.asset_information_progress_bar.setValue(0)
+        self.asset_information_progress_bar.setTextVisible(True)
+        self.asset_information_progress_bar.setVisible(False)
+        self.asset_information_progress_bar.setStyleSheet(
+            f"""
+            QProgressBar {{
+                background: {PALETTE['panel2']};
+                color: {PALETTE['text']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
+                border-radius: 8px;
+                text-align: center;
+                min-height: 22px;
+            }}
+            QProgressBar::chunk {{
+                background: {PALETTE['blue']};
+                border-radius: 7px;
+            }}
+            """
+        )
+        layout.addWidget(self.asset_information_progress_bar)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        table_panel = QtWidgets.QWidget()
+        table_panel.setObjectName("Panel")
+        table_layout = QtWidgets.QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        table_layout.setSpacing(8)
+        table_title = QtWidgets.QLabel("Asset Catalog")
+        table_title.setObjectName("Title")
+        table_note = QtWidgets.QLabel(
+            "Symbols already seen by the acquisition catalog are listed here first. FinanceDatabase fills broad reference coverage, while SimFin and defeatbeta attach provider-native fundamentals and event history."
+        )
+        table_note.setObjectName("Sub")
+        table_note.setWordWrap(True)
+        table_layout.addWidget(table_title)
+        table_layout.addWidget(table_note)
+
+        self.asset_information_table = QtWidgets.QTableWidget(0, 8)
+        self.asset_information_table.setHorizontalHeaderLabels(
+            ["Symbol", "Name", "Class", "Exchange", "Country", "Datasets", "Status", "Latest Source"]
+        )
+        self.asset_information_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.asset_information_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.asset_information_table.setAlternatingRowColors(True)
+        self.asset_information_table.verticalHeader().setVisible(False)
+        self.asset_information_table.horizontalHeader().setStretchLastSection(True)
+        self.asset_information_table.setObjectName("Panel")
+        self.asset_information_table.itemSelectionChanged.connect(self._on_asset_information_selection_changed)
+        table_layout.addWidget(self.asset_information_table, 1)
+        split.addWidget(table_panel)
+
+        detail_panel = QtWidgets.QWidget()
+        detail_panel.setObjectName("Panel")
+        detail_layout = QtWidgets.QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
+        detail_layout.setSpacing(8)
+        detail_title = QtWidgets.QLabel("Asset Detail")
+        detail_title.setObjectName("Title")
+        detail_note = QtWidgets.QLabel(
+            "Shows the shared asset record, acquisition coverage, and any provider-native payload coverage already synced for the selected asset."
+        )
+        detail_note.setObjectName("Sub")
+        detail_note.setWordWrap(True)
+        detail_layout.addWidget(detail_title)
+        detail_layout.addWidget(detail_note)
+
+        self.asset_information_detail = QtWidgets.QPlainTextEdit()
+        self.asset_information_detail.setReadOnly(True)
+        self.asset_information_detail.setObjectName("Panel")
+        self.asset_information_detail.setStyleSheet(
+            f"""
+            QPlainTextEdit {{
+                background: {PALETTE['panel2']};
+                color: {PALETTE['text']};
+                border: 1px solid {PALETTE['border']};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+            """
+        )
+        self.asset_information_detail.setPlainText("Select an asset to inspect its detail.")
+        detail_layout.addWidget(self.asset_information_detail, 1)
+        split.addWidget(detail_panel)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+
+        self._refresh_asset_information_tab()
+        return panel
+
+    def _selected_asset_information_asset_id(self) -> str | None:
+        if not hasattr(self, "asset_information_table"):
+            return None
+        selection_model = self.asset_information_table.selectionModel()
+        if selection_model is None:
+            return None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None
+        item = self.asset_information_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        asset_id = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+        return str(asset_id).strip() or None
+
+    def _selected_asset_information_asset_ids(self) -> list[str]:
+        if self.asset_information_bulk_selected_asset_ids:
+            return list(dict.fromkeys([str(item).strip() for item in self.asset_information_bulk_selected_asset_ids if str(item).strip()]))
+        if not hasattr(self, "asset_information_table"):
+            return []
+        selection_model = self.asset_information_table.selectionModel()
+        if selection_model is None:
+            return []
+        asset_ids: list[str] = []
+        for model_index in selection_model.selectedRows():
+            item = self.asset_information_table.item(model_index.row(), 0)
+            if item is None:
+                continue
+            asset_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+            if asset_id:
+                asset_ids.append(asset_id)
+        return list(dict.fromkeys(asset_ids))
+
+    def _selected_asset_information_symbols(self) -> list[str]:
+        asset_ids = self._selected_asset_information_asset_ids()
+        if not asset_ids:
+            return []
+        frame = self.asset_catalog_frame.copy()
+        if frame.empty:
+            frame = self.asset_catalog_filtered_frame.copy()
+        if frame.empty or "asset_id" not in frame.columns:
+            return []
+        selected = frame.loc[frame["asset_id"].astype(str).isin([str(item) for item in asset_ids])].copy()
+        if selected.empty:
+            return []
+        symbols = [
+            str(item).strip().upper()
+            for item in selected.get("symbol", pd.Series(dtype=str)).fillna("").tolist()
+            if str(item).strip()
+        ]
+        return list(dict.fromkeys(symbols))
+
+    def _asset_information_selected_count(self) -> int:
+        return len(self._selected_asset_information_asset_ids())
+
+    def _on_asset_information_selection_changed(self) -> None:
+        if not self._asset_information_programmatic_selection and self.asset_information_bulk_selected_asset_ids:
+            self.asset_information_bulk_selected_asset_ids = []
+        self._update_asset_information_summary()
+        self._update_asset_information_provider_controls()
+        self._update_asset_information_detail()
+
+    def _clear_asset_information_table_selection(self) -> None:
+        if not hasattr(self, "asset_information_table"):
+            return
+        self._asset_information_programmatic_selection = True
+        try:
+            self.asset_information_table.clearSelection()
+        finally:
+            self._asset_information_programmatic_selection = False
+
+    def _clear_asset_information_selection(self) -> None:
+        self.asset_information_bulk_selected_asset_ids = []
+        self._clear_asset_information_table_selection()
+        self._update_asset_information_summary()
+        self._update_asset_information_provider_controls()
+        if hasattr(self, "asset_information_detail"):
+            self.asset_information_detail.setPlainText("Select an asset to inspect its detail.")
+        self.status_label.setText("Asset Information selection cleared.")
+
+    def _select_all_filtered_asset_information_rows(self) -> None:
+        frame = self.asset_catalog_filtered_frame.copy()
+        if frame.empty:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Filtered Assets",
+                "Adjust the Asset Information filters until at least one asset is visible before selecting all.",
+            )
+            return
+        self.asset_information_bulk_selected_asset_ids = [
+            str(item).strip()
+            for item in frame.get("asset_id", pd.Series(dtype=str)).fillna("").tolist()
+            if str(item).strip()
+        ]
+        self._asset_information_programmatic_selection = True
+        try:
+            self.asset_information_table.clearSelection()
+            selection_model = self.asset_information_table.selectionModel()
+            if selection_model is not None:
+                bulk_set = set(self.asset_information_bulk_selected_asset_ids)
+                for row_idx in range(self.asset_information_table.rowCount()):
+                    item = self.asset_information_table.item(row_idx, 0)
+                    if item is None:
+                        continue
+                    asset_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+                    if not asset_id or asset_id not in bulk_set:
+                        continue
+                    index = self.asset_information_table.model().index(row_idx, 0)
+                    selection_model.select(
+                        index,
+                        QtCore.QItemSelectionModel.SelectionFlag.Select
+                        | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                    )
+        finally:
+            self._asset_information_programmatic_selection = False
+        self._update_asset_information_summary()
+        self._update_asset_information_provider_controls()
+        self._update_asset_information_detail()
+        self.status_label.setText(
+            f"Selected all {len(self.asset_information_bulk_selected_asset_ids)} filtered assets for queued provider sync."
+        )
+
+    def _set_asset_information_progress(self, percent: int | None, label: str) -> None:
+        if not hasattr(self, "asset_information_progress_bar") or not hasattr(
+            self, "asset_information_progress_label"
+        ):
+            return
+        text = str(label or "").strip()
+        self.asset_information_progress_label.setText(text)
+        self.asset_information_progress_label.setVisible(bool(text))
+        self.asset_information_progress_bar.setVisible(True)
+        if percent is None:
+            self.asset_information_progress_bar.setRange(0, 0)
+            self.asset_information_progress_bar.setFormat("")
+        else:
+            value = max(0, min(100, int(percent)))
+            self.asset_information_progress_bar.setRange(0, 100)
+            self.asset_information_progress_bar.setValue(value)
+            self.asset_information_progress_bar.setFormat(f"{value}%")
+
+    def _clear_asset_information_progress(self) -> None:
+        if not hasattr(self, "asset_information_progress_bar") or not hasattr(
+            self, "asset_information_progress_label"
+        ):
+            return
+        self.asset_information_progress_bar.setRange(0, 100)
+        self.asset_information_progress_bar.setValue(0)
+        self.asset_information_progress_bar.setFormat("")
+        self.asset_information_progress_bar.setVisible(False)
+        self.asset_information_progress_label.setText("")
+        self.asset_information_progress_label.setVisible(False)
+
+    def _update_asset_information_provider_controls(self) -> None:
+        if hasattr(self, "asset_information_provider_note"):
+            provider_messages: list[str] = []
+            if self.asset_provider_sync_provider:
+                done_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
+                provider_messages.append(
+                    f"Provider sync queue running: {done_count + 1}/{max(self.asset_provider_sync_total, 1)} "
+                    f"{self.asset_provider_sync_provider} ({self.asset_provider_sync_active_symbol or '—'})."
+                )
+            else:
+                provider_messages.append("Provider sync is idle.")
+            selected_count = self._asset_information_selected_count()
+            if selected_count:
+                provider_messages.append(f"Selected for queue: {selected_count}.")
+            provider_messages.append(
+                "SimFin ready."
+                if simfin_available()
+                else f"SimFin unavailable. {simfin_install_hint()}"
+            )
+            provider_messages.append(
+                "defeatbeta ready."
+                if defeatbeta_available()
+                else f"defeatbeta unavailable. {defeatbeta_install_hint()}"
+            )
+            self.asset_information_provider_note.setText(" ".join(provider_messages))
+        provider_busy = self.asset_provider_worker is not None or bool(self.asset_provider_sync_provider)
+        if hasattr(self, "asset_information_select_all_btn"):
+            self.asset_information_select_all_btn.setEnabled(not provider_busy)
+        if hasattr(self, "asset_information_clear_selection_btn"):
+            self.asset_information_clear_selection_btn.setEnabled((not provider_busy) and self._asset_information_selected_count() > 0)
+        if hasattr(self, "asset_information_sync_simfin_btn"):
+            self.asset_information_sync_simfin_btn.setEnabled((not provider_busy) and simfin_available())
+        if hasattr(self, "asset_information_sync_defeatbeta_btn"):
+            self.asset_information_sync_defeatbeta_btn.setEnabled((not provider_busy) and defeatbeta_available())
+
+    def _refresh_asset_information_tab(self, *, announce: bool = False) -> None:
+        if not hasattr(self, "asset_information_table"):
+            return
+        selected_asset_id = self._selected_asset_information_asset_id()
+        current_class = (
+            str(self.asset_information_class_combo.currentData() or "")
+            if hasattr(self, "asset_information_class_combo")
+            else ""
+        )
+        bootstrapped = self.catalog.bootstrap_asset_catalog()
+        self.asset_catalog_frame = self.catalog.load_asset_catalog(bootstrap_from_acquisition=False)
+        enrichment = self.catalog.load_asset_screener_enrichment()
+        self.asset_information_enrichment_frame = enrichment
+        if not enrichment.empty:
+            self.asset_catalog_frame = self.asset_catalog_frame.merge(enrichment, on="asset_id", how="left")
+        for column in (
+            "market_cap",
+            "shares_outstanding",
+            "beta",
+            "description",
+            "website",
+            "employee_count",
+            "profile_source",
+            "profile_as_of_date",
+            "provider_payload_count",
+            "simfin_payload_count",
+            "defeatbeta_payload_count",
+            "defeatbeta_earnings_count",
+            "defeatbeta_news_count",
+            "provider_last_sync_at",
+            "latest_earnings_date",
+            "latest_news_date",
+        ):
+            if column not in self.asset_catalog_frame.columns:
+                self.asset_catalog_frame[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta"} else ""
+        if hasattr(self, "asset_information_import_note"):
+            if self.asset_reference_worker is not None:
+                self.asset_information_import_note.setText("FinanceDatabase import is running in the background…")
+            elif financedatabase_available():
+                self.asset_information_import_note.setText(
+                    "FinanceDatabase import is available. Use `Import FinanceDatabase` to enrich this catalog with broad category, exchange, country, and identifier coverage."
+                )
+            else:
+                self.asset_information_import_note.setText(
+                    f"FinanceDatabase is not installed in the current environment. {financedatabase_install_hint()}"
+                )
+        if hasattr(self, "asset_information_import_btn"):
+            self.asset_information_import_btn.setEnabled(self.asset_reference_worker is None)
+        self._update_asset_information_provider_controls()
+        if self.asset_reference_worker is None and self.asset_provider_worker is None and not self.asset_provider_sync_provider:
+            self._clear_asset_information_progress()
+
+        if hasattr(self, "asset_information_class_combo"):
+            classes = sorted(
+                {
+                    str(value).strip()
+                    for value in self.asset_catalog_frame.get("asset_class", pd.Series(dtype=str)).fillna("Unclassified")
+                    if str(value).strip()
+                }
+            )
+            self.asset_information_class_combo.blockSignals(True)
+            self.asset_information_class_combo.clear()
+            self.asset_information_class_combo.addItem("All Classes", "")
+            for asset_class in classes:
+                self.asset_information_class_combo.addItem(asset_class, asset_class)
+            restored_idx = self.asset_information_class_combo.findData(current_class)
+            self.asset_information_class_combo.setCurrentIndex(restored_idx if restored_idx >= 0 else 0)
+            self.asset_information_class_combo.blockSignals(False)
+
+        self._apply_asset_information_filters(selected_asset_id=selected_asset_id)
+        if announce:
+            self.status_label.setText(
+                f"Asset catalog refreshed ({len(self.asset_catalog_frame)} assets, {bootstrapped} bootstrapped from tracked datasets)."
+            )
+
+    def _apply_asset_information_filters(self, *_args, selected_asset_id: str | None = None) -> None:
+        if not hasattr(self, "asset_information_table"):
+            return
+        frame = self.asset_catalog_frame.copy()
+        if frame.empty:
+            self.asset_catalog_filtered_frame = frame
+            self.asset_information_table.setRowCount(0)
+            self.asset_information_summary_label.setText(
+                "No assets are cataloged yet. Use Data Collection or manual CSV import to create tracked symbols, then refresh this tab."
+            )
+            self.asset_information_detail.setPlainText("No asset records are available yet.")
+            return
+
+        for column in ("display_symbol", "name", "asset_class", "exchange", "country", "sector", "industry", "latest_source", "dataset_status"):
+            if column not in frame.columns:
+                frame[column] = ""
+        frame["asset_class"] = frame["asset_class"].fillna("").replace("", "Unclassified")
+        frame["dataset_status"] = frame["dataset_status"].fillna("").replace("", "Untracked")
+
+        search_text = (
+            self.asset_information_search_edit.text().strip().lower()
+            if hasattr(self, "asset_information_search_edit")
+            else ""
+        )
+        if search_text:
+            haystack = (
+                frame["symbol"].fillna("").astype(str)
+                + " "
+                + frame["display_symbol"].fillna("").astype(str)
+                + " "
+                + frame["name"].fillna("").astype(str)
+                + " "
+                + frame["exchange"].fillna("").astype(str)
+                + " "
+                + frame["country"].fillna("").astype(str)
+                + " "
+                + frame["sector"].fillna("").astype(str)
+                + " "
+                + frame["industry"].fillna("").astype(str)
+                + " "
+                + frame["latest_source"].fillna("").astype(str)
+            ).str.lower()
+            frame = frame.loc[haystack.str.contains(re.escape(search_text), regex=True, na=False)].copy()
+
+        selected_class = (
+            str(self.asset_information_class_combo.currentData() or "")
+            if hasattr(self, "asset_information_class_combo")
+            else ""
+        )
+        if selected_class:
+            frame = frame.loc[frame["asset_class"].astype(str) == selected_class].copy()
+
+        selected_status = (
+            str(self.asset_information_status_combo.currentData() or "")
+            if hasattr(self, "asset_information_status_combo")
+            else ""
+        )
+        if selected_status:
+            frame = frame.loc[frame["dataset_status"].astype(str) == selected_status].copy()
+
+        selected_provider_state = (
+            str(self.asset_information_provider_combo.currentData() or "")
+            if hasattr(self, "asset_information_provider_combo")
+            else ""
+        )
+        if selected_provider_state == "simfin":
+            frame = frame.loc[pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0) > 0].copy()
+        elif selected_provider_state == "defeatbeta":
+            frame = frame.loc[pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0) > 0].copy()
+        elif selected_provider_state == "simfin_or_defeatbeta":
+            has_provider = (
+                pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0)
+                + pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0)
+            ) > 0
+            frame = frame.loc[has_provider].copy()
+        elif selected_provider_state == "earnings":
+            frame = frame.loc[pd.to_numeric(frame["defeatbeta_earnings_count"], errors="coerce").fillna(0) > 0].copy()
+        elif selected_provider_state == "news":
+            frame = frame.loc[pd.to_numeric(frame["defeatbeta_news_count"], errors="coerce").fillna(0) > 0].copy()
+
+        frame = frame.sort_values(["symbol", "name"], kind="stable").reset_index(drop=True)
+        self.asset_catalog_filtered_frame = frame
+        self._render_asset_information_table(preferred_asset_id=selected_asset_id)
+
+    def _update_asset_information_summary(self) -> None:
+        if not hasattr(self, "asset_information_summary_label"):
+            return
+        frame = self.asset_catalog_filtered_frame.copy()
+        render_count = min(len(frame), 1000)
+        if frame.empty:
+            self.asset_information_summary_label.setText(
+                f"Showing 0 of {len(self.asset_catalog_frame)} assets for the current filters."
+            )
+            return
+        ready_count = int((frame["dataset_status"].astype(str) == "Ready").sum())
+        error_count = int((frame["dataset_status"].astype(str) == "Error").sum())
+        tracked_count = int((frame["dataset_status"].astype(str) == "Tracked").sum())
+        selected_count = self._asset_information_selected_count()
+        rendered_note = f" | Rendered first {render_count}" if len(frame) > render_count else ""
+        selected_note = f" | Selected: {selected_count}" if selected_count else ""
+        self.asset_information_summary_label.setText(
+            f"Showing {len(frame)} of {len(self.asset_catalog_frame)} assets{rendered_note} | "
+            f"Ready: {ready_count} | Error: {error_count} | Tracked: {tracked_count}{selected_note}"
+        )
+
+    def _render_asset_information_table(self, *, preferred_asset_id: str | None = None) -> None:
+        frame = self.asset_catalog_filtered_frame.copy()
+        max_rows = 1000
+        render_frame = frame.head(max_rows).copy()
+        self.asset_information_table.setRowCount(len(render_frame))
+        status_colors = {
+            "Ready": PALETTE["green"],
+            "Error": PALETTE["red"],
+            "Tracked": PALETTE["amber"],
+            "Untracked": PALETTE["muted"],
+        }
+        for row_idx, (_, row) in enumerate(render_frame.iterrows()):
+            values = [
+                str(row.get("display_symbol") or row.get("symbol") or ""),
+                str(row.get("name") or row.get("symbol") or ""),
+                str(row.get("asset_class") or "Unclassified"),
+                str(row.get("exchange") or "—"),
+                str(row.get("country") or "—"),
+                str(int(row.get("dataset_count", 0) or 0)),
+                str(row.get("dataset_status") or "Untracked"),
+                str(row.get("latest_source") or "—"),
+            ]
+            for col_idx, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if col_idx == 0:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("asset_id") or ""))
+                if col_idx == 6:
+                    item.setForeground(QtGui.QColor(status_colors.get(value, PALETTE["text"])))
+                self.asset_information_table.setItem(row_idx, col_idx, item)
+
+        if frame.empty:
+            self._update_asset_information_summary()
+            self.asset_information_detail.setPlainText("No assets match the current filters.")
+            return
+
+        bulk_selected_ids = set(self.asset_information_bulk_selected_asset_ids)
+        self._asset_information_programmatic_selection = True
+        try:
+            self.asset_information_table.clearSelection()
+            selection_model = self.asset_information_table.selectionModel()
+            if bulk_selected_ids and selection_model is not None:
+                first_visible_row: int | None = None
+                for row_idx, (_, row) in enumerate(render_frame.iterrows()):
+                    asset_id = str(row.get("asset_id") or "").strip()
+                    if not asset_id or asset_id not in bulk_selected_ids:
+                        continue
+                    if first_visible_row is None:
+                        first_visible_row = row_idx
+                    index = self.asset_information_table.model().index(row_idx, 0)
+                    selection_model.select(
+                        index,
+                        QtCore.QItemSelectionModel.SelectionFlag.Select
+                        | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                    )
+                if first_visible_row is None and len(render_frame):
+                    self.asset_information_table.selectRow(0)
+            else:
+                selected_row = 0
+                if preferred_asset_id:
+                    matches = render_frame.index[render_frame["asset_id"].astype(str) == str(preferred_asset_id)].tolist()
+                    if matches:
+                        selected_row = int(matches[0])
+                self.asset_information_table.selectRow(selected_row)
+        finally:
+            self._asset_information_programmatic_selection = False
+        self._update_asset_information_summary()
+        self._update_asset_information_provider_controls()
+        self._update_asset_information_detail()
+
+    def _update_asset_information_detail(self) -> None:
+        if not hasattr(self, "asset_information_detail"):
+            return
+        asset_id = self._selected_asset_information_asset_id()
+        if not asset_id or self.asset_catalog_filtered_frame.empty:
+            self.asset_information_detail.setPlainText("Select an asset to inspect its detail.")
+            return
+        match = self.asset_catalog_filtered_frame.loc[
+            self.asset_catalog_filtered_frame["asset_id"].astype(str) == str(asset_id)
+        ]
+        if match.empty:
+            self.asset_information_detail.setPlainText("Select an asset to inspect its detail.")
+            return
+        row = match.iloc[0].to_dict()
+        identifiers = self.catalog.load_asset_identifiers(asset_id)
+        provider_payload_summary = self.catalog.load_asset_provider_payload_summary(asset_id)
+        lines = [
+            f"Symbol: {row.get('display_symbol') or row.get('symbol') or '—'}",
+            f"Name: {row.get('name') or row.get('symbol') or '—'}",
+            f"Asset Class: {row.get('asset_class') or 'Unclassified'}",
+            f"Security Type: {row.get('security_type') or '—'}",
+            f"Exchange: {row.get('exchange') or '—'}",
+            f"Country: {row.get('country') or '—'}",
+            f"Currency: {row.get('currency') or '—'}",
+            f"Sector: {row.get('sector') or '—'}",
+            f"Industry: {row.get('industry') or '—'}",
+            f"Identifier Provider: {identifiers.get('provider') or '—'}",
+            f"ISIN: {identifiers.get('isin') or '—'}",
+            f"CUSIP: {identifiers.get('cusip') or '—'}",
+            f"FIGI: {identifiers.get('figi') or '—'}",
+            f"Composite FIGI: {identifiers.get('composite_figi') or '—'}",
+            f"Shareclass FIGI: {identifiers.get('shareclass_figi') or '—'}",
+            "",
+            f"Dataset Status: {row.get('dataset_status') or 'Untracked'}",
+            f"Tracked Datasets: {int(row.get('dataset_count', 0) or 0)}",
+            f"Successful Datasets: {int(row.get('successful_dataset_count', 0) or 0)}",
+            f"Latest Dataset ID: {row.get('latest_dataset_id') or '—'}",
+            f"Latest Source: {row.get('latest_source') or '—'}",
+            f"Latest Download Attempt: {row.get('latest_download_at') or '—'}",
+            f"Latest Successful Download: {row.get('latest_success_at') or '—'}",
+            f"Latest Failure At: {row.get('latest_failure_at') or '—'}",
+            f"Latest Failure Reason: {row.get('latest_failure_reason') or '—'}",
+            f"Coverage Start: {row.get('coverage_start') or '—'}",
+            f"Coverage End: {row.get('coverage_end') or '—'}",
+            f"Freshness Status: {row.get('freshness_status') or '—'}",
+            "",
+            "Provider Payload Coverage:",
+        ]
+        if provider_payload_summary:
+            for item in provider_payload_summary:
+                lines.append(
+                    f"{item.get('provider') or '—'} | {item.get('dataset_code') or '—'} | "
+                    f"records={int(item.get('record_count') or 0)} | latest={item.get('latest_fetched_at') or '—'}"
+                )
+        else:
+            lines.append("No provider-native payloads have been synced yet.")
+        lines.extend(
+            [
+                "",
+            f"First Seen: {row.get('first_seen_at') or '—'}",
+            f"Last Seen: {row.get('last_seen_at') or '—'}",
+            f"Updated At: {row.get('updated_at') or '—'}",
+            ]
+        )
+        self.asset_information_detail.setPlainText("\n".join(lines))
+
+    def _start_financedatabase_import(self) -> None:
+        if self.asset_reference_worker is not None:
+            return
+        if not financedatabase_available():
+            self._show_error_dialog(
+                "FinanceDatabase Missing",
+                financedatabase_install_hint(),
+                details="The FinanceDatabase package is not installed in the current environment.",
+            )
+            return
+        self.asset_reference_worker = FinanceDatabaseImportWorker(
+            catalog_path=self.catalog.db_path,
+            store_raw_payloads=False,
+        )
+        self.asset_reference_worker.progress_signal.connect(self._on_financedatabase_import_progress)
+        self.asset_reference_worker.finished_signal.connect(self._financedatabase_import_finished)
+        self.asset_reference_worker.error_signal.connect(self._financedatabase_import_error)
+        self.asset_reference_worker.finished.connect(self._on_asset_reference_worker_stopped)
+        self.asset_reference_worker.finished.connect(self.asset_reference_worker.deleteLater)
+        self.asset_information_import_btn.setEnabled(False)
+        self.asset_information_import_note.setText("FinanceDatabase import is running in the background…")
+        self.status_label.setText("Importing FinanceDatabase asset catalog…")
+        self._set_asset_information_progress(0, "Starting FinanceDatabase import…")
+        self.asset_reference_worker.start()
+
+    def _start_asset_provider_sync(self, provider: str) -> None:
+        if self.asset_provider_worker is not None or self.asset_provider_sync_provider:
+            return
+        normalized_provider = str(provider or "").strip().lower()
+        symbols = self._selected_asset_information_symbols()
+        if not symbols:
+            self._show_error_dialog(
+                "No Assets Selected",
+                "Select one or more assets in Asset Information before starting a provider sync.",
+            )
+            return
+        if normalized_provider == "simfin" and not simfin_available():
+            self._show_error_dialog("SimFin Missing", simfin_install_hint())
+            return
+        if normalized_provider == "defeatbeta" and not defeatbeta_available():
+            self._show_error_dialog("defeatbeta Missing", defeatbeta_install_hint())
+            return
+        self.asset_provider_sync_queue = list(dict.fromkeys(symbols))
+        self.asset_provider_sync_provider = normalized_provider
+        self.asset_provider_sync_active_symbol = None
+        self.asset_provider_sync_total = len(self.asset_provider_sync_queue)
+        self.asset_provider_sync_completed_symbols = []
+        self.asset_provider_sync_failed_items = []
+        self.status_label.setText(
+            f"Queued {self.asset_provider_sync_total} asset{'s' if self.asset_provider_sync_total != 1 else ''} for {normalized_provider} sync."
+        )
+        self._set_asset_information_progress(0, f"Queued {self.asset_provider_sync_total} {normalized_provider} sync item(s)…")
+        self._refresh_asset_information_tab(announce=False)
+        self._start_next_asset_provider_sync_job()
+
+    def _start_next_asset_provider_sync_job(self) -> None:
+        if self.asset_provider_worker is not None or not self.asset_provider_sync_provider:
+            return
+        if not self.asset_provider_sync_queue:
+            self._finish_asset_provider_sync_queue()
+            return
+        symbol = str(self.asset_provider_sync_queue.pop(0) or "").strip().upper()
+        if not symbol:
+            self._start_next_asset_provider_sync_job()
+            return
+        provider = str(self.asset_provider_sync_provider or "").strip()
+        completed_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
+        self.asset_provider_sync_active_symbol = symbol
+        self.asset_provider_worker = AssetProviderSyncWorker(
+            provider=provider,
+            catalog_path=self.catalog.db_path,
+            symbols=[symbol],
+        )
+        self.asset_provider_worker.progress_signal.connect(self._on_asset_provider_sync_progress)
+        self.asset_provider_worker.finished_signal.connect(self._asset_provider_sync_finished)
+        self.asset_provider_worker.error_signal.connect(self._asset_provider_sync_error)
+        self.asset_provider_worker.finished.connect(self._on_asset_provider_worker_stopped)
+        self.asset_provider_worker.finished.connect(self.asset_provider_worker.deleteLater)
+        self.status_label.setText(
+            f"Syncing {symbol} from {provider} ({completed_count + 1}/{max(self.asset_provider_sync_total, 1)})…"
+        )
+        self._set_asset_information_progress(
+            int((completed_count / max(self.asset_provider_sync_total, 1)) * 100),
+            f"{completed_count + 1}/{max(self.asset_provider_sync_total, 1)} {provider} | Starting {symbol}…",
+        )
+        self._refresh_asset_information_tab(announce=False)
+        self.asset_provider_worker.start()
+
+    def _finish_asset_provider_sync_queue(self) -> None:
+        provider = str(self.asset_provider_sync_provider or "provider")
+        total = int(self.asset_provider_sync_total or 0)
+        success_count = len(self.asset_provider_sync_completed_symbols)
+        failure_count = len(self.asset_provider_sync_failed_items)
+        failure_details = "\n".join(
+            f"{symbol}: {error}" for symbol, error in self.asset_provider_sync_failed_items[:25]
+        )
+        self.asset_provider_sync_queue = []
+        self.asset_provider_sync_provider = None
+        self.asset_provider_sync_active_symbol = None
+        self.asset_provider_sync_total = 0
+        self.asset_information_bulk_selected_asset_ids = []
+        self._clear_asset_information_progress()
+        self._refresh_asset_information_tab(announce=False)
+        self.status_label.setText(
+            f"{provider} sync queue completed ({success_count}/{total} succeeded, {failure_count} failed)."
+        )
+        if failure_count:
+            self._show_error_dialog(
+                "Asset Provider Sync Completed With Errors",
+                f"{provider} sync queue completed with {failure_count} failure{'s' if failure_count != 1 else ''}.",
+                details=failure_details or None,
+            )
+        self.asset_provider_sync_completed_symbols = []
+        self.asset_provider_sync_failed_items = []
+
+    def _on_financedatabase_import_progress(self, payload: object) -> None:
+        if self._closing:
+            return
+        item = dict(payload or {})
+        self._set_asset_information_progress(item.get("percent"), str(item.get("label") or ""))
+
+    def _on_asset_provider_sync_progress(self, payload: object) -> None:
+        if self._closing:
+            return
+        item = dict(payload or {})
+        label = str(item.get("label") or "")
+        percent = item.get("percent")
+        if self.asset_provider_sync_provider and self.asset_provider_sync_total > 0:
+            completed_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
+            queue_prefix = (
+                f"{completed_count + 1}/{self.asset_provider_sync_total} "
+                f"{self.asset_provider_sync_active_symbol or '—'} | "
+            )
+            overall_percent = None
+            if percent is not None:
+                try:
+                    normalized = max(0.0, min(100.0, float(percent)))
+                    overall_percent = int(
+                        ((completed_count + (normalized / 100.0)) / max(self.asset_provider_sync_total, 1)) * 100
+                    )
+                except Exception:
+                    overall_percent = None
+            self._set_asset_information_progress(overall_percent, queue_prefix + label)
+            return
+        self._set_asset_information_progress(percent, label)
+
+    def _financedatabase_import_finished(self, payload: object) -> None:
+        if self._closing:
+            return
+        summary = dict(payload or {})
+        total_assets = int(summary.get("total_assets") or 0)
+        total_rows = int(summary.get("total_rows") or 0)
+        self._clear_asset_information_progress()
+        self._refresh_asset_information_tab(announce=False)
+        self.status_label.setText(
+            f"FinanceDatabase import completed ({total_assets} assets from {total_rows} source rows)."
+        )
+
+    def _financedatabase_import_error(self, message: str) -> None:
+        if self._closing:
+            return
+        self._clear_asset_information_progress()
+        self._refresh_asset_information_tab(announce=False)
+        self.status_label.setText("FinanceDatabase import failed.")
+        self._show_error_dialog("FinanceDatabase Import Error", str(message or "Unknown error"))
+
+    def _asset_provider_sync_finished(self, payload: object) -> None:
+        if self._closing:
+            return
+        summary = dict(payload or {})
+        provider = str(summary.get("provider") or "").strip() or "provider"
+        record_count = int(summary.get("record_count") or 0)
+        asset_count = int(summary.get("asset_count") or 0)
+        active_symbol = str(self.asset_provider_sync_active_symbol or "").strip().upper()
+        if active_symbol:
+            self.asset_provider_sync_completed_symbols.append(active_symbol)
+        completed_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
+        self.status_label.setText(
+            f"{provider} synced {active_symbol or 'asset'} ({record_count} records, {completed_count}/{max(self.asset_provider_sync_total, 1)} done)."
+        )
+
+    def _asset_provider_sync_error(self, message: str) -> None:
+        if self._closing:
+            return
+        active_symbol = str(self.asset_provider_sync_active_symbol or "").strip().upper() or "—"
+        error_summary = self._summarize_error(str(message or "Unknown error"))
+        self.asset_provider_sync_failed_items.append((active_symbol, error_summary))
+        completed_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
+        self.status_label.setText(
+            f"Provider sync failed for {active_symbol} ({completed_count}/{max(self.asset_provider_sync_total, 1)} done)."
+        )
+
+    def _on_asset_reference_worker_stopped(self) -> None:
+        if self.asset_reference_worker is not None and not self.asset_reference_worker.isRunning():
+            self.asset_reference_worker = None
+        if self._closing:
+            return
+        self._clear_asset_information_progress()
+        self._refresh_asset_information_tab(announce=False)
+
+    def _on_asset_provider_worker_stopped(self) -> None:
+        if self.asset_provider_worker is not None and not self.asset_provider_worker.isRunning():
+            self.asset_provider_worker = None
+        if self._closing:
+            return
+        self._refresh_asset_information_tab(announce=False)
+        if self.asset_provider_sync_provider:
+            self._start_next_asset_provider_sync_job()
+            return
+        self._clear_asset_information_progress()
+
+    def _build_asset_screener_tab(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        self.asset_screener_tab = panel
+        panel.setObjectName("Panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Asset Screener")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel(
+            "Filter the asset master using exchange, sector, country, acquisition readiness, and the provider-specific metadata already synced from FinanceDatabase, SimFin, and defeatbeta."
+        )
+        subtitle.setObjectName("Sub")
+        subtitle.setWordWrap(True)
+        self.asset_screener_summary_label = QtWidgets.QLabel("No screener records are available yet.")
+        self.asset_screener_summary_label.setObjectName("Sub")
+        self.asset_screener_summary_label.setWordWrap(True)
+        self.asset_screener_summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.asset_screener_summary_label)
+
+        controls_top = QtWidgets.QHBoxLayout()
+        controls_top.setSpacing(8)
+        self.asset_screener_search_edit = QtWidgets.QLineEdit()
+        self.asset_screener_search_edit.setPlaceholderText("Filter symbols, names, countries, sectors, descriptions...")
+        self.asset_screener_search_edit.textChanged.connect(self._apply_asset_screener_filters)
+        controls_top.addWidget(self.asset_screener_search_edit, 2)
+
+        self.asset_screener_class_combo = QtWidgets.QComboBox()
+        self.asset_screener_class_combo.addItem("All Classes", "")
+        self.asset_screener_class_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
+        controls_top.addWidget(self.asset_screener_class_combo, 1)
+
+        self.asset_screener_status_combo = QtWidgets.QComboBox()
+        self.asset_screener_status_combo.addItem("All Statuses", "")
+        self.asset_screener_status_combo.addItem("Ready", "Ready")
+        self.asset_screener_status_combo.addItem("Tracked", "Tracked")
+        self.asset_screener_status_combo.addItem("Error", "Error")
+        self.asset_screener_status_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
+        controls_top.addWidget(self.asset_screener_status_combo, 1)
+
+        self.asset_screener_provider_combo = QtWidgets.QComboBox()
+        self.asset_screener_provider_combo.addItem("All Provider States", "")
+        self.asset_screener_provider_combo.addItem("Has SimFin", "simfin")
+        self.asset_screener_provider_combo.addItem("Has defeatbeta", "defeatbeta")
+        self.asset_screener_provider_combo.addItem("Has SimFin or defeatbeta", "simfin_or_defeatbeta")
+        self.asset_screener_provider_combo.addItem("Has Earnings Calendar", "earnings")
+        self.asset_screener_provider_combo.addItem("Has News", "news")
+        self.asset_screener_provider_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
+        controls_top.addWidget(self.asset_screener_provider_combo, 1)
+        layout.addLayout(controls_top)
+
+        controls_bottom = QtWidgets.QHBoxLayout()
+        controls_bottom.setSpacing(8)
+        self.asset_screener_sector_combo = QtWidgets.QComboBox()
+        self.asset_screener_sector_combo.addItem("All Sectors", "")
+        self.asset_screener_sector_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
+        controls_bottom.addWidget(self.asset_screener_sector_combo, 1)
+
+        self.asset_screener_country_combo = QtWidgets.QComboBox()
+        self.asset_screener_country_combo.addItem("All Countries", "")
+        self.asset_screener_country_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
+        controls_bottom.addWidget(self.asset_screener_country_combo, 1)
+
+        self.asset_screener_min_market_cap_edit = QtWidgets.QLineEdit()
+        self.asset_screener_min_market_cap_edit.setPlaceholderText("Min Mkt Cap ($B)")
+        self.asset_screener_min_market_cap_edit.textChanged.connect(self._apply_asset_screener_filters)
+        controls_bottom.addWidget(self.asset_screener_min_market_cap_edit)
+
+        self.asset_screener_max_beta_edit = QtWidgets.QLineEdit()
+        self.asset_screener_max_beta_edit.setPlaceholderText("Max Beta")
+        self.asset_screener_max_beta_edit.textChanged.connect(self._apply_asset_screener_filters)
+        controls_bottom.addWidget(self.asset_screener_max_beta_edit)
+
+        refresh_btn = QtWidgets.QPushButton("Refresh Screener")
+        refresh_btn.clicked.connect(lambda: self._refresh_asset_screener_tab(announce=True))
+        controls_bottom.addWidget(refresh_btn)
+
+        create_universe_btn = QtWidgets.QPushButton("Create / Replace Universe")
+        create_universe_btn.clicked.connect(self._create_universe_from_asset_screener)
+        controls_bottom.addWidget(create_universe_btn)
+
+        use_for_matrix_btn = QtWidgets.QPushButton("Use In Matrix")
+        use_for_matrix_btn.clicked.connect(self._use_asset_screener_for_matrix)
+        controls_bottom.addWidget(use_for_matrix_btn)
+        layout.addLayout(controls_bottom)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        table_panel = QtWidgets.QWidget()
+        table_panel.setObjectName("Panel")
+        table_layout = QtWidgets.QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        table_layout.setSpacing(8)
+        table_title = QtWidgets.QLabel("Screened Assets")
+        table_title.setObjectName("Title")
+        table_note = QtWidgets.QLabel(
+            "The screener keeps provider provenance visible. FinanceDatabase fills the broad catalog, while SimFin and defeatbeta contribute optional enrichment counts and event coverage."
+        )
+        table_note.setObjectName("Sub")
+        table_note.setWordWrap(True)
+        table_layout.addWidget(table_title)
+        table_layout.addWidget(table_note)
+
+        self.asset_screener_table = QtWidgets.QTableWidget(0, 10)
+        self.asset_screener_table.setHorizontalHeaderLabels(
+            ["Symbol", "Name", "Class", "Sector", "Country", "Status", "Sources", "Market Cap", "Beta", "Datasets"]
+        )
+        self.asset_screener_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.asset_screener_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.asset_screener_table.setAlternatingRowColors(True)
+        self.asset_screener_table.horizontalHeader().setStretchLastSection(True)
+        self.asset_screener_table.verticalHeader().setVisible(False)
+        self.asset_screener_table.setObjectName("Panel")
+        self.asset_screener_table.itemSelectionChanged.connect(self._update_asset_screener_detail)
+        table_layout.addWidget(self.asset_screener_table, 1)
+        split.addWidget(table_panel)
+
+        detail_panel = QtWidgets.QWidget()
+        detail_panel.setObjectName("Panel")
+        detail_layout = QtWidgets.QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
+        detail_layout.setSpacing(8)
+        detail_title = QtWidgets.QLabel("Screener Detail")
+        detail_title.setObjectName("Title")
+        detail_note = QtWidgets.QLabel(
+            "Use this pane to inspect provider coverage, acquisition readiness, and the descriptive fundamentals already stored for the selected asset."
+        )
+        detail_note.setObjectName("Sub")
+        detail_note.setWordWrap(True)
+        detail_layout.addWidget(detail_title)
+        detail_layout.addWidget(detail_note)
+
+        self.asset_screener_detail = QtWidgets.QPlainTextEdit()
+        self.asset_screener_detail.setReadOnly(True)
+        self.asset_screener_detail.setObjectName("Panel")
+        self.asset_screener_detail.setPlainText("Select an asset to inspect its screener detail.")
+        detail_layout.addWidget(self.asset_screener_detail, 1)
+        split.addWidget(detail_panel)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+
+        self._refresh_asset_screener_tab()
+        return panel
+
+    @staticmethod
+    def _parse_optional_float(text: str) -> float | None:
+        raw = str(text or "").strip().replace(",", "")
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _format_market_cap(value: object) -> str:
+        if value is None or pd.isna(value):
+            return "—"
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if abs(numeric) >= 1_000_000_000:
+            return f"{numeric / 1_000_000_000:.2f}B"
+        if abs(numeric) >= 1_000_000:
+            return f"{numeric / 1_000_000:.1f}M"
+        return f"{numeric:,.0f}"
+
+    def _asset_screener_sources_label(self, row: dict) -> str:
+        labels: list[str] = []
+        profile_source = str(row.get("profile_source") or "").strip()
+        if profile_source:
+            labels.append(profile_source)
+        if int(row.get("simfin_payload_count", 0) or 0) > 0:
+            labels.append(f"SimFin {int(row.get('simfin_payload_count', 0) or 0)}")
+        if int(row.get("defeatbeta_payload_count", 0) or 0) > 0:
+            labels.append(f"defeatbeta {int(row.get('defeatbeta_payload_count', 0) or 0)}")
+        return ", ".join(labels) if labels else "—"
+
+    def _refresh_asset_screener_tab(self, *, announce: bool = False) -> None:
+        if not hasattr(self, "asset_screener_table"):
+            return
+        selected_asset_id = self._selected_asset_screener_asset_id()
+        current_class = str(self.asset_screener_class_combo.currentData() or "") if hasattr(self, "asset_screener_class_combo") else ""
+        current_sector = str(self.asset_screener_sector_combo.currentData() or "") if hasattr(self, "asset_screener_sector_combo") else ""
+        current_country = str(self.asset_screener_country_combo.currentData() or "") if hasattr(self, "asset_screener_country_combo") else ""
+
+        if self.asset_catalog_frame.empty:
+            self.asset_catalog_frame = self.catalog.load_asset_catalog()
+        enrichment = self.catalog.load_asset_screener_enrichment()
+        frame = self.asset_catalog_frame.copy()
+        if not enrichment.empty:
+            frame = frame.merge(enrichment, on="asset_id", how="left")
+        for column in (
+            "market_cap",
+            "shares_outstanding",
+            "beta",
+            "description",
+            "website",
+            "employee_count",
+            "profile_source",
+            "profile_as_of_date",
+            "provider_payload_count",
+            "simfin_payload_count",
+            "defeatbeta_payload_count",
+            "defeatbeta_earnings_count",
+            "defeatbeta_news_count",
+            "provider_last_sync_at",
+            "latest_earnings_date",
+            "latest_news_date",
+        ):
+            if column not in frame.columns:
+                frame[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta"} else ""
+        self.asset_screener_frame = frame
+
+        classes = sorted(
+            {
+                str(value).strip()
+                for value in frame.get("asset_class", pd.Series(dtype=str)).fillna("Unclassified")
+                if str(value).strip()
+            }
+        )
+        sectors = sorted({str(value).strip() for value in frame.get("sector", pd.Series(dtype=str)).fillna("") if str(value).strip()})
+        countries = sorted({str(value).strip() for value in frame.get("country", pd.Series(dtype=str)).fillna("") if str(value).strip()})
+
+        self.asset_screener_class_combo.blockSignals(True)
+        self.asset_screener_class_combo.clear()
+        self.asset_screener_class_combo.addItem("All Classes", "")
+        for item in classes:
+            self.asset_screener_class_combo.addItem(item, item)
+        idx = self.asset_screener_class_combo.findData(current_class)
+        self.asset_screener_class_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.asset_screener_class_combo.blockSignals(False)
+
+        self.asset_screener_sector_combo.blockSignals(True)
+        self.asset_screener_sector_combo.clear()
+        self.asset_screener_sector_combo.addItem("All Sectors", "")
+        for item in sectors:
+            self.asset_screener_sector_combo.addItem(item, item)
+        idx = self.asset_screener_sector_combo.findData(current_sector)
+        self.asset_screener_sector_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.asset_screener_sector_combo.blockSignals(False)
+
+        self.asset_screener_country_combo.blockSignals(True)
+        self.asset_screener_country_combo.clear()
+        self.asset_screener_country_combo.addItem("All Countries", "")
+        for item in countries:
+            self.asset_screener_country_combo.addItem(item, item)
+        idx = self.asset_screener_country_combo.findData(current_country)
+        self.asset_screener_country_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.asset_screener_country_combo.blockSignals(False)
+
+        self._apply_asset_screener_filters(selected_asset_id=selected_asset_id)
+        if announce:
+            self.status_label.setText(f"Asset screener refreshed ({len(self.asset_screener_frame)} assets).")
+
+    def _apply_asset_screener_filters(self, *_args, selected_asset_id: str | None = None) -> None:
+        if not hasattr(self, "asset_screener_table"):
+            return
+        frame = self.asset_screener_frame.copy()
+        if frame.empty:
+            self.asset_screener_filtered_frame = frame
+            self.asset_screener_table.setRowCount(0)
+            self.asset_screener_summary_label.setText("No screener records are available yet.")
+            self.asset_screener_detail.setPlainText("No assets are available for screening yet.")
+            return
+
+        for column in ("display_symbol", "name", "asset_class", "country", "sector", "industry", "dataset_status", "description"):
+            if column not in frame.columns:
+                frame[column] = ""
+        frame["asset_class"] = frame["asset_class"].fillna("").replace("", "Unclassified")
+        frame["dataset_status"] = frame["dataset_status"].fillna("").replace("", "Untracked")
+
+        search_text = self.asset_screener_search_edit.text().strip().lower() if hasattr(self, "asset_screener_search_edit") else ""
+        if search_text:
+            haystack = (
+                frame["symbol"].fillna("").astype(str)
+                + " "
+                + frame["display_symbol"].fillna("").astype(str)
+                + " "
+                + frame["name"].fillna("").astype(str)
+                + " "
+                + frame["country"].fillna("").astype(str)
+                + " "
+                + frame["sector"].fillna("").astype(str)
+                + " "
+                + frame["industry"].fillna("").astype(str)
+                + " "
+                + frame["description"].fillna("").astype(str)
+            ).str.lower()
+            frame = frame.loc[haystack.str.contains(re.escape(search_text), regex=True, na=False)].copy()
+
+        selected_class = str(self.asset_screener_class_combo.currentData() or "") if hasattr(self, "asset_screener_class_combo") else ""
+        if selected_class:
+            frame = frame.loc[frame["asset_class"].astype(str) == selected_class].copy()
+
+        selected_status = str(self.asset_screener_status_combo.currentData() or "") if hasattr(self, "asset_screener_status_combo") else ""
+        if selected_status:
+            frame = frame.loc[frame["dataset_status"].astype(str) == selected_status].copy()
+
+        selected_sector = str(self.asset_screener_sector_combo.currentData() or "") if hasattr(self, "asset_screener_sector_combo") else ""
+        if selected_sector:
+            frame = frame.loc[frame["sector"].astype(str) == selected_sector].copy()
+
+        selected_country = str(self.asset_screener_country_combo.currentData() or "") if hasattr(self, "asset_screener_country_combo") else ""
+        if selected_country:
+            frame = frame.loc[frame["country"].astype(str) == selected_country].copy()
+
+        provider_filter = str(self.asset_screener_provider_combo.currentData() or "") if hasattr(self, "asset_screener_provider_combo") else ""
+        if provider_filter == "simfin":
+            frame = frame.loc[pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0) > 0].copy()
+        elif provider_filter == "defeatbeta":
+            frame = frame.loc[pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0) > 0].copy()
+        elif provider_filter == "simfin_or_defeatbeta":
+            has_provider = (
+                pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0)
+                + pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0)
+            ) > 0
+            frame = frame.loc[has_provider].copy()
+        elif provider_filter == "earnings":
+            frame = frame.loc[pd.to_numeric(frame["defeatbeta_earnings_count"], errors="coerce").fillna(0) > 0].copy()
+        elif provider_filter == "news":
+            frame = frame.loc[pd.to_numeric(frame["defeatbeta_news_count"], errors="coerce").fillna(0) > 0].copy()
+
+        min_market_cap_billions = self._parse_optional_float(self.asset_screener_min_market_cap_edit.text()) if hasattr(self, "asset_screener_min_market_cap_edit") else None
+        if min_market_cap_billions is not None:
+            frame = frame.loc[pd.to_numeric(frame["market_cap"], errors="coerce").fillna(-np.inf) >= (min_market_cap_billions * 1_000_000_000.0)].copy()
+
+        max_beta = self._parse_optional_float(self.asset_screener_max_beta_edit.text()) if hasattr(self, "asset_screener_max_beta_edit") else None
+        if max_beta is not None:
+            frame = frame.loc[pd.to_numeric(frame["beta"], errors="coerce").fillna(np.inf) <= max_beta].copy()
+
+        frame = frame.sort_values(["symbol", "name"], kind="stable").reset_index(drop=True)
+        self.asset_screener_filtered_frame = frame
+        self._render_asset_screener_table(preferred_asset_id=selected_asset_id)
+        if hasattr(self, "correlation_universe_combo") and self.correlation_universe_combo.findData("__screener__") >= 0:
+            self._refresh_correlation_universe_options()
+
+    def _render_asset_screener_table(self, *, preferred_asset_id: str | None = None) -> None:
+        frame = self.asset_screener_filtered_frame.copy()
+        render_frame = frame.head(1500).copy()
+        self.asset_screener_table.setRowCount(len(render_frame))
+        status_colors = {
+            "Ready": PALETTE["green"],
+            "Error": PALETTE["red"],
+            "Tracked": PALETTE["amber"],
+            "Untracked": PALETTE["muted"],
+        }
+        for row_idx, (_, row) in enumerate(render_frame.iterrows()):
+            values = [
+                str(row.get("display_symbol") or row.get("symbol") or ""),
+                str(row.get("name") or row.get("symbol") or ""),
+                str(row.get("asset_class") or "Unclassified"),
+                str(row.get("sector") or "—"),
+                str(row.get("country") or "—"),
+                str(row.get("dataset_status") or "Untracked"),
+                self._asset_screener_sources_label(row.to_dict()),
+                self._format_market_cap(row.get("market_cap")),
+                self._deployment_fmt_ratio(row.get("beta")) if pd.notna(row.get("beta")) else "—",
+                str(int(row.get("dataset_count", 0) or 0)),
+            ]
+            for col_idx, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if col_idx == 0:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("asset_id") or ""))
+                if col_idx == 5:
+                    item.setForeground(QtGui.QColor(status_colors.get(value, PALETTE["text"])))
+                self.asset_screener_table.setItem(row_idx, col_idx, item)
+
+        if frame.empty:
+            self.asset_screener_summary_label.setText("No assets match the current screener filters.")
+            self.asset_screener_detail.setPlainText("No assets match the current screener filters.")
+            return
+
+        provider_ready_count = int(
+            (
+                pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0)
+                + pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0)
+            ).gt(0).sum()
+        )
+        rendered_note = f" | Rendered first {len(render_frame)}" if len(frame) > len(render_frame) else ""
+        self.asset_screener_summary_label.setText(
+            f"Showing {len(frame)} assets{rendered_note} | Provider-enriched: {provider_ready_count} | "
+            f"Tracked datasets: {int(pd.to_numeric(frame['dataset_count'], errors='coerce').fillna(0).gt(0).sum())}"
+        )
+
+        selected_row = 0
+        if preferred_asset_id:
+            matches = render_frame.index[render_frame["asset_id"].astype(str) == str(preferred_asset_id)].tolist()
+            if matches:
+                selected_row = int(matches[0])
+        self.asset_screener_table.selectRow(selected_row)
+        self._update_asset_screener_detail()
+
+    def _selected_asset_screener_asset_id(self) -> str | None:
+        if not hasattr(self, "asset_screener_table"):
+            return None
+        selection_model = self.asset_screener_table.selectionModel()
+        if selection_model is None:
+            return None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None
+        item = self.asset_screener_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        asset_id = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+        return str(asset_id).strip() or None
+
+    def _update_asset_screener_detail(self) -> None:
+        if not hasattr(self, "asset_screener_detail"):
+            return
+        asset_id = self._selected_asset_screener_asset_id()
+        if not asset_id or self.asset_screener_filtered_frame.empty:
+            self.asset_screener_detail.setPlainText("Select an asset to inspect its screener detail.")
+            return
+        match = self.asset_screener_filtered_frame.loc[
+            self.asset_screener_filtered_frame["asset_id"].astype(str) == str(asset_id)
+        ]
+        if match.empty:
+            self.asset_screener_detail.setPlainText("Select an asset to inspect its screener detail.")
+            return
+        row = match.iloc[0].to_dict()
+        provider_payload_summary = self.catalog.load_asset_provider_payload_summary(asset_id)
+        lines = [
+            f"Symbol: {row.get('display_symbol') or row.get('symbol') or '—'}",
+            f"Name: {row.get('name') or '—'}",
+            f"Asset Class: {row.get('asset_class') or 'Unclassified'}",
+            f"Security Type: {row.get('security_type') or '—'}",
+            f"Exchange: {row.get('exchange') or '—'}",
+            f"Country: {row.get('country') or '—'}",
+            f"Sector: {row.get('sector') or '—'}",
+            f"Industry: {row.get('industry') or '—'}",
+            "",
+            f"Dataset Status: {row.get('dataset_status') or 'Untracked'}",
+            f"Tracked Datasets: {int(row.get('dataset_count', 0) or 0)}",
+            f"Latest Dataset ID: {row.get('latest_dataset_id') or '—'}",
+            f"Latest Source: {row.get('latest_source') or '—'}",
+            "",
+            f"Profile Source: {row.get('profile_source') or '—'}",
+            f"Profile As Of: {row.get('profile_as_of_date') or '—'}",
+            f"Market Cap: {self._format_market_cap(row.get('market_cap'))}",
+            f"Shares Outstanding: {self._format_market_cap(row.get('shares_outstanding'))}",
+            f"Beta: {self._deployment_fmt_ratio(row.get('beta'))}",
+            f"defeatbeta Earnings Rows: {int(row.get('defeatbeta_earnings_count', 0) or 0)}",
+            f"defeatbeta News Rows: {int(row.get('defeatbeta_news_count', 0) or 0)}",
+            f"Latest Earnings Date: {row.get('latest_earnings_date') or '—'}",
+            f"Latest News Date: {row.get('latest_news_date') or '—'}",
+            "",
+            "Provider Payload Coverage:",
+        ]
+        if provider_payload_summary:
+            for item in provider_payload_summary:
+                lines.append(
+                    f"{item.get('provider') or '—'} | {item.get('dataset_code') or '—'} | records={int(item.get('record_count') or 0)} | latest={item.get('latest_fetched_at') or '—'}"
+                )
+        else:
+            lines.append("No provider-native payload rows are cached for this asset yet.")
+        description = str(row.get("description") or "").strip()
+        if description:
+            lines.extend(["", "Description:", description])
+        self.asset_screener_detail.setPlainText("\n".join(lines))
+
+    def _create_universe_from_asset_screener(self) -> None:
+        frame = self.asset_screener_filtered_frame.copy()
+        if frame.empty:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Screener Results",
+                "Adjust the screener filters until at least one asset is selected before creating a universe.",
+            )
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Create Universe From Screener",
+            "Universe name:",
+            text="Screener Universe",
+        )
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            QtWidgets.QMessageBox.information(self, "Universe Name Required", "Enter a universe name.")
+            return
+        existing = next((item for item in self.universes if str(item.get("name") or "").strip().lower() == name.lower()), None)
+        universe_id = str(existing.get("universe_id") or "") if existing else f"screener_{uuid.uuid4().hex[:8]}"
+        symbols = [str(item).strip().upper() for item in frame["symbol"].fillna("").tolist() if str(item).strip()]
+        dataset_ids = [str(item).strip() for item in frame["latest_dataset_id"].fillna("").tolist() if str(item).strip()]
+        description = (
+            f"Built from Asset Screener on {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M UTC')} "
+            f"with {len(symbols)} symbols and {len(dataset_ids)} tracked datasets."
+        )
+        ResultCatalog(self.catalog.db_path).save_universe(
+            universe_id=universe_id,
+            name=name,
+            description=description,
+            symbols=symbols,
+            dataset_ids=dataset_ids,
+        )
+        self._load_universes()
+        self.status_label.setText(f"Universe '{name}' saved from screener results.")
+
+    def _build_correlation_matrix_tab(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        self.correlation_matrix_tab = panel
+        panel.setObjectName("Panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Correlation Matrix")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel(
+            "Compute on-demand covariance or correlation views for assets, sectors, strategies, and portfolio runs. Asset and sector views use local historical datasets; strategy and portfolio views reuse saved run artifacts."
+        )
+        subtitle.setObjectName("Sub")
+        subtitle.setWordWrap(True)
+        self.correlation_summary_label = QtWidgets.QLabel("No matrix has been computed yet.")
+        self.correlation_summary_label.setObjectName("Sub")
+        self.correlation_summary_label.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.correlation_summary_label)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(8)
+        self.correlation_mode_combo = QtWidgets.QComboBox()
+        self.correlation_mode_combo.addItem("Assets", "assets")
+        self.correlation_mode_combo.addItem("Sectors", "sectors")
+        self.correlation_mode_combo.addItem("Strategies", "strategies")
+        self.correlation_mode_combo.addItem("Portfolios", "portfolios")
+        controls.addWidget(self.correlation_mode_combo)
+
+        self.correlation_matrix_type_combo = QtWidgets.QComboBox()
+        self.correlation_matrix_type_combo.addItem("Correlation", "correlation")
+        self.correlation_matrix_type_combo.addItem("Covariance", "covariance")
+        controls.addWidget(self.correlation_matrix_type_combo)
+
+        self.correlation_universe_combo = QtWidgets.QComboBox()
+        controls.addWidget(self.correlation_universe_combo, 1)
+
+        self.correlation_lookback_spin = QtWidgets.QSpinBox()
+        self.correlation_lookback_spin.setRange(20, 5000)
+        self.correlation_lookback_spin.setValue(252)
+        self.correlation_lookback_spin.setSuffix(" bars")
+        controls.addWidget(self.correlation_lookback_spin)
+
+        self.correlation_max_series_spin = QtWidgets.QSpinBox()
+        self.correlation_max_series_spin.setRange(2, 30)
+        self.correlation_max_series_spin.setValue(8)
+        self.correlation_max_series_spin.setSuffix(" series")
+        controls.addWidget(self.correlation_max_series_spin)
+
+        refresh_btn = QtWidgets.QPushButton("Refresh Sources")
+        refresh_btn.clicked.connect(self._refresh_correlation_universe_options)
+        controls.addWidget(refresh_btn)
+
+        compute_btn = QtWidgets.QPushButton("Compute Matrix")
+        compute_btn.clicked.connect(self._compute_selected_correlation_matrix)
+        controls.addWidget(compute_btn)
+
+        screener_btn = QtWidgets.QPushButton("Use Screener Results")
+        screener_btn.clicked.connect(self._use_asset_screener_for_matrix)
+        controls.addWidget(screener_btn)
+        layout.addLayout(controls)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        self.correlation_matrix_table = QtWidgets.QTableWidget(0, 0)
+        self.correlation_matrix_table.setAlternatingRowColors(True)
+        self.correlation_matrix_table.verticalHeader().setVisible(False)
+        self.correlation_matrix_table.horizontalHeader().setStretchLastSection(False)
+        self.correlation_matrix_table.setObjectName("Panel")
+        split.addWidget(self.correlation_matrix_table)
+
+        self.correlation_detail = QtWidgets.QPlainTextEdit()
+        self.correlation_detail.setReadOnly(True)
+        self.correlation_detail.setObjectName("Panel")
+        self.correlation_detail.setPlainText("Compute a matrix to inspect the strongest relationships.")
+        split.addWidget(self.correlation_detail)
+        split.setSizes([430, 220])
+
+        self._refresh_correlation_universe_options()
+        return panel
+
+    def _refresh_correlation_universe_options(self) -> None:
+        if not hasattr(self, "correlation_universe_combo"):
+            return
+        current = str(self.correlation_universe_combo.currentData() or "")
+        self.correlation_universe_combo.blockSignals(True)
+        self.correlation_universe_combo.clear()
+        self.correlation_universe_combo.addItem("Current Screener Results", "__screener__")
+        self.correlation_universe_combo.addItem("Tracked Datasets", "__tracked__")
+        for universe in self.universes:
+            label = str(universe.get("name") or universe.get("universe_id") or "Universe")
+            self.correlation_universe_combo.addItem(label, str(universe.get("universe_id") or ""))
+        idx = self.correlation_universe_combo.findData(current)
+        self.correlation_universe_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.correlation_universe_combo.blockSignals(False)
+
+    def _preferred_dataset_id_by_symbol(self) -> dict[str, str]:
+        datasets = self.catalog.load_acquisition_datasets(include_untracked_local=True)
+        if datasets.empty:
+            return {}
+        working = datasets.copy()
+        working["symbol"] = working["symbol"].fillna("").astype(str).str.upper()
+        working["ingested"] = working["ingested"].astype(bool)
+        working["bar_count"] = pd.to_numeric(working["bar_count"], errors="coerce").fillna(0)
+        working["last_download_success_at"] = working["last_download_success_at"].fillna("")
+        working = working.sort_values(
+            ["symbol", "ingested", "last_download_success_at", "bar_count"],
+            ascending=[True, False, False, False],
+            kind="stable",
+        )
+        mapping: dict[str, str] = {}
+        for _, row in working.iterrows():
+            symbol = str(row.get("symbol") or "").strip().upper()
+            dataset_id = str(row.get("dataset_id") or "").strip()
+            if symbol and dataset_id and symbol not in mapping:
+                mapping[symbol] = dataset_id
+        return mapping
+
+    def _candidate_dataset_ids_for_matrix(self, source_id: str, *, max_items: int) -> list[str]:
+        dataset_ids: list[str] = []
+        if source_id == "__screener__":
+            frame = self.asset_screener_filtered_frame if not self.asset_screener_filtered_frame.empty else self.asset_screener_frame
+            if frame.empty:
+                return []
+            dataset_map = self._preferred_dataset_id_by_symbol()
+            for _, row in frame.iterrows():
+                dataset_id = str(row.get("latest_dataset_id") or "").strip()
+                if not dataset_id:
+                    dataset_id = dataset_map.get(str(row.get("symbol") or "").strip().upper(), "")
+                if dataset_id and dataset_id not in dataset_ids:
+                    dataset_ids.append(dataset_id)
+                if len(dataset_ids) >= max_items:
+                    break
+            return dataset_ids
+        if source_id == "__tracked__":
+            datasets = self.catalog.load_acquisition_datasets(include_untracked_local=True)
+            if datasets.empty:
+                return []
+            working = datasets.copy()
+            working["ingested"] = working["ingested"].astype(bool)
+            working["bar_count"] = pd.to_numeric(working["bar_count"], errors="coerce").fillna(0)
+            working = working.sort_values(["ingested", "bar_count"], ascending=[False, False], kind="stable")
+            for dataset_id in working["dataset_id"].fillna("").astype(str).tolist():
+                if dataset_id and dataset_id not in dataset_ids:
+                    dataset_ids.append(dataset_id)
+                if len(dataset_ids) >= max_items:
+                    break
+            return dataset_ids
+        universe = self._find_universe(source_id)
+        if universe is None:
+            return []
+        for dataset_id in [str(item).strip() for item in list(universe.get("dataset_ids") or []) if str(item).strip()]:
+            if dataset_id not in dataset_ids:
+                dataset_ids.append(dataset_id)
+            if len(dataset_ids) >= max_items:
+                return dataset_ids
+        dataset_map = self._preferred_dataset_id_by_symbol()
+        for symbol in [str(item).strip().upper() for item in list(universe.get("symbols") or []) if str(item).strip()]:
+            dataset_id = dataset_map.get(symbol, "")
+            if dataset_id and dataset_id not in dataset_ids:
+                dataset_ids.append(dataset_id)
+            if len(dataset_ids) >= max_items:
+                break
+        return dataset_ids
+
+    def _load_asset_return_series(self, dataset_ids: Sequence[str], *, lookback_bars: int) -> dict[str, pd.Series]:
+        series: dict[str, pd.Series] = {}
+        duck = DuckDBStore()
+        try:
+            for dataset_id in list(dataset_ids or []):
+                try:
+                    bars = duck.load(str(dataset_id), columns=("timestamp", "close"))
+                except Exception:
+                    continue
+                if bars is None or bars.empty or "close" not in bars.columns:
+                    continue
+                returns = pd.to_numeric(bars["close"], errors="coerce").astype(float).pct_change()
+                returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+                if lookback_bars > 0:
+                    returns = returns.tail(int(lookback_bars))
+                if len(returns) >= 2:
+                    series[str(dataset_id)] = returns
+        finally:
+            duck.close()
+        return series
+
+    def _build_sector_return_series(self, dataset_ids: Sequence[str], *, lookback_bars: int) -> dict[str, pd.Series]:
+        asset_series = self._load_asset_return_series(dataset_ids, lookback_bars=lookback_bars)
+        if not asset_series:
+            return {}
+        screener_frame = self.asset_screener_frame if not self.asset_screener_frame.empty else pd.DataFrame()
+        dataset_to_sector: dict[str, str] = {}
+        symbol_to_sector: dict[str, str] = {}
+        if not screener_frame.empty:
+            for _, row in screener_frame.iterrows():
+                dataset_id = str(row.get("latest_dataset_id") or "").strip()
+                sector = str(row.get("sector") or "").strip()
+                if dataset_id and sector and dataset_id not in dataset_to_sector:
+                    dataset_to_sector[dataset_id] = sector
+                symbol = str(row.get("symbol") or "").strip().upper()
+                if symbol and sector and symbol not in symbol_to_sector:
+                    symbol_to_sector[symbol] = sector
+        grouped: dict[str, list[pd.Series]] = {}
+        for dataset_id, returns in asset_series.items():
+            sector = dataset_to_sector.get(dataset_id, "")
+            if not sector:
+                sector = symbol_to_sector.get(self._symbol_from_dataset_id(dataset_id), "")
+            if not sector:
+                continue
+            grouped.setdefault(sector, []).append(returns.rename(dataset_id))
+        series: dict[str, pd.Series] = {}
+        for sector, items in grouped.items():
+            frame = pd.concat(items, axis=1).dropna(how="all")
+            if frame.empty:
+                continue
+            averaged = frame.mean(axis=1, skipna=True).dropna()
+            if len(averaged) >= 2:
+                series[sector] = averaged.rename(sector)
+        return series
+
+    def _latest_strategy_runs_for_matrix(self, *, max_items: int) -> list[RunRow]:
+        selected: list[RunRow] = []
+        seen: set[str] = set()
+        for run in self.catalog.load_runs():
+            if str(run.status or "") != "finished":
+                continue
+            if str(run.engine_impl or "").lower() == "vectorized_portfolio":
+                continue
+            label = f"{run.strategy}:{run.dataset_id}"
+            if label in seen:
+                continue
+            selected.append(run)
+            seen.add(label)
+            if len(selected) >= max_items:
+                break
+        return selected
+
+    def _latest_portfolio_runs_for_matrix(self, *, max_items: int) -> list[RunRow]:
+        selected: list[RunRow] = []
+        seen: set[str] = set()
+        for run in self.catalog.load_runs():
+            if str(run.status or "") != "finished":
+                continue
+            if str(run.engine_impl or "").lower() != "vectorized_portfolio":
+                continue
+            label = f"{run.strategy}:{run.dataset_id}"
+            if label in seen:
+                continue
+            selected.append(run)
+            seen.add(label)
+            if len(selected) >= max_items:
+                break
+        return selected
+
+    def _return_series_from_run(self, run: RunRow, *, lookback_bars: int) -> pd.Series | None:
+        bars = RunChartDialog._load_bars_utc_static(run)
+        if bars is None or bars.empty:
+            return None
+        trades_df = ChartSnapshotExporter.build_trade_frame(run, self.catalog.db_path, bars)
+        equity = ChartSnapshotExporter.build_equity_curve(run, bars, trades_df)
+        returns = pd.to_numeric(equity, errors="coerce").astype(float).pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if lookback_bars > 0:
+            returns = returns.tail(int(lookback_bars))
+        return returns if len(returns) >= 2 else None
+
+    def _return_series_from_portfolio_run(self, run: RunRow, *, lookback_bars: int) -> pd.Series | None:
+        try:
+            portfolio_result = self._rebuild_portfolio_result_for_run(run)
+        except Exception:
+            return None
+        equity = pd.to_numeric(getattr(portfolio_result, "portfolio_equity_curve", pd.Series(dtype=float)), errors="coerce").astype(float)
+        returns = equity.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if lookback_bars > 0:
+            returns = returns.tail(int(lookback_bars))
+        return returns if len(returns) >= 2 else None
+
+    @staticmethod
+    def _matrix_item_color(value: float, *, max_abs: float) -> QtGui.QColor:
+        if not np.isfinite(value) or max_abs <= 0:
+            return QtGui.QColor(PALETTE["panel"])
+        ratio = min(1.0, abs(float(value)) / max_abs)
+        if value >= 0:
+            return QtGui.QColor(39, 208, 125, int(35 + (155 * ratio)))
+        return QtGui.QColor(255, 77, 109, int(35 + (155 * ratio)))
+
+    def _render_correlation_matrix(self, matrix: pd.DataFrame, *, matrix_kind: str) -> None:
+        self.correlation_matrix_table.clear()
+        if matrix is None or matrix.empty:
+            self.correlation_matrix_table.setRowCount(0)
+            self.correlation_matrix_table.setColumnCount(0)
+            return
+        columns = [str(col) for col in matrix.columns]
+        self.correlation_matrix_table.setRowCount(len(columns))
+        self.correlation_matrix_table.setColumnCount(len(columns))
+        self.correlation_matrix_table.setHorizontalHeaderLabels(columns)
+        self.correlation_matrix_table.setVerticalHeaderLabels(columns)
+        values = matrix.to_numpy(dtype=float, copy=True)
+        finite = np.abs(values[np.isfinite(values)])
+        max_abs = float(np.nanmax(finite)) if finite.size else 1.0
+        for row_idx, row_name in enumerate(columns):
+            for col_idx, col_name in enumerate(columns):
+                value = matrix.loc[row_name, col_name]
+                if pd.isna(value):
+                    text = "—"
+                elif matrix_kind == "correlation":
+                    text = f"{float(value):.3f}"
+                else:
+                    text = f"{float(value):.6f}"
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                if pd.notna(value):
+                    item.setBackground(self._matrix_item_color(float(value), max_abs=max_abs))
+                self.correlation_matrix_table.setItem(row_idx, col_idx, item)
+        self.correlation_matrix_table.resizeColumnsToContents()
+
+    def _compute_selected_correlation_matrix(self) -> None:
+        if not hasattr(self, "correlation_matrix_table"):
+            return
+        mode = str(self.correlation_mode_combo.currentData() or "assets")
+        matrix_kind = str(self.correlation_matrix_type_combo.currentData() or "correlation")
+        lookback_bars = int(self.correlation_lookback_spin.value())
+        max_items = int(self.correlation_max_series_spin.value())
+        source_id = str(self.correlation_universe_combo.currentData() or "__screener__")
+
+        series_map: dict[str, pd.Series] = {}
+        notes: list[str] = []
+        skipped: list[str] = []
+
+        if mode == "assets":
+            dataset_ids = self._candidate_dataset_ids_for_matrix(source_id, max_items=max_items)
+            notes.append(f"Datasets considered: {', '.join(dataset_ids) if dataset_ids else 'None'}")
+            series_map = self._load_asset_return_series(dataset_ids, lookback_bars=lookback_bars)
+            skipped.extend([dataset_id for dataset_id in dataset_ids if dataset_id not in series_map])
+        elif mode == "sectors":
+            dataset_ids = self._candidate_dataset_ids_for_matrix(source_id, max_items=max_items * 3)
+            notes.append(f"Dataset pool: {', '.join(dataset_ids) if dataset_ids else 'None'}")
+            series_map = self._build_sector_return_series(dataset_ids, lookback_bars=lookback_bars)
+        elif mode == "strategies":
+            runs = self._latest_strategy_runs_for_matrix(max_items=max_items)
+            notes.append(f"Strategy runs: {', '.join(f'{run.strategy}:{run.dataset_id}' for run in runs) if runs else 'None'}")
+            for run in runs:
+                label = f"{run.strategy}:{run.dataset_id}"
+                returns = self._return_series_from_run(run, lookback_bars=lookback_bars)
+                if returns is None:
+                    skipped.append(label)
+                    continue
+                series_map[label] = returns.rename(label)
+        else:
+            runs = self._latest_portfolio_runs_for_matrix(max_items=max_items)
+            notes.append(f"Portfolio runs: {', '.join(f'{run.strategy}:{run.dataset_id}' for run in runs) if runs else 'None'}")
+            for run in runs:
+                label = f"{run.strategy}:{run.dataset_id}"
+                returns = self._return_series_from_portfolio_run(run, lookback_bars=lookback_bars)
+                if returns is None:
+                    skipped.append(label)
+                    continue
+                series_map[label] = returns.rename(label)
+
+        if len(series_map) < 2:
+            self.correlation_matrix_frame = pd.DataFrame()
+            self._render_correlation_matrix(self.correlation_matrix_frame, matrix_kind=matrix_kind)
+            detail_lines = ["Not enough return series were available to compute a matrix."]
+            if notes:
+                detail_lines.extend(["", *notes])
+            if skipped:
+                detail_lines.extend(["", f"Skipped: {', '.join(skipped)}"])
+            self.correlation_detail.setPlainText("\n".join(detail_lines))
+            self.correlation_summary_label.setText("No matrix could be computed from the current selection.")
+            return
+
+        aligned = pd.concat(series_map, axis=1).sort_index().dropna(how="all")
+        if aligned.empty:
+            self.correlation_matrix_frame = pd.DataFrame()
+            self._render_correlation_matrix(self.correlation_matrix_frame, matrix_kind=matrix_kind)
+            self.correlation_detail.setPlainText("The selected return series did not have overlapping observations.")
+            self.correlation_summary_label.setText("No overlapping observations were available for the matrix.")
+            return
+
+        matrix = aligned.corr() if matrix_kind == "correlation" else aligned.cov()
+        self.correlation_matrix_frame = matrix
+        self._render_correlation_matrix(matrix, matrix_kind=matrix_kind)
+
+        pairs: list[tuple[float, str, str]] = []
+        columns = list(matrix.columns)
+        for left_idx, left_name in enumerate(columns):
+            for right_name in columns[left_idx + 1 :]:
+                value = matrix.loc[left_name, right_name]
+                if pd.isna(value):
+                    continue
+                pairs.append((float(value), str(left_name), str(right_name)))
+        strongest = sorted(pairs, key=lambda item: abs(item[0]), reverse=True)[:8]
+        detail_lines = [
+            f"Mode: {mode.title()}",
+            f"Matrix Type: {matrix_kind.title()}",
+            f"Series: {len(series_map)}",
+            f"Observations: {len(aligned)}",
+        ]
+        if strongest:
+            detail_lines.extend(["", "Strongest Pairs:"])
+            for value, left_name, right_name in strongest:
+                detail_lines.append(f"{left_name} <> {right_name}: {value:.4f}")
+        if notes:
+            detail_lines.extend(["", *notes])
+        if skipped:
+            detail_lines.extend(["", f"Skipped: {', '.join(skipped)}"])
+        self.correlation_detail.setPlainText("\n".join(detail_lines))
+        self.correlation_summary_label.setText(
+            f"{matrix_kind.title()} matrix computed for {len(series_map)} {mode} series across {len(aligned)} observations."
+        )
+
+    def _use_asset_screener_for_matrix(self) -> None:
+        if not hasattr(self, "correlation_universe_combo"):
+            return
+        idx = self.correlation_universe_combo.findData("__screener__")
+        if idx >= 0:
+            self.correlation_universe_combo.setCurrentIndex(idx)
+        if hasattr(self, "tabs") and getattr(self, "correlation_matrix_tab", None) is not None:
+            self.tabs.setCurrentWidget(self.correlation_matrix_tab)
+        self._compute_selected_correlation_matrix()
+
     def _build_universe_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         self.universe_tab = panel
@@ -7941,7 +12058,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         title.setObjectName("Title")
         subtitle = QtWidgets.QLabel(
             "Create reusable universes of provider symbols and local datasets. "
-            "Universes can be reused in Orchestrate and Automate."
+            "Universes can be reused in Orchestrate and Data Collection."
         )
         subtitle.setObjectName("Sub")
         subtitle.setWordWrap(True)
@@ -8176,6 +12293,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.study_universe_id = resolved_id
             elif combo_name == "download_universe_combo":
                 self.download_universe_id = resolved_id
+        self._refresh_correlation_universe_options()
         self._update_study_dataset_summary()
         self._update_ticker_summary()
 
@@ -8251,7 +12369,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
             )
             return
         current_symbols = set(self._parse_text_tokens(self.universe_symbols_edit.toPlainText(), uppercase=True))
-        dlg = TickerPickerDialog(self.nasdaq_symbols, current_symbols, self)
+        dlg = TickerPickerDialog(
+            self.nasdaq_symbols,
+            current_symbols,
+            self,
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=self.picker_snapshot_frame(),
+        )
         if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return
         self.universe_symbols_edit.setPlainText("\n".join(sorted(set(dlg.selected))))
@@ -8268,7 +12392,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.universe_dataset_summary.setPlaceholderText("No local datasets selected")
             self.universe_dataset_summary.setToolTip("")
             return
-        label = ", ".join(dataset_ids) if len(dataset_ids) <= 3 else f"{len(dataset_ids)} datasets selected"
+        label = _format_dataset_scope_label(dataset_ids, frame=self.picker_snapshot_frame())
         self.universe_dataset_summary.setText(label)
         self.universe_dataset_summary.setToolTip("\n".join(dataset_ids))
 
@@ -8287,14 +12411,25 @@ class DashboardWindow(QtWidgets.QMainWindow):
             )
             return
 
-        tracked_rows = self.catalog.load_acquisition_datasets()
-        matched_rows = [
-            row
-            for row in tracked_rows
-            if row.dataset_id in dataset_ids or (row.symbol and str(row.symbol).upper() in symbols)
-        ]
-        matched_dataset_ids = {row.dataset_id for row in matched_rows}
-        matched_symbols = {str(row.symbol).upper() for row in matched_rows if row.symbol}
+        tracked_frame = self.catalog.load_acquisition_datasets()
+        if tracked_frame.empty:
+            self.universe_acquisition_summary.setPlainText(
+                "No tracked acquisition metadata exists yet for this universe.\n\n"
+                "Download or ingest at least one matching symbol/dataset to populate freshness, coverage, and failure state."
+            )
+            return
+        match_mask = pd.Series(False, index=tracked_frame.index)
+        if dataset_ids and "dataset_id" in tracked_frame.columns:
+            match_mask = match_mask | tracked_frame["dataset_id"].astype(str).isin(dataset_ids)
+        if symbols and "symbol" in tracked_frame.columns:
+            match_mask = match_mask | tracked_frame["symbol"].astype(str).str.upper().isin(symbols)
+        matched_frame = tracked_frame[match_mask].reset_index(drop=True)
+        matched_dataset_ids = set(matched_frame.get("dataset_id", pd.Series(dtype=object)).dropna().astype(str))
+        matched_symbols = {
+            str(item).upper()
+            for item in list(matched_frame.get("symbol", pd.Series(dtype=object)).dropna().astype(str))
+            if str(item).strip()
+        }
         fresh_count = 0
         stale_count = 0
         unknown_count = 0
@@ -8308,30 +12443,30 @@ class DashboardWindow(QtWidgets.QMainWindow):
         last_attempt_times: list[pd.Timestamp] = []
         recent_failures: list[str] = []
 
-        for row in matched_rows:
-            if row.source:
-                sources.add(str(row.source))
-            if row.ingested:
+        for row in matched_frame.to_dict("records"):
+            if row.get("source"):
+                sources.add(str(row.get("source")))
+            if bool(row.get("ingested")):
                 ingested_count += 1
-            freshness = compute_freshness_state(row.coverage_end, row.resolution)
+            freshness = compute_freshness_state(row.get("coverage_end"), row.get("resolution"))
             if freshness == "fresh":
                 fresh_count += 1
             elif freshness == "stale":
                 stale_count += 1
             else:
                 unknown_count += 1
-            if row.last_status in {"download_error", "ingest_error", "failed"}:
+            if row.get("last_status") in {"download_error", "ingest_error", "failed"}:
                 error_count += 1
                 recent_failures.append(
-                    f"- {row.dataset_id}: {row.last_status} | {row.last_error or 'No details recorded.'}"
+                    f"- {row.get('dataset_id')}: {row.get('last_status')} | {row.get('last_error') or 'No details recorded.'}"
                 )
-            elif row.last_status == "skipped":
+            elif row.get("last_status") == "skipped":
                 skipped_count += 1
 
-            start_ts = pd.to_datetime(row.coverage_start, utc=True, errors="coerce")
-            end_ts = pd.to_datetime(row.coverage_end, utc=True, errors="coerce")
-            success_ts = pd.to_datetime(row.last_download_success_at, utc=True, errors="coerce")
-            attempt_ts = pd.to_datetime(row.last_download_attempt_at, utc=True, errors="coerce")
+            start_ts = pd.to_datetime(row.get("coverage_start"), utc=True, errors="coerce")
+            end_ts = pd.to_datetime(row.get("coverage_end"), utc=True, errors="coerce")
+            success_ts = pd.to_datetime(row.get("last_download_success_at"), utc=True, errors="coerce")
+            attempt_ts = pd.to_datetime(row.get("last_download_attempt_at"), utc=True, errors="coerce")
             if pd.notna(start_ts):
                 coverage_starts.append(start_ts)
             if pd.notna(end_ts):
@@ -8358,7 +12493,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         lines = [
             f"Preferred Source: {provider_display_name(preferred_source) if preferred_source else 'Any Source'}",
             f"Symbols In Draft: {len(symbols)} | Dataset Bindings: {len(dataset_ids)}",
-            f"Tracked Acquisition Datasets: {len(matched_rows)} | Ingested: {ingested_count}",
+            f"Tracked Acquisition Datasets: {len(matched_frame)} | Ingested: {ingested_count}",
             f"Fresh: {fresh_count} | Stale: {stale_count} | Unknown: {unknown_count} | Recent Failures: {error_count} | Recent Skips: {skipped_count}",
             f"Coverage Window: {coverage_window}",
             f"Last Successful Download: {_fmt_timestamp(max(last_success_times) if last_success_times else None)}",
@@ -8386,7 +12521,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if not available:
             QtWidgets.QMessageBox.information(self, "No datasets", "No datasets are available in the local store yet.")
             return
-        dlg = DatasetSelectionDialog(available, list(self._editing_universe_dataset_ids), self)
+        dlg = DatasetSelectionDialog(
+            available,
+            list(self._editing_universe_dataset_ids),
+            self,
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=self.picker_snapshot_frame(),
+        )
         if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return
         self._editing_universe_dataset_ids = dlg.selected_datasets()
@@ -8490,8 +12631,72 @@ class DashboardWindow(QtWidgets.QMainWindow):
             default_source=DEFAULT_ACQUISITION_PROVIDER,
         )
 
-    def _provider_runtime_environment(self, provider_id: str) -> dict[str, str]:
-        return build_provider_runtime_environment(provider_id, catalog=self.catalog)
+    def _provider_runtime_environment(self, provider_id: str, meta: dict | None = None) -> dict[str, str]:
+        normalized = str(provider_id or "").strip().lower()
+        if normalized != "interactive_brokers":
+            return build_provider_runtime_environment(provider_id, catalog=self.catalog)
+        assigned_client_id = None
+        if meta is not None:
+            assigned_client_id = meta.get("assigned_client_id")
+        if assigned_client_id is None:
+            base_env = build_provider_runtime_environment(provider_id, catalog=self.catalog)
+            try:
+                candidate = int(str(base_env.get("IB_CLIENT_ID") or "9301"))
+            except Exception:
+                candidate = 9301
+            occupied = {
+                int(other_meta.get("assigned_client_id"))
+                for other_meta in self.download_proc_meta.values()
+                if other_meta is not meta and other_meta.get("assigned_client_id") is not None
+            }
+            while candidate in occupied:
+                candidate += 1
+            assigned_client_id = candidate
+            if meta is not None:
+                meta["assigned_client_id"] = assigned_client_id
+        return build_provider_runtime_environment(
+            provider_id,
+            catalog=self.catalog,
+            client_id_override=assigned_client_id,
+        )
+
+    def _refresh_download_header_progress(self, ticker: str | None = None) -> None:
+        if ticker:
+            self.download_active_ticker = str(ticker)
+        active_ticker = str(self.download_active_ticker or "")
+        row_info = self.download_progress_rows.get(active_ticker)
+        if row_info is None:
+            if self.download_procs:
+                self.download_progress.setVisible(True)
+                self.download_progress.setRange(0, 0)
+                self.download_progress.setFormat("")
+            else:
+                self.download_progress.setVisible(False)
+            return
+        total_steps = int(row_info.get("progress_total_steps") or 0)
+        completed_steps = int(row_info.get("progress_completed_steps") or 0)
+        current_steps = int(row_info.get("progress_current_steps") or 0)
+        if row_info.get("progress_mode") == "steps" and total_steps > 0:
+            current_value = min(completed_steps + current_steps, total_steps)
+            self.download_progress.setVisible(True)
+            self.download_progress.setRange(0, total_steps)
+            self.download_progress.setValue(current_value)
+            pct = int(round((100.0 * current_value) / max(total_steps, 1)))
+            self.download_progress.setFormat(f"{pct}%")
+            return
+        status_item = self.progress_table.item(row_info["row"], 1)
+        status_text = str(status_item.text()).strip().lower() if status_item is not None else ""
+        if status_text in {"done", "ingested", "gap_filled", "skipped"}:
+            self.download_progress.setVisible(True)
+            self.download_progress.setRange(0, 100)
+            self.download_progress.setValue(100)
+            self.download_progress.setFormat("100%")
+        elif self.download_procs:
+            self.download_progress.setVisible(True)
+            self.download_progress.setRange(0, 0)
+            self.download_progress.setFormat("")
+        else:
+            self.download_progress.setVisible(False)
 
     def _provider_settings_status_text(self, provider_id: str) -> str:
         return provider_settings_status(provider_id, catalog=self.catalog)
@@ -8500,6 +12705,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         dlg = ProviderSettingsDialog(self.catalog, self)
         if dlg.exec() == int(QtWidgets.QDialog.DialogCode.Accepted):
             self._update_ticker_summary()
+            if hasattr(self, "asset_information_tab"):
+                self._refresh_asset_information_tab(announce=False)
 
     def _build_heatmap_tab(self) -> QtWidgets.QWidget:
         return self._build_heatmap_panel()
@@ -8823,6 +13030,297 @@ class DashboardWindow(QtWidgets.QMainWindow):
         split.setStretchFactor(1, 6)
         return panel
 
+    def _build_deployment_tab(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        panel.setObjectName("Panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Deployment")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel(
+            "Create live or paper deployment drafts from validated candidates or manual definitions, including portfolio sources. Live market data for v1 follows the Interactive Brokers -> Alpaca -> Massive stack."
+        )
+        subtitle.setObjectName("Sub")
+        self.deployment_summary_label = QtWidgets.QLabel("No deployments have been created yet.")
+        self.deployment_summary_label.setObjectName("Sub")
+        self.deployment_summary_label.setWordWrap(True)
+        self.deployment_summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.deployment_summary_label)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        source_panel = QtWidgets.QWidget()
+        source_panel.setObjectName("Panel")
+        source_layout = QtWidgets.QVBoxLayout(source_panel)
+        source_layout.setContentsMargins(8, 8, 8, 8)
+        source_layout.setSpacing(8)
+
+        validated_group = QtWidgets.QGroupBox("Validated Candidates")
+        validated_layout = QtWidgets.QVBoxLayout(validated_group)
+        validated_layout.setContentsMargins(10, 10, 10, 10)
+        validated_layout.setSpacing(8)
+        target_row = QtWidgets.QHBoxLayout()
+        target_row.addWidget(QtWidgets.QLabel("Target"))
+        self.deployment_candidate_target_combo = QtWidgets.QComboBox()
+        target_row.addWidget(self.deployment_candidate_target_combo, 1)
+        target_row.addWidget(QtWidgets.QLabel("Sizing"))
+        self.deployment_candidate_sizing_type_combo = QtWidgets.QComboBox()
+        self.deployment_candidate_sizing_type_combo.addItem("Fixed", "fixed")
+        self.deployment_candidate_sizing_type_combo.addItem("Cash", "cash")
+        self.deployment_candidate_sizing_type_combo.addItem("Percent Equity", "percent_equity")
+        target_row.addWidget(self.deployment_candidate_sizing_type_combo)
+        self.deployment_candidate_sizing_value_spin = QtWidgets.QDoubleSpinBox()
+        self.deployment_candidate_sizing_value_spin.setDecimals(4)
+        self.deployment_candidate_sizing_value_spin.setRange(0.0, 1_000_000_000.0)
+        self.deployment_candidate_sizing_value_spin.setValue(100.0)
+        self.deployment_candidate_sizing_value_spin.setSingleStep(1.0)
+        target_row.addWidget(self.deployment_candidate_sizing_value_spin)
+        validated_layout.addLayout(target_row)
+        self.deployment_candidate_summary_label = QtWidgets.QLabel("No validated candidates are queued yet.")
+        self.deployment_candidate_summary_label.setObjectName("Sub")
+        self.deployment_candidate_summary_label.setWordWrap(True)
+        validated_layout.addWidget(self.deployment_candidate_summary_label)
+        validated_actions = QtWidgets.QHBoxLayout()
+        self.deployment_create_from_candidate_btn = QtWidgets.QPushButton("Create Draft Deployment")
+        self.deployment_create_from_candidate_btn.clicked.connect(self._create_deployment_from_selected_candidate)
+        validated_actions.addWidget(self.deployment_create_from_candidate_btn)
+        self.deployment_open_candidate_source_btn = QtWidgets.QPushButton("Open Source")
+        self.deployment_open_candidate_source_btn.clicked.connect(self._open_selected_deployment_candidate_source)
+        validated_actions.addWidget(self.deployment_open_candidate_source_btn)
+        validated_actions.addStretch(1)
+        validated_layout.addLayout(validated_actions)
+        self.deployment_candidate_table = QtWidgets.QTableWidget(0, 7)
+        self.deployment_candidate_table.setHorizontalHeaderLabels(
+            ["Candidate ID", "Kind", "Strategy", "Scope", "Timeframe", "Source", "Updated"]
+        )
+        self.deployment_candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.deployment_candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.deployment_candidate_table.setAlternatingRowColors(True)
+        self.deployment_candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.deployment_candidate_table.verticalHeader().setVisible(False)
+        self.deployment_candidate_table.setObjectName("Panel")
+        self.deployment_candidate_table.itemSelectionChanged.connect(self._refresh_deployment_candidate_details)
+        validated_layout.addWidget(self.deployment_candidate_table, 1)
+        self.deployment_candidate_details = QtWidgets.QPlainTextEdit()
+        self.deployment_candidate_details.setReadOnly(True)
+        self.deployment_candidate_details.setMaximumHeight(160)
+        self.deployment_candidate_details.setObjectName("Panel")
+        validated_layout.addWidget(self.deployment_candidate_details)
+        source_layout.addWidget(validated_group, 1)
+
+        manual_group = QtWidgets.QGroupBox("Manual Deployment")
+        manual_layout = QtWidgets.QVBoxLayout(manual_group)
+        manual_layout.setContentsMargins(10, 10, 10, 10)
+        manual_layout.setSpacing(8)
+        self.manual_definition_summary_label = QtWidgets.QLabel("No manual deployment definitions saved yet.")
+        self.manual_definition_summary_label.setObjectName("Sub")
+        self.manual_definition_summary_label.setWordWrap(True)
+        manual_layout.addWidget(self.manual_definition_summary_label)
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self.manual_deployment_kind_combo = QtWidgets.QComboBox()
+        self.manual_deployment_kind_combo.addItem("Single Strategy", "single_strategy")
+        self.manual_deployment_kind_combo.addItem("Portfolio Shared Strategy", "portfolio_shared_strategy")
+        self.manual_deployment_kind_combo.addItem("Portfolio Strategy Blocks", "portfolio_strategy_blocks")
+        form.addRow("Kind", self.manual_deployment_kind_combo)
+        self.manual_deployment_strategy_edit = QtWidgets.QLineEdit()
+        form.addRow("Strategy", self.manual_deployment_strategy_edit)
+        self.manual_deployment_strategy_version_edit = QtWidgets.QLineEdit()
+        form.addRow("Strategy Version", self.manual_deployment_strategy_version_edit)
+        self.manual_deployment_symbol_edit = QtWidgets.QLineEdit()
+        self.manual_deployment_symbol_edit.setPlaceholderText("Optional symbol override")
+        form.addRow("Symbol", self.manual_deployment_symbol_edit)
+        self.manual_deployment_dataset_scope_edit = QtWidgets.QLineEdit()
+        self.manual_deployment_dataset_scope_edit.setPlaceholderText("AAPL, MSFT, SPY")
+        form.addRow("Dataset Scope", self.manual_deployment_dataset_scope_edit)
+        self.manual_deployment_timeframe_edit = QtWidgets.QLineEdit()
+        self.manual_deployment_timeframe_edit.setPlaceholderText("5 minutes")
+        form.addRow("Timeframe", self.manual_deployment_timeframe_edit)
+        self.manual_deployment_target_combo = QtWidgets.QComboBox()
+        form.addRow("Target", self.manual_deployment_target_combo)
+        self.manual_deployment_sizing_type_combo = QtWidgets.QComboBox()
+        self.manual_deployment_sizing_type_combo.addItem("Fixed", "fixed")
+        self.manual_deployment_sizing_type_combo.addItem("Cash", "cash")
+        self.manual_deployment_sizing_type_combo.addItem("Percent Equity", "percent_equity")
+        form.addRow("Sizing Type", self.manual_deployment_sizing_type_combo)
+        self.manual_deployment_sizing_value_spin = QtWidgets.QDoubleSpinBox()
+        self.manual_deployment_sizing_value_spin.setDecimals(4)
+        self.manual_deployment_sizing_value_spin.setRange(0.0, 1_000_000_000.0)
+        self.manual_deployment_sizing_value_spin.setValue(100.0)
+        self.manual_deployment_sizing_value_spin.setSingleStep(1.0)
+        form.addRow("Sizing Value", self.manual_deployment_sizing_value_spin)
+        manual_layout.addLayout(form)
+        manual_layout.addWidget(QtWidgets.QLabel("Params JSON"))
+        self.manual_deployment_params_edit = QtWidgets.QPlainTextEdit()
+        self.manual_deployment_params_edit.setPlaceholderText("{}")
+        self.manual_deployment_params_edit.setMaximumHeight(90)
+        self.manual_deployment_params_edit.setObjectName("Panel")
+        manual_layout.addWidget(self.manual_deployment_params_edit)
+        manual_layout.addWidget(QtWidgets.QLabel("Structure JSON"))
+        self.manual_deployment_structure_edit = QtWidgets.QPlainTextEdit()
+        self.manual_deployment_structure_edit.setPlaceholderText("{}")
+        self.manual_deployment_structure_edit.setMaximumHeight(90)
+        self.manual_deployment_structure_edit.setObjectName("Panel")
+        manual_layout.addWidget(self.manual_deployment_structure_edit)
+        manual_layout.addWidget(QtWidgets.QLabel("Notes"))
+        self.manual_deployment_notes_edit = QtWidgets.QPlainTextEdit()
+        self.manual_deployment_notes_edit.setMaximumHeight(80)
+        self.manual_deployment_notes_edit.setObjectName("Panel")
+        manual_layout.addWidget(self.manual_deployment_notes_edit)
+        manual_actions = QtWidgets.QHBoxLayout()
+        self.manual_save_definition_btn = QtWidgets.QPushButton("Save Manual Definition")
+        self.manual_save_definition_btn.clicked.connect(self._save_manual_deployment_definition_from_form)
+        manual_actions.addWidget(self.manual_save_definition_btn)
+        self.manual_create_deployment_btn = QtWidgets.QPushButton("Create Draft Deployment")
+        self.manual_create_deployment_btn.clicked.connect(self._create_manual_deployment_from_form)
+        manual_actions.addWidget(self.manual_create_deployment_btn)
+        manual_actions.addStretch(1)
+        manual_layout.addLayout(manual_actions)
+        source_layout.addWidget(manual_group, 1)
+        split.addWidget(source_panel)
+
+        deployment_panel = QtWidgets.QWidget()
+        deployment_panel.setObjectName("Panel")
+        deployment_layout = QtWidgets.QVBoxLayout(deployment_panel)
+        deployment_layout.setContentsMargins(8, 8, 8, 8)
+        deployment_layout.setSpacing(8)
+        deployment_title = QtWidgets.QLabel("Deployed / Draft Strategies")
+        deployment_title.setObjectName("Title")
+        deployment_note = QtWidgets.QLabel(
+            "Parent portfolio deployments and single-strategy deployments live together here."
+        )
+        deployment_note.setObjectName("Sub")
+        deployment_note.setWordWrap(True)
+        self.deployment_table_summary_label = QtWidgets.QLabel("No deployment drafts saved yet.")
+        self.deployment_table_summary_label.setObjectName("Sub")
+        self.deployment_table_summary_label.setWordWrap(True)
+        deployment_actions = QtWidgets.QHBoxLayout()
+        self.deployment_arm_btn = QtWidgets.QPushButton("Arm")
+        self.deployment_arm_btn.clicked.connect(lambda: self._set_selected_deployment_status("armed"))
+        deployment_actions.addWidget(self.deployment_arm_btn)
+        self.deployment_pause_btn = QtWidgets.QPushButton("Pause")
+        self.deployment_pause_btn.clicked.connect(lambda: self._set_selected_deployment_status("paused"))
+        deployment_actions.addWidget(self.deployment_pause_btn)
+        self.deployment_stop_btn = QtWidgets.QPushButton("Stop")
+        self.deployment_stop_btn.clicked.connect(lambda: self._set_selected_deployment_status("stopped"))
+        deployment_actions.addWidget(self.deployment_stop_btn)
+        self.deployment_sync_state_btn = QtWidgets.QPushButton("Sync External State")
+        self.deployment_sync_state_btn.clicked.connect(self._sync_external_deployment_state)
+        deployment_actions.addWidget(self.deployment_sync_state_btn)
+        self.deployment_open_dashboard_btn = QtWidgets.QPushButton("Open External Dashboard")
+        self.deployment_open_dashboard_btn.clicked.connect(self._open_selected_deployment_dashboard)
+        deployment_actions.addWidget(self.deployment_open_dashboard_btn)
+        deployment_actions.addStretch(1)
+        self.deployment_table = QtWidgets.QTableWidget(0, 7)
+        self.deployment_table.setHorizontalHeaderLabels(
+            ["Deployment ID", "Kind", "Strategy", "Scope", "Target", "Status", "Updated"]
+        )
+        self.deployment_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.deployment_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.deployment_table.setAlternatingRowColors(True)
+        self.deployment_table.horizontalHeader().setStretchLastSection(True)
+        self.deployment_table.verticalHeader().setVisible(False)
+        self.deployment_table.setObjectName("Panel")
+        self.deployment_table.itemSelectionChanged.connect(self._refresh_selected_deployment_details)
+        self.deployment_details = QtWidgets.QPlainTextEdit()
+        self.deployment_details.setReadOnly(True)
+        self.deployment_details.setObjectName("Panel")
+        deployment_layout.addWidget(deployment_title)
+        deployment_layout.addWidget(deployment_note)
+        deployment_layout.addWidget(self.deployment_table_summary_label)
+        deployment_layout.addLayout(deployment_actions)
+        deployment_layout.addWidget(self.deployment_table, 1)
+        deployment_layout.addWidget(self.deployment_details)
+        split.addWidget(deployment_panel)
+
+        split.setStretchFactor(0, 6)
+        split.setStretchFactor(1, 5)
+        return panel
+
+    def _build_live_monitor_tab(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        panel.setObjectName("Panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Live Monitor")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel(
+            "Monitor draft, armed, live, paused, and stopped deployments, including parent portfolio deployments. Use Sync External State to reconcile metrics from the external execution engine."
+        )
+        subtitle.setObjectName("Sub")
+        self.live_monitor_summary_label = QtWidgets.QLabel("No deployment monitor state is available yet.")
+        self.live_monitor_summary_label.setObjectName("Sub")
+        self.live_monitor_summary_label.setWordWrap(True)
+        self.live_monitor_summary_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(self.live_monitor_summary_label)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.live_monitor_arm_btn = QtWidgets.QPushButton("Arm")
+        self.live_monitor_arm_btn.clicked.connect(lambda: self._set_selected_live_monitor_status("armed"))
+        actions.addWidget(self.live_monitor_arm_btn)
+        self.live_monitor_pause_btn = QtWidgets.QPushButton("Pause")
+        self.live_monitor_pause_btn.clicked.connect(lambda: self._set_selected_live_monitor_status("paused"))
+        actions.addWidget(self.live_monitor_pause_btn)
+        self.live_monitor_stop_btn = QtWidgets.QPushButton("Stop")
+        self.live_monitor_stop_btn.clicked.connect(lambda: self._set_selected_live_monitor_status("stopped"))
+        actions.addWidget(self.live_monitor_stop_btn)
+        self.live_monitor_sync_btn = QtWidgets.QPushButton("Sync External State")
+        self.live_monitor_sync_btn.clicked.connect(self._sync_external_deployment_state)
+        actions.addWidget(self.live_monitor_sync_btn)
+        self.live_monitor_open_dashboard_btn = QtWidgets.QPushButton("Open External Dashboard")
+        self.live_monitor_open_dashboard_btn.clicked.connect(self._open_selected_live_monitor_dashboard)
+        actions.addWidget(self.live_monitor_open_dashboard_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        self.live_monitor_table = QtWidgets.QTableWidget(0, 12)
+        self.live_monitor_table.setHorizontalHeaderLabels(
+            [
+                "Deployment ID",
+                "Kind",
+                "Strategy",
+                "Scope",
+                "Target",
+                "Status",
+                "Realized PnL",
+                "Open PnL",
+                "Trades",
+                "Win Rate",
+                "Sharpe",
+                "Last Sync",
+            ]
+        )
+        self.live_monitor_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.live_monitor_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.live_monitor_table.setAlternatingRowColors(True)
+        self.live_monitor_table.horizontalHeader().setStretchLastSection(True)
+        self.live_monitor_table.verticalHeader().setVisible(False)
+        self.live_monitor_table.setObjectName("Panel")
+        self.live_monitor_table.itemSelectionChanged.connect(self._refresh_live_monitor_details)
+        split.addWidget(self.live_monitor_table)
+
+        self.live_monitor_details = QtWidgets.QPlainTextEdit()
+        self.live_monitor_details.setReadOnly(True)
+        self.live_monitor_details.setObjectName("Panel")
+        split.addWidget(self.live_monitor_details)
+        split.setSizes([420, 240])
+        return panel
+
     def _build_heatmap_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         panel.setObjectName("Panel")
@@ -8852,7 +13350,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
-        title = QtWidgets.QLabel("Automate")
+        title = QtWidgets.QLabel("Data Collection")
         title.setObjectName("Title")
         subtitle = QtWidgets.QLabel(
             "Schedule data acquisition using the selected provider or a saved universe source preference."
@@ -8861,25 +13359,42 @@ class DashboardWindow(QtWidgets.QMainWindow):
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
-        content_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        content_split.setChildrenCollapsible(False)
-        layout.addWidget(content_split, 1)
+        content_row = QtWidgets.QHBoxLayout()
+        content_row.setSpacing(18)
+        layout.addLayout(content_row, 1)
 
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setMinimumWidth(640)
+        left_scroll.setMaximumWidth(780)
+        left_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         left_container = QtWidgets.QWidget()
         left_container.setObjectName("Panel")
         left_layout = QtWidgets.QVBoxLayout(left_container)
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(10)
         left_scroll.setWidget(left_container)
-        content_split.addWidget(left_scroll)
+        content_row.addWidget(left_scroll, 0)
 
-        right_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        right_split.setChildrenCollapsible(False)
-        content_split.addWidget(right_split)
+        right_host = QtWidgets.QWidget()
+        right_host.setObjectName("Panel")
+        right_host_layout = QtWidgets.QVBoxLayout(right_host)
+        right_host_layout.setContentsMargins(10, 10, 10, 10)
+        right_host_layout.setSpacing(8)
+        right_tabs = QtWidgets.QTabWidget()
+        right_tabs.setDocumentMode(True)
+        right_tabs.setMinimumWidth(560)
+        right_tabs.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        right_host_layout.addWidget(right_tabs)
+        content_row.addWidget(right_host, 1)
 
         universe_label = QtWidgets.QLabel("Download Universe")
         universe_label.setObjectName("Title")
@@ -8890,11 +13405,12 @@ class DashboardWindow(QtWidgets.QMainWindow):
         open_universe_btn.clicked.connect(self._open_universe_builder_tab)
         clear_universe_btn = QtWidgets.QPushButton("Manual")
         clear_universe_btn.clicked.connect(lambda: self.download_universe_combo.setCurrentIndex(0))
-        universe_row = QtWidgets.QHBoxLayout()
-        universe_row.addWidget(self.download_universe_combo, 3)
-        universe_row.addWidget(open_universe_btn, 1)
-        universe_row.addWidget(clear_universe_btn, 1)
-        left_layout.addLayout(universe_row)
+        left_layout.addWidget(self.download_universe_combo)
+        universe_btn_row = QtWidgets.QHBoxLayout()
+        universe_btn_row.addWidget(open_universe_btn)
+        universe_btn_row.addWidget(clear_universe_btn)
+        universe_btn_row.addStretch(1)
+        left_layout.addLayout(universe_btn_row)
         self.download_universe_note = QtWidgets.QLabel()
         self.download_universe_note.setObjectName("Sub")
         self.download_universe_note.setWordWrap(True)
@@ -8908,11 +13424,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
         for provider in available_acquisition_providers():
             self.download_source_combo.addItem(provider.label, provider.provider_id)
         self.download_source_combo.currentIndexChanged.connect(self._update_ticker_summary)
+        left_layout.addWidget(self.download_source_combo)
         source_row = QtWidgets.QHBoxLayout()
-        source_row.addWidget(self.download_source_combo, 2)
         provider_settings_btn = QtWidgets.QPushButton("Provider Settings")
         provider_settings_btn.clicked.connect(self._open_provider_settings_dialog)
-        source_row.addWidget(provider_settings_btn, 1)
+        source_row.addWidget(provider_settings_btn)
         source_row.addStretch(1)
         left_layout.addLayout(source_row)
         self.download_source_note = QtWidgets.QLabel()
@@ -8938,12 +13454,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         choose_btn.clicked.connect(self._open_ticker_picker)
         refresh_btn = QtWidgets.QPushButton("Update Symbols")
         refresh_btn.clicked.connect(self._update_nasdaq_symbols)
-        ticker_row = QtWidgets.QHBoxLayout()
-        ticker_row.addWidget(self.ticker_summary, 3)
-        ticker_row.addWidget(select_all_btn, 1)
-        ticker_row.addWidget(choose_btn, 1)
-        ticker_row.addWidget(refresh_btn, 1)
-        left_layout.addLayout(ticker_row)
+        left_layout.addWidget(self.ticker_summary)
+        ticker_btn_row = QtWidgets.QHBoxLayout()
+        ticker_btn_row.addWidget(select_all_btn)
+        ticker_btn_row.addWidget(choose_btn)
+        ticker_btn_row.addWidget(refresh_btn)
+        ticker_btn_row.addStretch(1)
+        left_layout.addLayout(ticker_btn_row)
 
         schedule_label = QtWidgets.QLabel("Scheduling")
         schedule_label.setObjectName("Title")
@@ -8959,6 +13476,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         schedule_grid = QtWidgets.QGridLayout()
         schedule_grid.setHorizontalSpacing(10)
         schedule_grid.setVerticalSpacing(6)
+        schedule_grid.setColumnStretch(1, 1)
 
         schedule_grid.addWidget(QtWidgets.QLabel("Start Time"), 0, 0)
         time_row = QtWidgets.QHBoxLayout()
@@ -8995,40 +13513,46 @@ class DashboardWindow(QtWidgets.QMainWindow):
         schedule_grid.addWidget(QtWidgets.QLabel("Days of Week"), 1, 0)
         self.weekday_checks = []
         days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        days_row = QtWidgets.QHBoxLayout()
-        for d in days:
+        days_grid = QtWidgets.QGridLayout()
+        days_grid.setHorizontalSpacing(12)
+        days_grid.setVerticalSpacing(6)
+        for idx, d in enumerate(days):
             chk = QtWidgets.QCheckBox(d)
             chk.setChecked(d in ["Mon", "Tue", "Wed", "Thu", "Fri"])
             self.weekday_checks.append(chk)
-            days_row.addWidget(chk)
+            days_grid.addWidget(chk, idx // 4, idx % 4)
         day_wrap = QtWidgets.QWidget()
-        day_wrap.setLayout(days_row)
+        day_wrap.setLayout(days_grid)
         schedule_grid.addWidget(day_wrap, 1, 1)
 
         schedule_grid.addWidget(QtWidgets.QLabel("Weeks of Month"), 2, 0)
         self.week_of_month_checks = []
         week_labels = ["1", "2", "3", "4", "Last"]
-        weeks_row = QtWidgets.QHBoxLayout()
-        for w in week_labels:
+        weeks_grid = QtWidgets.QGridLayout()
+        weeks_grid.setHorizontalSpacing(12)
+        weeks_grid.setVerticalSpacing(6)
+        for idx, w in enumerate(week_labels):
             chk = QtWidgets.QCheckBox(w)
             chk.setChecked(w == "1")
             self.week_of_month_checks.append(chk)
-            weeks_row.addWidget(chk)
+            weeks_grid.addWidget(chk, idx // 3, idx % 3)
         weeks_wrap = QtWidgets.QWidget()
-        weeks_wrap.setLayout(weeks_row)
+        weeks_wrap.setLayout(weeks_grid)
         schedule_grid.addWidget(weeks_wrap, 2, 1)
 
         schedule_grid.addWidget(QtWidgets.QLabel("Months"), 3, 0)
         self.month_checks = []
         months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        months_row = QtWidgets.QHBoxLayout()
-        for m in months:
+        months_grid = QtWidgets.QGridLayout()
+        months_grid.setHorizontalSpacing(12)
+        months_grid.setVerticalSpacing(6)
+        for idx, m in enumerate(months):
             chk = QtWidgets.QCheckBox(m)
             chk.setChecked(True)
             self.month_checks.append(chk)
-            months_row.addWidget(chk)
+            months_grid.addWidget(chk, idx // 4, idx % 4)
         months_wrap = QtWidgets.QWidget()
-        months_wrap.setLayout(months_row)
+        months_wrap.setLayout(months_grid)
         schedule_grid.addWidget(months_wrap, 3, 1)
 
         left_layout.addLayout(schedule_grid)
@@ -9067,6 +13591,25 @@ class DashboardWindow(QtWidgets.QMainWindow):
         downloads_layout.addWidget(self.download_status)
         self.download_progress = QtWidgets.QProgressBar()
         self.download_progress.setRange(0, 0)
+        self.download_progress.setTextVisible(True)
+        self.download_progress.setMinimumHeight(16)
+        self.download_progress.setStyleSheet(
+            f"""
+            QProgressBar {{
+                background: rgba(255,255,255,.08);
+                color: {PALETTE['panel']};
+                border: 1px solid {PALETTE['border']};
+                border-radius: 6px;
+                text-align: center;
+                font-weight: 700;
+            }}
+            QProgressBar::chunk {{
+                background: {PALETTE['green']};
+                border-radius: 5px;
+                margin: 1px;
+            }}
+            """
+        )
         self.download_progress.setVisible(False)
         downloads_layout.addWidget(self.download_progress)
 
@@ -9117,7 +13660,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         )
         self.progress_table.setMinimumHeight(260)
         downloads_layout.addWidget(self.progress_table, 1)
-        right_split.addWidget(downloads_panel)
+        right_tabs.addTab(downloads_panel, "Current Downloads")
 
         tasks_panel = QtWidgets.QWidget()
         tasks_panel.setObjectName("Panel")
@@ -9200,10 +13743,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         )
         self.tasks_table.setMinimumHeight(260)
         tasks_layout.addWidget(self.tasks_table, 1)
-        right_split.addWidget(tasks_panel)
+        right_tabs.addTab(tasks_panel, "Scheduled Tasks")
 
-        content_split.setSizes([620, 820])
-        right_split.setSizes([380, 340])
         self._load_tasks()
         self._refresh_tasks_table()
         if not hasattr(self, "tasks_timer"):
@@ -9355,7 +13896,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if not self.nasdaq_symbols:
             QtWidgets.QMessageBox.warning(self, "Symbols missing", f"Symbols file not found: {NASDAQ_SYMBOLS_PATH}")
             return
-        dlg = TickerPickerDialog(self.nasdaq_symbols, set(self.selected_tickers), self)
+        dlg = TickerPickerDialog(
+            self.nasdaq_symbols,
+            set(self.selected_tickers),
+            self,
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=self.picker_snapshot_frame(),
+        )
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.download_universe_id = ""
             if hasattr(self, "download_universe_combo"):
@@ -9383,6 +13930,104 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if self.select_all_tickers:
             return list(self.nasdaq_symbols)
         return list(self.selected_tickers)
+
+    def _open_automate_tab(self) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        for idx in range(self.tabs.count()):
+            if str(self.tabs.tabText(idx) or "").strip().lower() == "automate":
+                self.tabs.setCurrentIndex(idx)
+                return
+
+    def _has_active_download_session(self) -> bool:
+        return bool(
+            self.download_queue
+            or self.download_policy_workers
+            or self.download_procs
+            or self.download_finalize_workers
+            or self._paused_download_launch_metas
+        )
+
+    def _known_download_tickers(self) -> set[str]:
+        known = {str(item).strip().upper() for item in list(self.download_queue) if str(item).strip()}
+        known.update(str(item).strip().upper() for item in list(self.download_progress_rows.keys()) if str(item).strip())
+        for meta in list(self.download_proc_meta.values()):
+            ticker = str(meta.get("ticker") or "").strip().upper()
+            if ticker:
+                known.add(ticker)
+        for ticker in list(self.download_policy_metas.keys()):
+            symbol = str(ticker or "").strip().upper()
+            if symbol:
+                known.add(symbol)
+        for ticker in list(self.download_finalize_metas.keys()):
+            symbol = str(ticker or "").strip().upper()
+            if symbol:
+                known.add(symbol)
+        for meta in list(self._paused_download_launch_metas):
+            ticker = str(meta.get("ticker") or "").strip().upper()
+            if ticker:
+                known.add(ticker)
+        return known
+
+    def _retry_download_symbols(self, symbols: Sequence[str], *, source: str = "") -> tuple[int, str]:
+        normalized: list[str] = []
+        for item in list(symbols or []):
+            ticker = str(item).strip().upper()
+            if ticker and ticker not in normalized:
+                normalized.append(ticker)
+        if not normalized:
+            return 0, "No failed tickers were available to retry."
+        normalized_source = str(source or "").strip().lower()
+        active_source = str(self._active_download_source or self._resolved_download_source() or "").strip().lower()
+        if normalized_source and hasattr(self, "download_source_combo") and not self._has_active_download_session():
+            source_index = self.download_source_combo.findData(normalized_source)
+            if source_index >= 0:
+                self.download_source_combo.blockSignals(True)
+                self.download_source_combo.setCurrentIndex(source_index)
+                self.download_source_combo.blockSignals(False)
+        self.download_universe_id = ""
+        if hasattr(self, "download_universe_combo"):
+            self.download_universe_combo.blockSignals(True)
+            self.download_universe_combo.setCurrentIndex(0)
+            self.download_universe_combo.blockSignals(False)
+        self.select_all_tickers = False
+        self.selected_tickers = list(normalized)
+        self._update_ticker_summary()
+        self._open_automate_tab()
+        if self._has_active_download_session():
+            if normalized_source and active_source and normalized_source != active_source:
+                return (
+                    len(normalized),
+                    (
+                        f"Prepared {len(normalized)} retry ticker(s), but the active download session is using "
+                        f"{provider_display_name(active_source)} while the failed attempts came from "
+                        f"{provider_display_name(normalized_source)}. Finish or stop the current session, then start the retry batch."
+                    ),
+                )
+            existing = self._known_download_tickers()
+            added = 0
+            for ticker in normalized:
+                if ticker in existing:
+                    continue
+                self.download_queue.append(ticker)
+                existing.add(ticker)
+                self._ensure_progress_row(ticker)
+                self._update_progress_row(
+                    ticker,
+                    status="paused" if self.download_paused else "queued",
+                    tooltip="Queued from failed-attempt retry.",
+                )
+                added += 1
+            self._persist_download_session_state()
+            if not self.download_paused:
+                self._maybe_start_downloads()
+            if added <= 0:
+                return len(normalized), "Those failed tickers are already present in the current download session."
+            if self.download_paused:
+                return added, f"Queued {added} failed ticker(s) into the paused download session. Click Resume to retry them."
+            return added, f"Queued {added} failed ticker(s) into the current download session."
+        self._start_download()
+        return len(normalized), f"Started a retry batch for {len(normalized)} failed ticker(s)."
 
     def _schedule_task(self) -> None:
         symbols = self._selected_download_symbols()
@@ -9820,6 +14465,500 @@ WantedBy=default.target
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(text)
 
+    def _write_download_artifact_state(self, meta: dict, status: str, **extra: object) -> None:
+        out_path = str(meta.get("out_path") or "").strip()
+        if not out_path:
+            return
+        request_windows = []
+        for start, end in list(meta.get("request_windows") or []):
+            request_windows.append([str(start or ""), str(end or "")])
+        payload = {
+            "status": str(status or "").strip().lower(),
+            "updated_at": pd.Timestamp.now("UTC").isoformat(),
+            "ticker": str(meta.get("ticker") or "").strip().upper(),
+            "source": str(meta.get("source") or "").strip().lower(),
+            "history_window": str(meta.get("history_window") or "").strip().lower(),
+            "resolution": str(meta.get("resolution") or "").strip().lower(),
+            "request_windows": request_windows,
+            "window_index": int(meta.get("window_index") or 0),
+            "merge_with_existing": bool(meta.get("merge_with_existing")),
+            "policy_reason": str(meta.get("policy_reason") or ""),
+            "policy_action": str(meta.get("policy_action") or ""),
+            "policy_plan_type": str(meta.get("policy_plan_type") or ""),
+            "secondary_source": str(meta.get("secondary_source") or ""),
+            "secondary_dataset_id": str(meta.get("secondary_dataset_id") or ""),
+            "log_path": str(meta.get("log_path") or ""),
+            "rows": int(meta.get("rows") or 0),
+            "acquisition_run_id": str(self.current_acquisition_run_id or ""),
+        }
+        payload.update({str(key): value for key, value in dict(extra or {}).items()})
+        write_download_artifact_state(out_path, **payload)
+
+    def _clear_download_artifact_state(self, meta_or_path: dict | str | Path | None) -> None:
+        if meta_or_path is None:
+            return
+        if isinstance(meta_or_path, dict):
+            csv_path = str(meta_or_path.get("out_path") or "").strip()
+        else:
+            csv_path = str(meta_or_path).strip()
+        if not csv_path:
+            return
+        clear_download_artifact_state(csv_path)
+
+    def _download_row_snapshot(self, ticker: str) -> dict | None:
+        row_info = self.download_progress_rows.get(ticker)
+        if row_info is None:
+            return None
+        row = int(row_info.get("row") or 0)
+        status_item = self.progress_table.item(row, 1)
+        pages_item = self.progress_table.item(row, 2)
+        rows_item = self.progress_table.item(row, 3)
+        bar: QtWidgets.QProgressBar = row_info["bar"]
+        return {
+            "ticker": str(ticker),
+            "row": row,
+            "status": str(status_item.text() if status_item is not None else ""),
+            "pages_text": str(pages_item.text() if pages_item is not None else ""),
+            "rows_text": str(rows_item.text() if rows_item is not None else ""),
+            "tooltip": str(status_item.toolTip() if status_item is not None else ""),
+            "log_path": str(row_info.get("log_path") or ""),
+            "progress_mode": str(row_info.get("progress_mode") or "indeterminate"),
+            "progress_total_steps": int(row_info.get("progress_total_steps") or 0),
+            "progress_completed_steps": int(row_info.get("progress_completed_steps") or 0),
+            "progress_current_steps": int(row_info.get("progress_current_steps") or 0),
+            "progress_minimum": int(bar.minimum()),
+            "progress_maximum": int(bar.maximum()),
+            "progress_value": int(bar.value()),
+            "progress_format": str(bar.format() or ""),
+        }
+
+    def _recoverable_download_tickers(self) -> list[str]:
+        recoverable: list[str] = []
+        for ticker, row_info in sorted(self.download_progress_rows.items(), key=lambda item: int(item[1].get("row") or 0)):
+            row = int(row_info.get("row") or 0)
+            status_item = self.progress_table.item(row, 1)
+            status = str(status_item.text() if status_item is not None else "").strip().lower()
+            if status in _DOWNLOAD_RECOVERABLE_STATUSES and ticker not in recoverable:
+                recoverable.append(str(ticker).strip().upper())
+        return recoverable
+
+    def _retain_download_rows(self, tickers: Sequence[str]) -> None:
+        normalized = [str(item).strip().upper() for item in list(tickers or []) if str(item).strip()]
+        if not normalized:
+            self.progress_table.setRowCount(0)
+            self.download_progress_rows = {}
+            return
+        snapshots: list[dict] = []
+        for ticker in normalized:
+            snapshot = self._download_row_snapshot(ticker)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        self.progress_table.setRowCount(0)
+        self.download_progress_rows = {}
+        for snapshot in snapshots:
+            self._apply_progress_row_snapshot(snapshot)
+
+    def _download_session_has_work(self) -> bool:
+        return bool(
+            self.current_acquisition_run_id
+            or self.download_queue
+            or self.download_policy_metas
+            or self.download_proc_meta
+            or self.download_finalize_metas
+            or self._paused_download_launch_metas
+            or self._recoverable_download_tickers()
+        )
+
+    def _build_download_session_payload(self) -> dict | None:
+        if not self._download_session_has_work():
+            return None
+        has_active_work = bool(
+            self.current_acquisition_run_id
+            or self.download_queue
+            or self.download_policy_metas
+            or self.download_proc_meta
+            or self.download_finalize_metas
+            or self._paused_download_launch_metas
+        )
+        recoverable_tickers = self._recoverable_download_tickers()
+        retained_tickers = set(recoverable_tickers) if (recoverable_tickers and not has_active_work) else None
+        row_payloads = []
+        for ticker, row_info in sorted(self.download_progress_rows.items(), key=lambda item: int(item[1].get("row") or 0)):
+            if retained_tickers is not None and str(ticker).strip().upper() not in retained_tickers:
+                continue
+            snapshot = self._download_row_snapshot(ticker)
+            if snapshot is not None:
+                row_payloads.append(snapshot)
+        resume_tickers: list[str] = []
+        for meta in list(self.download_proc_meta.values()):
+            ticker = str(meta.get("ticker") or "").strip().upper()
+            if ticker and ticker not in resume_tickers:
+                resume_tickers.append(ticker)
+        for ticker in list(self.download_policy_metas.keys()):
+            symbol = str(ticker or "").strip().upper()
+            if symbol and symbol not in resume_tickers:
+                resume_tickers.append(symbol)
+        for ticker in list(self.download_finalize_metas.keys()):
+            symbol = str(ticker or "").strip().upper()
+            if symbol and symbol not in resume_tickers:
+                resume_tickers.append(symbol)
+        for meta in list(self._paused_download_launch_metas):
+            ticker = str(meta.get("ticker") or "").strip().upper()
+            if ticker and ticker not in resume_tickers:
+                resume_tickers.append(ticker)
+        if not resume_tickers and recoverable_tickers:
+            resume_tickers.extend(recoverable_tickers)
+        queued_tickers: list[str] = []
+        for ticker in list(self.download_queue):
+            symbol = str(ticker or "").strip().upper()
+            if symbol and symbol not in queued_tickers and symbol not in resume_tickers:
+                queued_tickers.append(symbol)
+        return {
+            "version": 1,
+            "saved_at": pd.Timestamp.now("UTC").isoformat(),
+            "current_acquisition_run_id": str(self.current_acquisition_run_id or ""),
+            "current_acquisition_attempts": dict(self.current_acquisition_attempts or {}),
+            "download_universe_id": str(self.download_universe_id or ""),
+            "download_source_choice": str(self._selected_download_source_choice() or ""),
+            "download_source_effective": str(self._active_download_source or self._resolved_download_source() or ""),
+            "selected_tickers": [str(item).strip().upper() for item in list(self.selected_tickers or []) if str(item).strip()],
+            "select_all_tickers": bool(self.select_all_tickers),
+            "resume_enabled": bool(getattr(self, "resume_chk", None).isChecked()) if hasattr(self, "resume_chk") else True,
+            "force_refresh": bool(getattr(self, "force_refresh_chk", None).isChecked()) if hasattr(self, "force_refresh_chk") else False,
+            "download_paused": bool(self.download_paused or (recoverable_tickers and not has_active_work)),
+            "download_active_ticker": str(self.download_active_ticker or ""),
+            "download_status_text": str(self.download_status.text() or "") if hasattr(self, "download_status") else "",
+            "resume_tickers": resume_tickers,
+            "queued_tickers": queued_tickers,
+            "rows": row_payloads,
+        }
+
+    def _persist_download_session_state(self, *, clear: bool = False) -> None:
+        if clear:
+            try:
+                ACTIVE_DOWNLOAD_SESSION_PATH.unlink()
+            except FileNotFoundError:
+                return
+            except Exception:
+                return
+            return
+        payload = self._build_download_session_payload()
+        if payload is None:
+            self._persist_download_session_state(clear=True)
+            return
+        ACTIVE_DOWNLOAD_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ACTIVE_DOWNLOAD_SESSION_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _load_download_session_state(self) -> dict | None:
+        if not ACTIVE_DOWNLOAD_SESSION_PATH.exists():
+            return None
+        try:
+            payload = json.loads(ACTIVE_DOWNLOAD_SESSION_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return dict(payload)
+
+    @staticmethod
+    def _download_state_timestamp(value: object) -> pd.Timestamp:
+        stamp = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(stamp):
+            return pd.Timestamp(0, tz="UTC")
+        return stamp
+
+    def _recoverable_download_artifact_states(self) -> list[dict]:
+        data_dir = ACTIVE_DOWNLOAD_SESSION_PATH.parent
+        if not data_dir.exists():
+            return []
+        states: list[dict] = []
+        for state_path in sorted(data_dir.glob("*.download_state.json")):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            status = str(payload.get("status") or "").strip().lower()
+            if status not in _DOWNLOAD_ARTIFACT_RECOVERY_STATUSES:
+                continue
+            ticker = str(payload.get("ticker") or "").strip().upper()
+            csv_path = str(payload.get("csv_path") or "").strip()
+            if not ticker:
+                ticker = _infer_picker_ticker(Path(csv_path).stem if csv_path else state_path.stem)
+            if not ticker:
+                continue
+            payload["ticker"] = ticker
+            payload["status"] = status
+            payload["csv_path"] = csv_path
+            payload["source"] = str(payload.get("source") or "").strip().lower()
+            payload["_updated_at_ts"] = self._download_state_timestamp(payload.get("updated_at"))
+            states.append(dict(payload))
+        if not states:
+            return []
+        grouped: dict[str, list[dict]] = {}
+        for payload in states:
+            run_id = str(payload.get("acquisition_run_id") or "").strip()
+            source = str(payload.get("source") or "").strip().lower() or DEFAULT_ACQUISITION_PROVIDER
+            group_key = run_id if run_id else f"source::{source}"
+            grouped.setdefault(group_key, []).append(payload)
+        best_group = max(
+            grouped.values(),
+            key=lambda items: max((item.get("_updated_at_ts") or pd.Timestamp(0, tz="UTC")) for item in items),
+        )
+        best_group = sorted(
+            best_group,
+            key=lambda item: (
+                str(item.get("ticker") or ""),
+                str(item.get("csv_path") or ""),
+            ),
+        )
+        deduped: list[dict] = []
+        seen_tickers: set[str] = set()
+        for payload in sorted(best_group, key=lambda item: item.get("_updated_at_ts") or pd.Timestamp(0, tz="UTC"), reverse=True):
+            ticker = str(payload.get("ticker") or "").strip().upper()
+            if not ticker or ticker in seen_tickers:
+                continue
+            seen_tickers.add(ticker)
+            deduped.append(dict(payload))
+        deduped.reverse()
+        return deduped
+
+    def _build_download_session_payload_from_artifact_states(self) -> dict | None:
+        states = self._recoverable_download_artifact_states()
+        if not states:
+            return None
+        sources = [str(item.get("source") or "").strip().lower() for item in states if str(item.get("source") or "").strip()]
+        source_effective = sources[0] if sources else str(self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
+        rows: list[dict] = []
+        resume_tickers: list[str] = []
+        for row_idx, payload in enumerate(states):
+            ticker = str(payload.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            source = str(payload.get("source") or "").strip().lower()
+            status = str(payload.get("status") or "").strip().lower()
+            log_path = str(payload.get("log_path") or "").strip()
+            last_error = str(payload.get("last_error") or "").strip()
+            display_status = "paused"
+            if status == "downloaded":
+                display_status = "downloaded"
+            elif status == "finalizing":
+                display_status = "ingesting"
+            tooltip_lines = [
+                f"Recovered from download checkpoint state: {status or 'unknown'}",
+                f"Source: {provider_display_name(source) if source else '—'}",
+                f"CSV Path: {payload.get('csv_path') or '—'}",
+                f"Rows: {int(payload.get('rows') or 0)}",
+                f"Last Error: {last_error or '—'}",
+                f"Log: {log_path or '—'}",
+            ]
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "row": row_idx,
+                    "status": display_status,
+                    "pages_text": "0",
+                    "rows_text": str(int(payload.get("rows") or 0)),
+                    "tooltip": "\n".join(tooltip_lines),
+                    "log_path": log_path,
+                    "progress_mode": "indeterminate",
+                    "progress_total_steps": 0,
+                    "progress_completed_steps": 0,
+                    "progress_current_steps": 0,
+                    "progress_minimum": 0,
+                    "progress_maximum": 0,
+                    "progress_value": 0,
+                    "progress_format": "",
+                }
+            )
+            resume_tickers.append(ticker)
+        if not resume_tickers:
+            return None
+        return {
+            "version": 1,
+            "saved_at": pd.Timestamp.now("UTC").isoformat(),
+            "current_acquisition_run_id": "",
+            "current_acquisition_attempts": {},
+            "download_universe_id": "",
+            "download_source_choice": source_effective,
+            "download_source_effective": source_effective,
+            "selected_tickers": list(resume_tickers),
+            "select_all_tickers": False,
+            "resume_enabled": bool(getattr(self, "resume_chk", None).isChecked()) if hasattr(self, "resume_chk") else True,
+            "force_refresh": bool(getattr(self, "force_refresh_chk", None).isChecked()) if hasattr(self, "force_refresh_chk") else False,
+            "download_paused": True,
+            "download_active_ticker": "",
+            "download_status_text": "Recoverable download checkpoints were found. Click Resume to continue from the saved state.",
+            "resume_tickers": list(resume_tickers),
+            "queued_tickers": [],
+            "rows": rows,
+        }
+
+    def _apply_progress_row_snapshot(self, snapshot: dict) -> None:
+        ticker = str(snapshot.get("ticker") or "").strip().upper()
+        if not ticker:
+            return
+        log_path = str(snapshot.get("log_path") or "").strip()
+        self._ensure_progress_row(ticker, Path(log_path) if log_path else None)
+        row_info = self.download_progress_rows[ticker]
+        row = int(row_info.get("row") or 0)
+        row_info["progress_mode"] = str(snapshot.get("progress_mode") or "indeterminate")
+        row_info["progress_total_steps"] = int(snapshot.get("progress_total_steps") or 0)
+        row_info["progress_completed_steps"] = int(snapshot.get("progress_completed_steps") or 0)
+        row_info["progress_current_steps"] = int(snapshot.get("progress_current_steps") or 0)
+        status_item = self.progress_table.item(row, 1)
+        pages_item = self.progress_table.item(row, 2)
+        rows_item = self.progress_table.item(row, 3)
+        tooltip = str(snapshot.get("tooltip") or "")
+        if status_item is not None:
+            status_item.setText(str(snapshot.get("status") or "queued"))
+            status_item.setToolTip(tooltip)
+        if pages_item is not None:
+            pages_item.setText(str(snapshot.get("pages_text") or "0"))
+            pages_item.setToolTip(tooltip)
+        if rows_item is not None:
+            rows_item.setText(str(snapshot.get("rows_text") or "0"))
+            rows_item.setToolTip(tooltip)
+        bar: QtWidgets.QProgressBar = row_info["bar"]
+        minimum = int(snapshot.get("progress_minimum") or 0)
+        maximum = int(snapshot.get("progress_maximum") or 0)
+        if minimum == 0 and maximum == 0:
+            bar.setRange(0, 0)
+        else:
+            bar.setRange(minimum, maximum)
+            bar.setValue(int(snapshot.get("progress_value") or 0))
+        bar.setFormat(str(snapshot.get("progress_format") or ""))
+
+    def _restore_download_session_if_available(self) -> bool:
+        if self.download_procs or self.download_policy_workers or self.download_finalize_workers or self.download_queue:
+            return False
+        state = self._load_download_session_state()
+        if not state:
+            state = self._build_download_session_payload_from_artifact_states()
+        if not state:
+            return False
+        resume_tickers = [str(item).strip().upper() for item in list(state.get("resume_tickers") or []) if str(item).strip()]
+        queued_tickers = [str(item).strip().upper() for item in list(state.get("queued_tickers") or []) if str(item).strip()]
+        combined_queue: list[str] = []
+        for ticker in resume_tickers + queued_tickers:
+            if ticker and ticker not in combined_queue:
+                combined_queue.append(ticker)
+        if not combined_queue:
+            artifact_state = self._build_download_session_payload_from_artifact_states()
+            if artifact_state is None:
+                self._persist_download_session_state(clear=True)
+                return False
+            state = artifact_state
+            resume_tickers = [str(item).strip().upper() for item in list(state.get("resume_tickers") or []) if str(item).strip()]
+            queued_tickers = [str(item).strip().upper() for item in list(state.get("queued_tickers") or []) if str(item).strip()]
+            combined_queue = []
+            for ticker in resume_tickers + queued_tickers:
+                if ticker and ticker not in combined_queue:
+                    combined_queue.append(ticker)
+            if not combined_queue:
+                self._persist_download_session_state(clear=True)
+                return False
+        source_choice = str(state.get("download_source_choice") or "").strip().lower()
+        source_effective = str(state.get("download_source_effective") or "").strip().lower()
+        if hasattr(self, "download_source_combo"):
+            source_index = self.download_source_combo.findData(source_choice)
+            if source_index < 0 and source_effective:
+                source_index = self.download_source_combo.findData(source_effective)
+            if source_index >= 0:
+                self.download_source_combo.blockSignals(True)
+                self.download_source_combo.setCurrentIndex(source_index)
+                self.download_source_combo.blockSignals(False)
+        restored_universe_id = str(state.get("download_universe_id") or "").strip()
+        if hasattr(self, "download_universe_combo"):
+            universe_index = self.download_universe_combo.findData(restored_universe_id)
+            if universe_index >= 0:
+                self.download_universe_combo.blockSignals(True)
+                self.download_universe_combo.setCurrentIndex(universe_index)
+                self.download_universe_combo.blockSignals(False)
+        self.download_universe_id = restored_universe_id
+        self._active_download_source = source_effective or None
+        self.selected_tickers = [
+            str(item).strip().upper() for item in list(state.get("selected_tickers") or []) if str(item).strip()
+        ]
+        self.select_all_tickers = bool(state.get("select_all_tickers"))
+        if hasattr(self, "resume_chk"):
+            self.resume_chk.setChecked(bool(state.get("resume_enabled", True)))
+        if hasattr(self, "force_refresh_chk"):
+            self.force_refresh_chk.setChecked(bool(state.get("force_refresh", False)))
+        self._update_ticker_summary()
+        self.progress_table.setRowCount(0)
+        self.download_progress_rows = {}
+        self.download_policy_workers = {}
+        self.download_policy_metas = {}
+        self.download_proc_meta = {}
+        self.download_finalize_workers = {}
+        self.download_finalize_metas = {}
+        self.download_procs = []
+        self.download_proc = None
+        for snapshot in sorted(list(state.get("rows") or []), key=lambda item: int(item.get("row") or 0)):
+            if isinstance(snapshot, dict):
+                self._apply_progress_row_snapshot(dict(snapshot))
+        for ticker in combined_queue:
+            if ticker not in self.download_progress_rows:
+                self._ensure_progress_row(ticker)
+        self.current_acquisition_run_id = str(state.get("current_acquisition_run_id") or "").strip() or None
+        self.current_acquisition_attempts = {
+            str(key).strip().upper(): str(value)
+            for key, value in dict(state.get("current_acquisition_attempts") or {}).items()
+            if str(key).strip()
+        }
+        self.download_queue = list(combined_queue)
+        self.download_paused = bool(state.get("download_paused"))
+        self._download_stop_requested = False
+        self.download_active_ticker = str(state.get("download_active_ticker") or "").strip() or None
+        self.download_progress.setVisible(True)
+        self.download_progress.setRange(0, 0)
+        restored_status_text = str(state.get("download_status_text") or "").strip()
+        if self.download_paused:
+            self.download_status.setText(restored_status_text or "Interrupted download session restored in paused state.")
+        else:
+            self.download_status.setText(restored_status_text or "Interrupted download session restored. Resuming downloads…")
+            QtCore.QTimer.singleShot(0, self._maybe_start_downloads)
+        return True
+
+    def _prepare_download_session_for_shutdown(self) -> None:
+        if not self._download_session_has_work():
+            return
+        for worker in list(self.download_policy_workers.values()):
+            try:
+                worker.requestInterruption()
+                worker.wait(100)
+            except Exception:
+                continue
+        for meta in list(self.download_proc_meta.values()):
+            self._write_download_artifact_state(
+                meta,
+                "interrupted",
+                last_error=str(meta.get("last_error") or "Dashboard closed while the provider download was active."),
+            )
+        for meta in list(self.download_finalize_metas.values()):
+            self._write_download_artifact_state(
+                meta,
+                "finalizing",
+                last_error=str(meta.get("last_error") or "Dashboard closed while ingestion/finalization was active."),
+            )
+        for meta in list(self._paused_download_launch_metas):
+            self._write_download_artifact_state(
+                meta,
+                "paused",
+                last_error="Dashboard closed while the download session was paused.",
+            )
+        self._persist_download_session_state()
+        for proc in list(self.download_procs):
+            try:
+                proc.blockSignals(True)
+                if proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+                    proc.kill()
+                    proc.waitForFinished(250)
+            except Exception:
+                continue
+
     def _download_meta(self, proc: QtCore.QProcess | None) -> dict | None:
         if proc is None:
             return None
@@ -9886,7 +15025,14 @@ WantedBy=default.target
             return ""
         if len(clean) == 1:
             return clean[0]
-        dlg = DatasetPickerDialog(clean, clean[0], self, title=title)
+        dlg = DatasetPickerDialog(
+            clean,
+            clean[0],
+            self,
+            title=title,
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=self.picker_snapshot_frame(),
+        )
         if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return ""
         return dlg.selected_dataset()
@@ -9969,10 +15115,286 @@ WantedBy=default.target
             resolution=resolution,
         )
         try:
-            artifact = ingest_csv_to_store(out_path, dataset_id=dataset_id, merge_existing=merge_with_existing)
+            artifact = ingest_csv_to_store(
+                out_path,
+                dataset_id=dataset_id,
+                merge_existing=merge_with_existing,
+                resolution=resolution,
+            )
             return "ingested", artifact, None
         except Exception as exc:
             return "ingest_error", None, str(exc)
+
+    def _start_download_finalize_worker(self, *, ticker: str, meta: dict, job: dict, context: dict) -> None:
+        payload = dict(job or {})
+        payload["ticker"] = str(ticker or "")
+        payload["meta"] = dict(meta or {})
+        payload["context"] = dict(context or {})
+        worker = DownloadFinalizeWorker(payload, self)
+        self.download_finalize_workers[str(ticker or "")] = worker
+        self.download_finalize_metas[str(ticker or "")] = dict(meta or {})
+        self._write_download_artifact_state(
+            dict(meta or {}),
+            "finalizing",
+            finalize_mode=str(payload.get("mode") or ""),
+        )
+        self._persist_download_session_state()
+        worker.result_signal.connect(self._on_download_finalize_result)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_download_finalize_result(self, result: object) -> None:
+        payload = dict(result or {}) if isinstance(result, dict) else {}
+        ticker = str(payload.get("ticker") or "")
+        meta = dict(payload.get("meta") or {})
+        context = dict(payload.get("context") or {})
+        artifact = payload.get("artifact")
+        error = str(payload.get("error") or "").strip()
+        worker = self.download_finalize_workers.pop(ticker, None)
+        self.download_finalize_metas.pop(ticker, None)
+        if worker is not None:
+            worker.deleteLater()
+        if self._closing:
+            return
+        branch = str(context.get("branch") or "")
+        if branch == "ingest_existing":
+            if artifact is not None:
+                tooltip = f"Ingested existing CSV -> {artifact.dataset_id}\nPlan: {meta.get('policy_plan_type') or '—'}\nLog: {meta.get('log_path') or '—'}"
+                self.download_status.setText(f"Ingested existing CSV for {ticker}.")
+                self._update_progress_row(ticker, status="ingested", rows=artifact.bar_count, done=True, tooltip=tooltip)
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="ingested",
+                    summary=str(meta.get("policy_reason") or ""),
+                    parquet_path=artifact.parquet_path,
+                    coverage_start=artifact.start,
+                    coverage_end=artifact.end,
+                    bar_count=artifact.bar_count,
+                    ingested=True,
+                    quality_snapshot=artifact.quality_snapshot,
+                )
+                self._clear_download_artifact_state(meta)
+            else:
+                summary = error or "Existing CSV ingestion failed."
+                self.download_status.setText(f"{ticker} CSV found but ingest failed: {summary}")
+                self._update_progress_row(ticker, status="ingest_error", tooltip=summary)
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="ingest_error",
+                    summary=summary,
+                    parquet_path=str(meta.get("prefill_parquet_path") or meta.get("out_path") or ""),
+                    coverage_start=meta.get("prefill_coverage_start"),
+                    coverage_end=meta.get("prefill_coverage_end"),
+                    bar_count=meta.get("prefill_bar_count"),
+                    ingested=False,
+                )
+                self._write_download_artifact_state(meta, "downloaded", last_error=summary)
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
+            return
+        if branch == "secondary_prefill":
+            decision = context.get("decision")
+            if artifact is not None:
+                meta["prefill_parquet_path"] = artifact.parquet_path
+                meta["prefill_coverage_start"] = artifact.start
+                meta["prefill_coverage_end"] = artifact.end
+                meta["prefill_bar_count"] = artifact.bar_count
+                self._append_download_log(
+                    Path(str(meta.get("log_path") or "")),
+                    (
+                        f"[{pd.Timestamp.now('UTC').isoformat()}] Secondary gap fill complete for {ticker}\n"
+                        f"Source: {getattr(decision, 'secondary_source', '') or '—'} / {getattr(decision, 'secondary_dataset_id', '') or '—'}\n"
+                        f"Windows: {list(getattr(decision, 'secondary_request_windows', ()) or [])}\n\n"
+                    ),
+                )
+                if getattr(decision, "action", "") == ACQUISITION_ACTION_GAP_FILL_SECONDARY:
+                    self._start_download_finalize_worker(
+                        ticker=ticker,
+                        meta=meta,
+                        job={
+                            "mode": "gap_fill",
+                            "target_dataset_id": build_download_dataset_id(
+                                ticker,
+                                source=str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER),
+                                history_window=str(meta.get("history_window") or ""),
+                                resolution=str(meta.get("resolution") or ""),
+                            ),
+                            "secondary_dataset_id": str(getattr(decision, "secondary_dataset_id", "") or ""),
+                            "windows": self._decision_request_windows(decision),
+                            "resolution": str(meta.get("resolution") or ""),
+                        },
+                        context={"branch": "gap_fill_only", "decision": decision},
+                    )
+                    return
+                    if not self.download_paused:
+                        self._launch_download_process_for_meta(meta)
+                    else:
+                        self._paused_download_launch_metas.append(dict(meta))
+                        self._write_download_artifact_state(meta, "paused")
+                        self._persist_download_session_state()
+                return
+            summary = error or "Secondary gap-fill pre-step failed."
+            self.download_status.setText(f"{ticker} secondary gap fill failed: {summary}")
+            self._update_progress_row(ticker, status="gap_fill_error", tooltip=summary)
+            self._record_acquisition_attempt_result(
+                ticker=ticker,
+                meta=meta,
+                status="gap_fill_error",
+                summary=summary,
+                parquet_path=context.get("decision").parquet_path if context.get("decision") is not None else None,
+                coverage_start=context.get("decision").coverage_start if context.get("decision") is not None else None,
+                coverage_end=context.get("decision").coverage_end if context.get("decision") is not None else None,
+                bar_count=context.get("decision").bar_count if context.get("decision") is not None else None,
+                ingested=False,
+            )
+            self._write_download_artifact_state(meta, "interrupted", last_error=summary)
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
+            return
+        if branch == "gap_fill_only":
+            decision = context.get("decision")
+            if artifact is not None:
+                summary = (
+                    f"{getattr(decision, 'reason', '')} Secondary source: {getattr(decision, 'secondary_source', '') or '—'} "
+                    f"dataset={getattr(decision, 'secondary_dataset_id', '') or '—'} "
+                    f"parity={getattr(decision, 'parity_state', '')} overlap={getattr(decision, 'parity_overlap_bars', 0)}"
+                )
+                self.download_status.setText(
+                    f"Gap-filled {ticker} from {getattr(decision, 'secondary_source', '') or 'secondary source'}."
+                )
+                self._update_progress_row(
+                    ticker,
+                    status="gap_filled",
+                    rows=artifact.bar_count,
+                    done=True,
+                    tooltip=(
+                        f"Gap-filled from {getattr(decision, 'secondary_source', '') or 'secondary source'}\n"
+                        f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                        f"Log: {meta.get('log_path') or '—'}"
+                    ),
+                )
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="gap_filled",
+                    summary=summary,
+                    parquet_path=artifact.parquet_path,
+                    coverage_start=artifact.start,
+                    coverage_end=artifact.end,
+                    bar_count=artifact.bar_count,
+                    ingested=True,
+                    quality_snapshot=artifact.quality_snapshot,
+                )
+                self._clear_download_artifact_state(meta)
+            else:
+                summary = error or "Cross-source gap fill failed."
+                self.download_status.setText(f"{ticker} gap fill failed: {summary}")
+                self._update_progress_row(ticker, status="gap_fill_error", tooltip=summary)
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="gap_fill_error",
+                    summary=summary,
+                    parquet_path=getattr(decision, "parquet_path", None),
+                    coverage_start=getattr(decision, "coverage_start", None),
+                    coverage_end=getattr(decision, "coverage_end", None),
+                    bar_count=getattr(decision, "bar_count", None),
+                    ingested=False,
+                )
+                self._write_download_artifact_state(meta, "interrupted", last_error=summary)
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
+            return
+        if branch == "post_download_ingest":
+            row_info = self.download_progress_rows.get(ticker, {})
+            request_windows = list(meta.get("request_windows") or [(None, None)])
+            window_total = len(request_windows)
+            window_index = int(meta.get("window_index") or 0)
+            current_window_pages = int(meta.get("current_window_pages") or 0)
+            if artifact is not None:
+                meta["latest_parquet_path"] = artifact.parquet_path
+                meta["latest_coverage_start"] = artifact.start
+                meta["latest_coverage_end"] = artifact.end
+                meta["latest_bar_count"] = artifact.bar_count
+                if window_index + 1 < window_total:
+                    if row_info:
+                        row_info["progress_completed_steps"] = int(row_info.get("progress_completed_steps") or 0) + current_window_pages
+                        row_info["progress_current_steps"] = 0
+                    meta["window_index"] = window_index + 1
+                    meta["last_error"] = ""
+                    self.download_status.setText(
+                        f"Finished {ticker} window {window_index + 1}/{window_total}; continuing…"
+                    )
+                    self._update_progress_row(
+                        ticker,
+                        status="running",
+                        rows=artifact.bar_count,
+                        tooltip=(
+                            f"Completed window {window_index + 1}/{window_total}\n"
+                            f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                            f"Log: {meta.get('log_path') or '—'}"
+                        ),
+                    )
+                    if not self.download_paused:
+                        self._launch_download_process_for_meta(meta)
+                    else:
+                        self._paused_download_launch_metas.append(dict(meta))
+                        self._write_download_artifact_state(meta, "paused")
+                        self._persist_download_session_state()
+                    return
+                if row_info:
+                    row_info["progress_completed_steps"] = int(row_info.get("progress_completed_steps") or 0) + current_window_pages
+                    row_info["progress_current_steps"] = 0
+                summary = str(meta.get("policy_reason") or "")
+                if window_total > 1:
+                    summary = f"{summary} Completed {window_total} request windows.".strip()
+                self.download_status.setText(f"Finished {ticker} and ingested {artifact.bar_count} bars.")
+                self._update_progress_row(
+                    ticker,
+                    status="ingested",
+                    rows=artifact.bar_count,
+                    done=True,
+                    tooltip=(
+                        f"Ingested -> {artifact.dataset_id}\n"
+                        f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                        f"Merge With Existing: {'yes' if meta.get('merge_with_existing') else 'no'}\n"
+                        f"Windows: {window_total}\n"
+                        f"Log: {meta.get('log_path') or '—'}"
+                    ),
+                )
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="ingested",
+                    summary=summary,
+                    parquet_path=artifact.parquet_path,
+                    coverage_start=artifact.start,
+                    coverage_end=artifact.end,
+                    bar_count=artifact.bar_count,
+                    ingested=True,
+                    quality_snapshot=artifact.quality_snapshot,
+                )
+                self._clear_download_artifact_state(meta)
+            else:
+                summary = error or "Download completed but ingestion failed."
+                self.download_status.setText(f"{ticker} downloaded but ingest failed: {summary}")
+                self._update_progress_row(ticker, status="ingest_error", tooltip=summary)
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="ingest_error",
+                    summary=summary,
+                    parquet_path=None,
+                    coverage_start=None,
+                    coverage_end=None,
+                    bar_count=int(meta.get("rows") or 0),
+                    ingested=False,
+                )
+                self._write_download_artifact_state(meta, "downloaded", last_error=summary)
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
 
     @staticmethod
     def _decision_request_windows(decision) -> list[tuple[str | None, str | None]]:
@@ -9988,6 +15410,110 @@ WantedBy=default.target
             for start, end in list(decision.secondary_request_windows or [])
         ]
 
+    @staticmethod
+    def _offset_from_history_spec(value: str | None) -> pd.DateOffset | None:
+        text = str(value or "").strip().lower()
+        if not text:
+            return None
+        digits = "".join(ch for ch in text if ch.isdigit())
+        unit = "".join(ch for ch in text if ch.isalpha())
+        if not digits or not unit:
+            return None
+        amount = int(digits)
+        if amount <= 0:
+            return None
+        if unit == "y":
+            return pd.DateOffset(years=amount)
+        if unit == "m":
+            return pd.DateOffset(months=amount)
+        if unit == "w":
+            return pd.DateOffset(weeks=amount)
+        if unit == "d":
+            return pd.DateOffset(days=amount)
+        if unit == "mo":
+            return pd.DateOffset(months=amount)
+        return None
+
+    @staticmethod
+    def _to_utc_timestamp(value: str | pd.Timestamp | None) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            stamp = pd.Timestamp(value)
+        except Exception:
+            return None
+        if stamp.tzinfo is None:
+            return stamp.tz_localize("UTC")
+        return stamp.tz_convert("UTC")
+
+    @classmethod
+    def _count_offset_windows(
+        cls,
+        start: pd.Timestamp | None,
+        end: pd.Timestamp | None,
+        offset: pd.DateOffset | None,
+    ) -> int | None:
+        if start is None or end is None or offset is None or end <= start:
+            return None
+        cursor = start
+        steps = 0
+        while cursor < end:
+            cursor = min(cursor + offset, end)
+            steps += 1
+            if steps > 100000:
+                break
+        return max(steps, 1)
+
+    def _estimate_download_step_total(self, meta: dict) -> int | None:
+        source = str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER)
+        resolution = str(meta.get("resolution") or "")
+        history_window = str(meta.get("history_window") or "")
+        tuning = provider_fetch_tuning(source, resolution=resolution, history_window=history_window)
+        chunk_offset = self._offset_from_history_spec(tuning.default_chunk_duration)
+        if chunk_offset is None:
+            return None
+        request_windows = list(meta.get("request_windows") or [])
+        if not request_windows:
+            request_windows = [(meta.get("request_start"), meta.get("request_end"))]
+        now_utc = pd.Timestamp.now("UTC")
+        history_offset = self._offset_from_history_spec(history_window)
+        total_steps = 0
+        for raw_start, raw_end in request_windows:
+            end_ts = self._to_utc_timestamp(raw_end) or now_utc
+            start_ts = self._to_utc_timestamp(raw_start)
+            if start_ts is None and history_offset is not None:
+                start_ts = end_ts - history_offset
+            steps = self._count_offset_windows(start_ts, end_ts, chunk_offset)
+            if steps is None:
+                return None
+            total_steps += steps
+        return total_steps or None
+
+    def _configure_progress_tracking(self, ticker: str, meta: dict) -> None:
+        if ticker not in self.download_progress_rows:
+            return
+        row_info = self.download_progress_rows[ticker]
+        bar: QtWidgets.QProgressBar = row_info["bar"]
+        planned_steps = self._estimate_download_step_total(meta)
+        row_info["progress_mode"] = "steps" if planned_steps else "indeterminate"
+        row_info["progress_total_steps"] = int(planned_steps or 0)
+        row_info["progress_completed_steps"] = int(row_info.get("progress_completed_steps") or 0)
+        row_info["progress_current_steps"] = 0
+        if planned_steps:
+            bar.setRange(0, int(planned_steps))
+            bar.setValue(min(int(row_info["progress_completed_steps"]), int(planned_steps)))
+            pct = int(round((100.0 * int(row_info["progress_completed_steps"])) / max(int(planned_steps), 1)))
+            bar.setFormat(f"{pct}%")
+            pages_item = self.progress_table.item(row_info["row"], 2)
+            if pages_item is not None:
+                pages_item.setText(f"{int(row_info['progress_completed_steps'])}/{int(planned_steps)}")
+        else:
+            bar.setRange(0, 0)
+            bar.setFormat("")
+
     def _launch_download_process_for_meta(self, meta: dict) -> None:
         source = str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER)
         ticker = str(meta.get("ticker") or "")
@@ -9997,6 +15523,7 @@ WantedBy=default.target
         window_start, window_end = request_windows[window_index]
         meta["current_window_start"] = window_start
         meta["current_window_end"] = window_end
+        meta["current_window_pages"] = 0
         proc = QtCore.QProcess(self)
         proc.setProgram(sys.executable)
         extra_args: list[str] = []
@@ -10021,32 +15548,47 @@ WantedBy=default.target
         proc.finished.connect(self._download_finished)
         proc.errorOccurred.connect(self._download_process_error)
         process_env = QtCore.QProcessEnvironment.systemEnvironment()
-        for key, value in self._provider_runtime_environment(source).items():
+        runtime_env = self._provider_runtime_environment(source, meta)
+        for key, value in runtime_env.items():
             process_env.insert(key, value)
         proc.setProcessEnvironment(process_env)
         self.download_proc_meta[id(proc)] = meta
+        client_note = ""
+        client_tooltip = ""
+        if str(source).strip().lower() == "interactive_brokers":
+            client_note = f"Runtime Client ID: {runtime_env.get('IB_CLIENT_ID', '—')}\n"
+            client_tooltip = (
+                f"Client ID: {runtime_env.get('IB_CLIENT_ID')}\n"
+                if runtime_env.get("IB_CLIENT_ID")
+                else ""
+            )
         launch_text = (
             f"[{pd.Timestamp.now('UTC').isoformat()}] Launching download for {ticker}"
             f" window {window_index + 1}/{window_total}\n"
             f"Request Window: {window_start or 'provider default'} -> {window_end or 'provider default'}\n"
+            f"{client_note}"
             f"Command: {' '.join(args)}\n\n"
         )
         self._append_download_log(Path(str(meta["log_path"])), launch_text)
         proc.start()
         self.download_proc = proc
         self.download_procs.append(proc)
+        self._write_download_artifact_state(meta, "running")
         self.download_status.setText(
             f"Downloading {ticker} window {window_index + 1}/{window_total}…"
         )
+        self._refresh_download_header_progress(ticker)
         self._update_progress_row(
             ticker,
             status="running",
             tooltip=(
                 f"Window {window_index + 1}/{window_total}\n"
                 f"Request: {window_start or 'provider default'} -> {window_end or 'provider default'}\n"
+                f"{client_tooltip}"
                 f"Log: {meta['log_path']}"
             ),
         )
+        self._persist_download_session_state()
 
     def _record_acquisition_attempt_result(
         self,
@@ -10060,6 +15602,7 @@ WantedBy=default.target
         coverage_end: str | None = None,
         bar_count: int | None = None,
         ingested: bool = False,
+        quality_snapshot: dict | None = None,
     ) -> None:
         if not self.current_acquisition_run_id or not ticker:
             return
@@ -10092,10 +15635,12 @@ WantedBy=default.target
             universe_id=self.download_universe_id or None,
             resolution=str(meta.get("resolution") or provider.default_resolution),
             history_window=str(meta.get("history_window") or provider.default_history_window),
+            quality_snapshot=quality_snapshot,
         )
         self.current_acquisition_attempts[ticker] = status
         if ingested and parquet_path:
             self._refresh_dataset_options()
+        self._invalidate_picker_snapshot()
 
     def _finish_current_acquisition_run(self, *, stopped: bool = False) -> None:
         run_id = self.current_acquisition_run_id
@@ -10131,29 +15676,14 @@ WantedBy=default.target
         )
         self.current_acquisition_run_id = None
         self.current_acquisition_attempts = {}
+        self._active_download_source = None
 
-    def _start_download(self) -> None:
-        if self.download_procs:
-            QtWidgets.QMessageBox.information(self, "Download running", "A download process is already running.")
+    def _ensure_acquisition_run(self, *, source: str, symbol_count: int, note: str) -> None:
+        if self.current_acquisition_run_id:
             return
-        symbols = self._selected_download_symbols()
-        if not symbols:
-            QtWidgets.QMessageBox.warning(self, "No tickers", "Select at least one ticker or a universe with symbols.")
-            return
-        source = self._resolved_download_source()
-        provider = get_acquisition_provider(source)
-        self.download_queue = list(symbols)
-        self.download_progress_rows = {}
-        self.download_proc_meta = {}
-        self.progress_table.setRowCount(0)
-        self.download_paused = False
-        self.download_progress.setVisible(True)
-        self.download_progress.setRange(0, 0)
-        self.download_status.setText("Starting downloads…")
-        self.download_procs = []
+        selected_universe = self._selected_download_universe() or {}
         self.current_acquisition_run_id = f"acq_{uuid.uuid4().hex[:8]}"
         self.current_acquisition_attempts = {}
-        selected_universe = self._selected_download_universe() or {}
         ResultCatalog(self.catalog.db_path).start_acquisition_run(
             acquisition_run_id=self.current_acquisition_run_id,
             trigger_type="interactive_download",
@@ -10162,15 +15692,275 @@ WantedBy=default.target
             universe_name=str(selected_universe.get("name", "") or "") or None,
             started_at=pd.Timestamp.utcnow().isoformat(),
             status="running",
-            symbol_count=len(self.download_queue),
-            notes=f"Interactive download request launched from Automate tab using {provider_display_name(source)}.",
+            symbol_count=max(0, int(symbol_count or 0)),
+            notes=note,
         )
-        for _ in range(min(self.concurrency_spin.value(), len(self.download_queue))):
-            self._start_next_download()
+
+    def _start_download_policy_worker(self, meta: dict) -> None:
+        ticker = str(meta.get("ticker") or "").strip().upper()
+        if not ticker:
+            return
+        payload = {
+            "ticker": ticker,
+            "source": str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER),
+            "resolution": str(meta.get("resolution") or ""),
+            "history_window": str(meta.get("history_window") or ""),
+            "catalog_path": str(self.catalog.db_path),
+            "force_refresh": bool(self.force_refresh_chk.isChecked()),
+        }
+        worker = AcquisitionPolicyWorker(payload, self)
+        self.download_policy_workers[ticker] = worker
+        self.download_policy_metas[ticker] = dict(meta)
+        worker.result_signal.connect(self._on_download_policy_result)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_download_policy_result(self, result: object) -> None:
+        payload = dict(result or {}) if isinstance(result, dict) else {}
+        ticker = str(payload.get("ticker") or "").strip().upper()
+        worker = self.download_policy_workers.pop(ticker, None)
+        meta = self.download_policy_metas.pop(ticker, None)
+        if worker is not None:
+            worker.deleteLater()
+        if meta is None:
+            return
+        if self._closing:
+            return
+        error = str(payload.get("error") or "").strip()
+        decision = payload.get("decision")
+        if error or decision is None:
+            summary = error or "Acquisition policy planning failed."
+            meta["last_error"] = summary
+            self.download_status.setText(f"{ticker} planning failed: {summary}")
+            self._update_progress_row(ticker, status="error", tooltip=summary)
+            if self.current_acquisition_run_id and ticker:
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="failed",
+                    summary=summary,
+                    parquet_path=None,
+                    coverage_start=None,
+                    coverage_end=None,
+                    bar_count=int(meta.get("rows") or 0),
+                    ingested=False,
+                )
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
+            return
+        self._handle_download_policy_decision(meta, decision)
+
+    def _handle_download_policy_decision(self, meta: dict, decision: object) -> None:
+        ticker = str(meta.get("ticker") or "").strip().upper()
+        meta.update(
+            {
+                "rows": int(getattr(decision, "bar_count", 0) or 0),
+                "policy_reason": getattr(decision, "reason", ""),
+                "policy_action": getattr(decision, "action", ""),
+                "policy_plan_type": getattr(decision, "plan_type", ""),
+                "request_start": getattr(decision, "request_start", None),
+                "request_end": getattr(decision, "request_end", None),
+                "request_windows": self._decision_request_windows(decision),
+                "secondary_request_windows": self._decision_secondary_request_windows(decision),
+                "merge_with_existing": bool(getattr(decision, "merge_with_existing", False)),
+                "window_index": 0,
+                "secondary_source": getattr(decision, "secondary_source", None),
+                "secondary_dataset_id": getattr(decision, "secondary_dataset_id", None),
+                "parity_state": getattr(decision, "parity_state", None),
+                "parity_overlap_bars": getattr(decision, "parity_overlap_bars", None),
+                "parity_close_mae": getattr(decision, "parity_close_mae", None),
+                "parity_close_mean_abs_bps": getattr(decision, "parity_close_mean_abs_bps", None),
+                "last_error": "",
+            }
+        )
+        self._configure_progress_tracking(ticker, meta)
+        self._write_download_artifact_state(meta, "queued")
+        launch_lines = [
+            f"[{pd.Timestamp.now('UTC').isoformat()}] Acquisition policy for {ticker}: {getattr(decision, 'action', '')}",
+            f"Plan: {getattr(decision, 'plan_type', '')}",
+            f"Reason: {getattr(decision, 'reason', '')}",
+            (
+                f"Request Window: {getattr(decision, 'request_start', None) or 'provider default'} -> "
+                f"{getattr(decision, 'request_end', None) or 'provider default'}"
+            ),
+            f"Merge With Existing Dataset: {'yes' if getattr(decision, 'merge_with_existing', False) else 'no'}",
+        ]
+        request_windows = getattr(decision, "request_windows", None)
+        if request_windows:
+            launch_lines.append(f"Request Windows: {list(request_windows)}")
+        secondary_request_windows = getattr(decision, "secondary_request_windows", None)
+        if secondary_request_windows:
+            launch_lines.append(f"Secondary Repair Windows: {list(secondary_request_windows)}")
+        if getattr(decision, "secondary_dataset_id", None):
+            launch_lines.append(
+                f"Secondary Source: {getattr(decision, 'secondary_source', None)} / {getattr(decision, 'secondary_dataset_id', None)}"
+            )
+        if getattr(decision, "secondary_dataset_id", None) and getattr(decision, "parity_close_mean_abs_bps", None) is not None:
+            launch_lines.append(
+                f"Parity: {getattr(decision, 'parity_state', None)} "
+                f"({getattr(decision, 'parity_overlap_bars', 0)} overlap bars, "
+                f"mean abs {float(getattr(decision, 'parity_close_mean_abs_bps', 0.0)):.2f} bps)"
+            )
+        launch_text = "\n".join(launch_lines)
+        self._append_download_log(Path(str(meta["log_path"])), launch_text + "\n")
+        self._persist_download_session_state()
+        if getattr(decision, "action", "") == ACQUISITION_ACTION_SKIP_FRESH:
+            tooltip = (
+                f"{getattr(decision, 'reason', '')}\nPlan: {getattr(decision, 'plan_type', '')}\n"
+                f"Coverage: {getattr(decision, 'coverage_start', None) or '—'} → {getattr(decision, 'coverage_end', None) or '—'}\nLog: {meta['log_path']}"
+            )
+            self.download_status.setText(f"Skipping {ticker}: dataset is already fresh.")
+            self._update_progress_row(ticker, status="skipped", rows=getattr(decision, "bar_count", None), done=True, tooltip=tooltip)
+            self._record_acquisition_attempt_result(
+                ticker=ticker,
+                meta=meta,
+                status="skipped",
+                summary=getattr(decision, "reason", ""),
+                parquet_path=getattr(decision, "parquet_path", None),
+                coverage_start=getattr(decision, "coverage_start", None),
+                coverage_end=getattr(decision, "coverage_end", None),
+                bar_count=getattr(decision, "bar_count", None),
+                ingested=bool(getattr(decision, "ingested", False)),
+            )
+            self._clear_download_artifact_state(meta)
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
+            return
+        if getattr(decision, "action", "") == ACQUISITION_ACTION_INGEST_EXISTING:
+            self.download_status.setText(f"Ingesting existing CSV for {ticker}…")
+            self._update_progress_row(ticker, status="ingesting", tooltip=f"Ingesting existing CSV\nLog: {meta['log_path']}")
+            self._start_download_finalize_worker(
+                ticker=ticker,
+                meta=meta,
+                job={
+                    "mode": "ingest_csv",
+                    "out_path": Path(getattr(decision, "csv_path", "")),
+                    "dataset_id": build_download_dataset_id(
+                        ticker,
+                        source=str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER),
+                        history_window=str(meta.get("history_window") or ""),
+                        resolution=str(meta.get("resolution") or ""),
+                    ),
+                    "merge_existing": bool(getattr(decision, "merge_with_existing", False)),
+                    "resolution": str(meta.get("resolution") or ""),
+                },
+                context={"branch": "ingest_existing"},
+            )
+            return
+        if getattr(decision, "secondary_dataset_id", None) and self._decision_secondary_request_windows(decision):
+            self.download_status.setText(f"Running secondary gap fill for {ticker}…")
+            self._update_progress_row(
+                ticker,
+                status="gap_fill",
+                tooltip=f"Secondary gap fill pre-step\nLog: {meta['log_path']}",
+            )
+            self._start_download_finalize_worker(
+                ticker=ticker,
+                meta=meta,
+                job={
+                    "mode": "gap_fill",
+                    "target_dataset_id": build_download_dataset_id(
+                        ticker,
+                        source=str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER),
+                        history_window=str(meta.get("history_window") or ""),
+                        resolution=str(meta.get("resolution") or ""),
+                    ),
+                    "secondary_dataset_id": str(getattr(decision, "secondary_dataset_id", "") or ""),
+                    "windows": self._decision_secondary_request_windows(decision),
+                    "resolution": str(meta.get("resolution") or ""),
+                },
+                context={"branch": "secondary_prefill", "decision": decision},
+            )
+            return
+        if getattr(decision, "action", "") == ACQUISITION_ACTION_GAP_FILL_SECONDARY:
+            self.download_status.setText(f"Gap filling {ticker} from {getattr(decision, 'secondary_source', None) or 'secondary source'}…")
+            self._update_progress_row(
+                ticker,
+                status="gap_fill",
+                tooltip=f"Gap filling from {getattr(decision, 'secondary_source', None) or 'secondary source'}\nLog: {meta['log_path']}",
+            )
+            self._start_download_finalize_worker(
+                ticker=ticker,
+                meta=meta,
+                job={
+                    "mode": "gap_fill",
+                    "target_dataset_id": build_download_dataset_id(
+                        ticker,
+                        source=str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER),
+                        history_window=str(meta.get("history_window") or ""),
+                        resolution=str(meta.get("resolution") or ""),
+                    ),
+                    "secondary_dataset_id": str(getattr(decision, "secondary_dataset_id", "") or ""),
+                    "windows": self._decision_request_windows(decision),
+                    "resolution": str(meta.get("resolution") or ""),
+                },
+                context={"branch": "gap_fill_only", "decision": decision},
+            )
+            return
+        if self.download_paused:
+            self.download_status.setText(f"Download paused before launching {ticker}.")
+            self._update_progress_row(
+                ticker,
+                status="paused",
+                tooltip=(
+                    f"Acquisition plan ready; provider launch is waiting for resume.\n"
+                    f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                    f"Log: {meta['log_path']}"
+                ),
+            )
+            self._paused_download_launch_metas.append(dict(meta))
+            self._write_download_artifact_state(
+                meta,
+                "paused",
+                last_error="Download launch deferred while the queue was paused.",
+            )
+            self._persist_download_session_state()
+            return
+        self._launch_download_process_for_meta(meta)
+
+    def _start_download(self) -> None:
+        if self.download_procs or self.download_policy_workers or self.download_finalize_workers:
+            QtWidgets.QMessageBox.information(self, "Download running", "A download process is already running.")
+            return
+        symbols = self._selected_download_symbols()
+        if not symbols:
+            QtWidgets.QMessageBox.warning(self, "No tickers", "Select at least one ticker or a universe with symbols.")
+            return
+        source = self._resolved_download_source()
+        provider = get_acquisition_provider(source)
+        self._active_download_source = source
+        self.download_queue = list(symbols)
+        self.download_progress_rows = {}
+        self.download_policy_workers = {}
+        self.download_policy_metas = {}
+        self.download_proc_meta = {}
+        self.download_finalize_workers = {}
+        self.download_finalize_metas = {}
+        self._paused_download_launch_metas = []
+        self.progress_table.setRowCount(0)
+        self.download_paused = False
+        self._download_stop_requested = False
+        self.download_progress.setVisible(True)
+        self.download_progress.setRange(0, 0)
+        self.download_status.setText("Starting downloads…")
+        self.download_procs = []
+        selected_universe = self._selected_download_universe() or {}
+        self._ensure_acquisition_run(
+            source=source,
+            symbol_count=len(self.download_queue),
+            note=f"Interactive download request launched from Data Collection tab using {provider_display_name(source)}.",
+        )
+        self._persist_download_session_state()
+        self._maybe_start_downloads()
 
     def _start_next_download(self) -> None:
         if not self.download_queue:
-            if not self.download_procs:
+            if (
+                not self.download_policy_workers
+                and not self.download_procs
+                and not self.download_finalize_workers
+                and not self._download_stop_requested
+            ):
                 self._finish_current_acquisition_run()
                 self.download_status.setText("Downloads complete.")
                 self.download_progress.setVisible(False)
@@ -10178,7 +15968,7 @@ WantedBy=default.target
             return
         ticker = self.download_queue.pop(0)
         self.download_active_ticker = ticker
-        source = self._resolved_download_source()
+        source = str(self._active_download_source or self._resolved_download_source())
         provider = get_acquisition_provider(source)
         out_path = build_download_csv_path(
             ticker,
@@ -10188,226 +15978,49 @@ WantedBy=default.target
         )
         log_path = self._create_download_log_path(ticker)
         self._ensure_progress_row(ticker, log_path)
-        decision = decide_acquisition_policy(
-            ticker,
-            source=source,
-            resolution=provider.default_resolution,
-            history_window=provider.default_history_window,
-            catalog=ResultCatalog(self.catalog.db_path),
-            force_refresh=bool(self.force_refresh_chk.isChecked()),
-        )
         meta = {
             "ticker": ticker,
             "log_path": str(log_path),
             "buffer": "",
             "last_error": "",
-            "rows": int(decision.bar_count or 0),
+            "rows": 0,
             "out_path": str(out_path),
             "attempt_started_at": pd.Timestamp.utcnow().isoformat(),
             "source": source,
             "history_window": provider.default_history_window,
             "resolution": provider.default_resolution,
-            "policy_reason": decision.reason,
-            "policy_action": decision.action,
-            "policy_plan_type": decision.plan_type,
-            "request_start": decision.request_start,
-            "request_end": decision.request_end,
-            "request_windows": self._decision_request_windows(decision),
-            "secondary_request_windows": self._decision_secondary_request_windows(decision),
-            "merge_with_existing": bool(decision.merge_with_existing),
+            "policy_reason": "",
+            "policy_action": "",
+            "policy_plan_type": "",
+            "request_start": None,
+            "request_end": None,
+            "request_windows": [],
+            "secondary_request_windows": [],
+            "merge_with_existing": False,
             "window_index": 0,
-            "secondary_source": decision.secondary_source,
-            "secondary_dataset_id": decision.secondary_dataset_id,
-            "parity_state": decision.parity_state,
-            "parity_overlap_bars": decision.parity_overlap_bars,
-            "parity_close_mae": decision.parity_close_mae,
-            "parity_close_mean_abs_bps": decision.parity_close_mean_abs_bps,
+            "secondary_source": None,
+            "secondary_dataset_id": None,
+            "parity_state": None,
+            "parity_overlap_bars": 0,
+            "parity_close_mae": None,
+            "parity_close_mean_abs_bps": None,
         }
+        self._configure_progress_tracking(ticker, meta)
         launch_text = (
-            f"[{pd.Timestamp.now('UTC').isoformat()}] Acquisition policy for {ticker}: {decision.action}\n"
-            f"Plan: {decision.plan_type}\n"
-            f"Reason: {decision.reason}\n"
-            f"Request Window: {decision.request_start or 'provider default'} -> {decision.request_end or 'provider default'}\n"
-            f"Merge With Existing Dataset: {'yes' if decision.merge_with_existing else 'no'}\n"
-            f"{f'Request Windows: {list(decision.request_windows)}\\n' if decision.request_windows else ''}"
-            f"{f'Secondary Repair Windows: {list(decision.secondary_request_windows)}\\n' if decision.secondary_request_windows else ''}"
-            f"{f'Secondary Source: {decision.secondary_source} / {decision.secondary_dataset_id}\\n' if decision.secondary_dataset_id else ''}"
-            f"{f'Parity: {decision.parity_state} ({decision.parity_overlap_bars} overlap bars, mean abs {decision.parity_close_mean_abs_bps:.2f} bps)\\n' if decision.secondary_dataset_id and decision.parity_close_mean_abs_bps is not None else ''}"
+            f"[{pd.Timestamp.now('UTC').isoformat()}] Evaluating acquisition policy for {ticker}\n"
+            f"Source: {source}\n"
+            f"Resolution: {provider.default_resolution}\n"
+            f"History Window: {provider.default_history_window}\n\n"
         )
         self._append_download_log(log_path, launch_text + "\n")
-        if decision.action == ACQUISITION_ACTION_SKIP_FRESH:
-            tooltip = (
-                f"{decision.reason}\nPlan: {decision.plan_type}\n"
-                f"Coverage: {decision.coverage_start or '—'} → {decision.coverage_end or '—'}\nLog: {log_path}"
-            )
-            self.download_status.setText(f"Skipping {ticker}: dataset is already fresh.")
-            self._update_progress_row(ticker, status="skipped", rows=decision.bar_count, done=True, tooltip=tooltip)
-            self._record_acquisition_attempt_result(
-                ticker=ticker,
-                meta=meta,
-                status="skipped",
-                summary=decision.reason,
-                parquet_path=decision.parquet_path,
-                coverage_start=decision.coverage_start,
-                coverage_end=decision.coverage_end,
-                bar_count=decision.bar_count,
-                ingested=decision.ingested,
-            )
-            QtCore.QTimer.singleShot(0, self._start_next_download)
-            return
-        if decision.action == ACQUISITION_ACTION_INGEST_EXISTING:
-            ingest_status, artifact, ingest_error = self._auto_ingest_downloaded_csv(
-                ticker=ticker,
-                out_path=Path(decision.csv_path),
-                source=source,
-                history_window=provider.default_history_window,
-                resolution=provider.default_resolution,
-                merge_with_existing=bool(decision.merge_with_existing),
-            )
-            if artifact is not None:
-                tooltip = f"Ingested existing CSV → {artifact.dataset_id}\nPlan: {decision.plan_type}\nLog: {log_path}"
-                self.download_status.setText(f"Ingested existing CSV for {ticker}.")
-                self._update_progress_row(
-                    ticker,
-                    status="ingested",
-                    rows=artifact.bar_count,
-                    done=True,
-                    tooltip=tooltip,
-                )
-                self._record_acquisition_attempt_result(
-                    ticker=ticker,
-                    meta=meta,
-                    status=ingest_status,
-                    summary=decision.reason,
-                    parquet_path=artifact.parquet_path,
-                    coverage_start=artifact.start,
-                    coverage_end=artifact.end,
-                    bar_count=artifact.bar_count,
-                    ingested=True,
-                )
-            else:
-                summary = ingest_error or "Existing CSV ingestion failed."
-                self.download_status.setText(f"{ticker} CSV found but ingest failed: {summary}")
-                self._update_progress_row(ticker, status="ingest_error", tooltip=summary)
-                self._record_acquisition_attempt_result(
-                    ticker=ticker,
-                    meta=meta,
-                    status=ingest_status,
-                    summary=summary,
-                    parquet_path=decision.parquet_path,
-                    coverage_start=decision.coverage_start,
-                    coverage_end=decision.coverage_end,
-                    bar_count=decision.bar_count,
-                    ingested=False,
-                )
-            QtCore.QTimer.singleShot(0, self._start_next_download)
-            return
-        if decision.secondary_dataset_id and self._decision_secondary_request_windows(decision):
-            try:
-                artifact = None
-                for window_start, window_end in self._decision_secondary_request_windows(decision):
-                    artifact = gap_fill_dataset_from_secondary(
-                        build_download_dataset_id(
-                            ticker,
-                            source=source,
-                            history_window=provider.default_history_window,
-                            resolution=provider.default_resolution,
-                        ),
-                        str(decision.secondary_dataset_id or ""),
-                        start=window_start,
-                        end=window_end,
-                    )
-                meta["prefill_parquet_path"] = artifact.parquet_path if artifact is not None else None
-                meta["prefill_coverage_start"] = artifact.start if artifact is not None else None
-                meta["prefill_coverage_end"] = artifact.end if artifact is not None else None
-                meta["prefill_bar_count"] = artifact.bar_count if artifact is not None else None
-                self._append_download_log(
-                    log_path,
-                    (
-                        f"[{pd.Timestamp.now('UTC').isoformat()}] Secondary gap fill complete for {ticker}\n"
-                        f"Source: {decision.secondary_source or '—'} / {decision.secondary_dataset_id or '—'}\n"
-                        f"Windows: {list(decision.secondary_request_windows)}\n\n"
-                    ),
-                )
-            except Exception as exc:
-                summary = f"Secondary gap-fill pre-step failed: {exc}"
-                self.download_status.setText(f"{ticker} secondary gap fill failed: {exc}")
-                self._update_progress_row(ticker, status="gap_fill_error", tooltip=summary)
-                self._record_acquisition_attempt_result(
-                    ticker=ticker,
-                    meta=meta,
-                    status="gap_fill_error",
-                    summary=summary,
-                    parquet_path=decision.parquet_path,
-                    coverage_start=decision.coverage_start,
-                    coverage_end=decision.coverage_end,
-                    bar_count=decision.bar_count,
-                    ingested=False,
-                )
-                QtCore.QTimer.singleShot(0, self._start_next_download)
-                return
-        if decision.action == ACQUISITION_ACTION_GAP_FILL_SECONDARY:
-            try:
-                artifact = None
-                windows = self._decision_request_windows(decision)
-                for window_start, window_end in windows:
-                    artifact = gap_fill_dataset_from_secondary(
-                        build_download_dataset_id(
-                            ticker,
-                            source=source,
-                            history_window=provider.default_history_window,
-                            resolution=provider.default_resolution,
-                        ),
-                        str(decision.secondary_dataset_id or ""),
-                        start=window_start,
-                        end=window_end,
-                    )
-                summary = (
-                    f"{decision.reason} Secondary source: {decision.secondary_source or '—'} "
-                    f"dataset={decision.secondary_dataset_id or '—'} "
-                    f"parity={decision.parity_state} overlap={decision.parity_overlap_bars}"
-                )
-                self.download_status.setText(f"Gap-filled {ticker} from {decision.secondary_source or 'secondary source'}.")
-                self._update_progress_row(
-                    ticker,
-                    status="gap_filled",
-                    rows=artifact.bar_count if artifact is not None else decision.bar_count,
-                    done=True,
-                    tooltip=(
-                        f"Gap-filled from {decision.secondary_source or 'secondary source'}\n"
-                        f"Plan: {decision.plan_type}\n"
-                        f"Log: {log_path}"
-                    ),
-                )
-                self._record_acquisition_attempt_result(
-                    ticker=ticker,
-                    meta=meta,
-                    status="gap_filled",
-                    summary=summary,
-                    parquet_path=artifact.parquet_path if artifact is not None else decision.parquet_path,
-                    coverage_start=artifact.start if artifact is not None else decision.coverage_start,
-                    coverage_end=artifact.end if artifact is not None else decision.coverage_end,
-                    bar_count=artifact.bar_count if artifact is not None else decision.bar_count,
-                    ingested=True,
-                )
-            except Exception as exc:
-                summary = f"Cross-source gap fill failed: {exc}"
-                self.download_status.setText(f"{ticker} gap fill failed: {exc}")
-                self._update_progress_row(ticker, status="gap_fill_error", tooltip=summary)
-                self._record_acquisition_attempt_result(
-                    ticker=ticker,
-                    meta=meta,
-                    status="gap_fill_error",
-                    summary=summary,
-                    parquet_path=decision.parquet_path,
-                    coverage_start=decision.coverage_start,
-                    coverage_end=decision.coverage_end,
-                    bar_count=decision.bar_count,
-                    ingested=False,
-                )
-            QtCore.QTimer.singleShot(0, self._start_next_download)
-            return
-        self._launch_download_process_for_meta(meta)
+        self.download_status.setText(f"Evaluating acquisition plan for {ticker}…")
+        self._update_progress_row(
+            ticker,
+            status="planning",
+            tooltip=f"Evaluating acquisition policy in a worker thread\nLog: {log_path}",
+        )
+        self._start_download_policy_worker(meta)
+        self._persist_download_session_state()
 
     def _handle_download_output(self) -> None:
         proc = self.sender()
@@ -10440,26 +16053,39 @@ WantedBy=default.target
             pages = payload.get("pages")
             rows = payload.get("rows")
             meta["rows"] = int(rows or 0)
+            meta["current_window_pages"] = int(pages or 0)
+            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
             self.download_status.setText(
                 f"Downloading {payload.get('ticker')}… pages={pages} rows={rows}"
             )
             self._update_progress_row(payload.get("ticker"), pages=pages, rows=rows)
+            self._refresh_download_header_progress(payload.get("ticker"))
         elif payload.get("type") == "start":
+            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
             self.download_status.setText(
                 f"Downloading {payload.get('ticker')}… {payload.get('start')} → {payload.get('end')}"
             )
             self._update_progress_row(payload.get("ticker"), status="running")
+            self._refresh_download_header_progress(payload.get("ticker"))
+            self._persist_download_session_state()
         elif payload.get("type") == "done":
             meta["rows"] = int(payload.get("rows") or 0)
+            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
             self.download_status.setText(
                 f"Finished {payload.get('ticker')} ({payload.get('rows')} bars)"
             )
             self._update_progress_row(payload.get("ticker"), status="done", rows=payload.get("rows"), done=True)
+            self._refresh_download_header_progress(payload.get("ticker"))
+            self._persist_download_session_state()
         elif payload.get("type") == "error":
             message = str(payload.get("message") or payload.get("details") or "Unknown download error")
             meta["last_error"] = message
+            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
             self.download_status.setText(f"{payload.get('ticker')} failed: {message}")
             self._update_progress_row(payload.get("ticker"), status="error", tooltip=message)
+            self._refresh_download_header_progress(payload.get("ticker"))
+            self._write_download_artifact_state(meta, "interrupted", last_error=message)
+            self._persist_download_session_state()
 
     def _download_process_error(self, error: QtCore.QProcess.ProcessError) -> None:
         proc = self.sender()
@@ -10473,18 +16099,16 @@ WantedBy=default.target
         meta["last_error"] = message
         self.download_status.setText(f"{ticker} failed: {message}")
         self._update_progress_row(ticker, status="error", tooltip=message)
+        self._write_download_artifact_state(meta, "interrupted", last_error=message)
+        self._persist_download_session_state()
 
     def _download_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus) -> None:
         proc = self.sender()
         meta = self._download_meta(proc) if isinstance(proc, QtCore.QProcess) else None
         ticker = str(meta.get("ticker", "")) if meta else ""
-        continue_same_ticker = False
         if meta:
             source = str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER)
             provider = get_acquisition_provider(source)
-            request_windows = list(meta.get("request_windows") or [(None, None)])
-            window_total = len(request_windows)
-            window_index = int(meta.get("window_index") or 0)
             remainder = str(meta.get("buffer", ""))
             if remainder.strip():
                 self._append_download_log(Path(meta["log_path"]), remainder + "\n")
@@ -10492,12 +16116,6 @@ WantedBy=default.target
                 meta["buffer"] = ""
             log_path = Path(meta["log_path"])
             summary = str(meta.get("last_error") or "")
-            attempt_status = "ingested"
-            parquet_path = None
-            coverage_start = None
-            coverage_end = None
-            bar_count = int(meta.get("rows") or 0)
-            ingested = False
             if (exit_code != 0 or exit_status != QtCore.QProcess.ExitStatus.NormalExit) and not summary:
                 try:
                     summary = self._summarize_error(log_path.read_text(encoding="utf-8"))
@@ -10506,104 +16124,69 @@ WantedBy=default.target
             if exit_code != 0 or exit_status != QtCore.QProcess.ExitStatus.NormalExit:
                 if not summary:
                     summary = f"Process exited with code {exit_code}"
-                attempt_status = "download_error"
                 self.download_status.setText(f"{ticker} failed: {summary}")
                 self._update_progress_row(ticker, status="error", tooltip=summary)
+                self._write_download_artifact_state(meta, "interrupted", last_error=summary)
+                if self.current_acquisition_run_id and ticker:
+                    self._record_acquisition_attempt_result(
+                        ticker=ticker,
+                        meta=meta,
+                        status="download_error",
+                        summary=summary,
+                        parquet_path=None,
+                        coverage_start=None,
+                        coverage_end=None,
+                        bar_count=int(meta.get("rows") or 0),
+                        ingested=False,
+                    )
             elif ticker:
-                ingest_status, artifact, ingest_error = self._auto_ingest_downloaded_csv(
-                    ticker=ticker,
-                    out_path=Path(str(meta.get("out_path") or "")),
-                    source=source,
-                    history_window=str(meta.get("history_window") or provider.default_history_window),
-                    resolution=str(meta.get("resolution") or provider.default_resolution),
-                    merge_with_existing=bool(meta.get("merge_with_existing") or window_index > 0 or window_total > 1),
+                self._write_download_artifact_state(meta, "downloaded")
+                self.download_status.setText(f"Ingesting {ticker} and analyzing dataset quality…")
+                self._update_progress_row(
+                    ticker,
+                    status="ingesting",
+                    tooltip=(
+                        f"Ingesting downloaded CSV and computing dataset quality\n"
+                        f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                        f"Log: {log_path}"
+                    ),
                 )
-                attempt_status = ingest_status
-                if artifact is not None:
-                    parquet_path = artifact.parquet_path
-                    coverage_start = artifact.start
-                    coverage_end = artifact.end
-                    bar_count = artifact.bar_count
-                    ingested = True
-                    meta["latest_parquet_path"] = artifact.parquet_path
-                    meta["latest_coverage_start"] = artifact.start
-                    meta["latest_coverage_end"] = artifact.end
-                    meta["latest_bar_count"] = artifact.bar_count
-                    if window_index + 1 < window_total:
-                        meta["window_index"] = window_index + 1
-                        meta["last_error"] = ""
-                        continue_same_ticker = True
-                        self.download_status.setText(
-                            f"Finished {ticker} window {window_index + 1}/{window_total}; continuing…"
-                        )
-                        self._update_progress_row(
-                            ticker,
-                            status="running",
-                            rows=artifact.bar_count,
-                            tooltip=(
-                                f"Completed window {window_index + 1}/{window_total}\n"
-                                f"Plan: {meta.get('policy_plan_type') or '—'}\n"
-                                f"Log: {log_path}"
-                            ),
-                        )
-                    else:
-                        summary = summary or str(meta.get("policy_reason") or "")
-                        if window_total > 1:
-                            summary = f"{summary} Completed {window_total} request windows.".strip()
-                        self.download_status.setText(f"Finished {ticker} and ingested {artifact.bar_count} bars.")
-                        self._update_progress_row(
-                            ticker,
-                            status="ingested",
-                            rows=artifact.bar_count,
-                            done=True,
-                            tooltip=(
-                                f"Ingested → {artifact.dataset_id}\n"
-                                f"Plan: {meta.get('policy_plan_type') or '—'}\n"
-                                f"Merge With Existing: {'yes' if meta.get('merge_with_existing') else 'no'}\n"
-                                f"Windows: {window_total}\n"
-                                f"Log: {log_path}"
-                            ),
-                        )
-                else:
-                    summary = ingest_error or "Download completed but ingestion failed."
-                    self.download_status.setText(f"{ticker} downloaded but ingest failed: {summary}")
-                    self._update_progress_row(ticker, status="ingest_error", tooltip=summary)
-            if self.current_acquisition_run_id and ticker and not continue_same_ticker:
-                self._record_acquisition_attempt_result(
+                request_windows = list(meta.get("request_windows") or [(None, None)])
+                window_total = len(request_windows)
+                window_index = int(meta.get("window_index") or 0)
+                self._start_download_finalize_worker(
                     ticker=ticker,
                     meta=meta,
-                    status=attempt_status,
-                    summary=summary,
-                    parquet_path=parquet_path,
-                    coverage_start=coverage_start,
-                    coverage_end=coverage_end,
-                    bar_count=bar_count,
-                    ingested=ingested,
+                    job={
+                        "mode": "ingest_csv",
+                        "out_path": Path(str(meta.get("out_path") or "")),
+                        "dataset_id": build_download_dataset_id(
+                            ticker,
+                            source=source,
+                            history_window=str(meta.get("history_window") or provider.default_history_window),
+                            resolution=str(meta.get("resolution") or provider.default_resolution),
+                        ),
+                        "merge_existing": bool(meta.get("merge_with_existing") or window_index > 0 or window_total > 1),
+                        "resolution": str(meta.get("resolution") or provider.default_resolution),
+                    },
+                    context={"branch": "post_download_ingest"},
                 )
         if isinstance(proc, QtCore.QProcess) and proc in self.download_procs:
             self.download_procs.remove(proc)
         if isinstance(proc, QtCore.QProcess):
             self.download_proc_meta.pop(id(proc), None)
         self.download_proc = self.download_procs[0] if self.download_procs else None
-        if continue_same_ticker and meta is not None:
-            if self.download_paused:
-                return
-            self._launch_download_process_for_meta(meta)
-            return
+        if ticker and str(self.download_active_ticker or "") == ticker:
+            next_meta = self.download_proc_meta.get(id(self.download_proc)) if self.download_proc is not None else None
+            self.download_active_ticker = str(next_meta.get("ticker") or "") if next_meta else None
+        self._refresh_download_header_progress(self.download_active_ticker)
+        self._persist_download_session_state()
         if self.download_paused:
             return
-        if self.download_queue:
-            self._start_next_download()
-        elif not self.download_procs:
-            self._finish_current_acquisition_run()
-            if self.download_status.text().startswith(f"{ticker} failed:"):
-                pass
-            else:
-                self.download_status.setText("Downloads complete.")
-            self.download_progress.setVisible(False)
+        self._maybe_start_downloads()
 
     def _pause_download(self) -> None:
-        if not self.download_procs:
+        if not self.download_procs and not self.download_policy_workers and not self.download_queue and not self._paused_download_launch_metas:
             return
         for proc in list(self.download_procs):
             if proc.state() == QtCore.QProcess.ProcessState.NotRunning:
@@ -10615,28 +16198,71 @@ WantedBy=default.target
         self.download_status.setText("Download paused.")
         for ticker in list(self.download_progress_rows.keys()):
             self._update_progress_row(ticker, status="paused")
+        for meta in list(self.download_proc_meta.values()):
+            self._write_download_artifact_state(meta, "paused")
+        self._persist_download_session_state()
 
     def _resume_download(self) -> None:
-        if not self.download_procs:
-            return
+        if not self.download_procs and not self.download_policy_workers and not self._paused_download_launch_metas and not self.download_queue:
+            restored = self._restore_download_session_if_available()
+            if not restored and (not self.download_queue and not self.download_procs and not self.download_policy_workers and not self._paused_download_launch_metas):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Resume Downloads",
+                    "No interrupted or failed download checkpoints were found to resume.",
+                )
+                return
         for proc in list(self.download_procs):
             if proc.state() == QtCore.QProcess.ProcessState.NotRunning:
                 continue
             pid = proc.processId()
             if pid:
                 os.kill(pid, signal.SIGCONT)
+        if self.download_queue and not self.current_acquisition_run_id:
+            source = str(self._active_download_source or self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
+            self._ensure_acquisition_run(
+                source=source,
+                symbol_count=len(self.download_queue),
+                note=(
+                    f"Retry/resume download batch launched from Data Collection tab using "
+                    f"{provider_display_name(source)}."
+                ),
+            )
         self.download_paused = False
         self.download_status.setText("Download resumed.")
         for ticker in list(self.download_progress_rows.keys()):
             self._update_progress_row(ticker, status="running")
+        concurrency = max(1, int(self.concurrency_spin.value()))
+        while self._paused_download_launch_metas and self._active_download_slot_count() < concurrency:
+            meta = self._paused_download_launch_metas.pop(0)
+            self._launch_download_process_for_meta(meta)
+        self._persist_download_session_state()
+        self._maybe_start_downloads()
 
     def _stop_download(self) -> None:
+        self._download_stop_requested = True
+        for meta in list(self.download_proc_meta.values()):
+            self._write_download_artifact_state(meta, "stopped", last_error="Download stopped by the user.")
+        for meta in list(self.download_finalize_metas.values()):
+            self._write_download_artifact_state(meta, "finalizing", last_error="Dashboard stop requested during finalization.")
+        for meta in list(self._paused_download_launch_metas):
+            self._write_download_artifact_state(meta, "stopped", last_error="Download stopped by the user.")
         for proc in list(self.download_procs):
             if proc.state() != QtCore.QProcess.ProcessState.NotRunning:
                 proc.kill()
+        for worker in list(self.download_policy_workers.values()):
+            try:
+                worker.requestInterruption()
+            except Exception:
+                continue
+        self.download_policy_workers = {}
+        self.download_policy_metas = {}
         self.download_procs = []
         self.download_proc = None
+        self.download_proc_meta = {}
+        self.download_finalize_metas = {}
         self.download_queue = []
+        self._paused_download_launch_metas = []
         self.download_active_ticker = None
         self.download_paused = False
         self.download_progress.setVisible(False)
@@ -10644,6 +16270,7 @@ WantedBy=default.target
         self._finish_current_acquisition_run(stopped=True)
         for ticker in list(self.download_progress_rows.keys()):
             self._update_progress_row(ticker, status="stopped")
+        self._persist_download_session_state(clear=True)
 
     def _ensure_progress_row(self, ticker: str, log_path: Path | None = None) -> None:
         if ticker in self.download_progress_rows:
@@ -10657,13 +16284,40 @@ WantedBy=default.target
         self.progress_table.setItem(row, 2, QtWidgets.QTableWidgetItem("0"))
         self.progress_table.setItem(row, 3, QtWidgets.QTableWidgetItem("0"))
         bar = QtWidgets.QProgressBar()
-        bar.setRange(0, EXPECTED_2Y_1M_EQUITY_ROWS)
+        bar.setRange(0, 100)
         bar.setValue(0)
+        bar.setTextVisible(True)
+        bar.setFormat("0%")
+        bar.setStyleSheet(
+            f"""
+            QProgressBar {{
+                background: rgba(255,255,255,.08);
+                color: {PALETTE['panel']};
+                border: 1px solid {PALETTE['border']};
+                border-radius: 6px;
+                text-align: center;
+                font-weight: 700;
+            }}
+            QProgressBar::chunk {{
+                background: {PALETTE['green']};
+                border-radius: 5px;
+                margin: 1px;
+            }}
+            """
+        )
         self.progress_table.setCellWidget(row, 4, bar)
         log_btn = QtWidgets.QPushButton("Log")
         log_btn.clicked.connect(lambda _, sym=ticker: self._open_download_log(sym))
         self.progress_table.setCellWidget(row, 5, log_btn)
-        self.download_progress_rows[ticker] = {"row": row, "bar": bar, "log_path": str(log_path) if log_path else None}
+        self.download_progress_rows[ticker] = {
+            "row": row,
+            "bar": bar,
+            "log_path": str(log_path) if log_path else None,
+            "progress_mode": "indeterminate",
+            "progress_total_steps": 0,
+            "progress_completed_steps": 0,
+            "progress_current_steps": 0,
+        }
 
     def _update_progress_row(
         self,
@@ -10676,8 +16330,9 @@ WantedBy=default.target
     ) -> None:
         if not ticker or ticker not in self.download_progress_rows:
             return
-        row = self.download_progress_rows[ticker]["row"]
-        bar: QtWidgets.QProgressBar = self.download_progress_rows[ticker]["bar"]
+        row_info = self.download_progress_rows[ticker]
+        row = row_info["row"]
+        bar: QtWidgets.QProgressBar = row_info["bar"]
         if status:
             item = self.progress_table.item(row, 1)
             if item:
@@ -10687,21 +16342,46 @@ WantedBy=default.target
         if pages is not None:
             item = self.progress_table.item(row, 2)
             if item:
-                item.setText(str(pages))
+                if row_info.get("progress_mode") == "steps" and int(row_info.get("progress_total_steps") or 0) > 0:
+                    row_info["progress_current_steps"] = int(pages)
+                    total_steps = int(row_info["progress_total_steps"])
+                    current_steps = min(
+                        int(row_info.get("progress_completed_steps") or 0) + int(pages),
+                        total_steps,
+                    )
+                    item.setText(f"{current_steps}/{total_steps}")
+                    bar.setRange(0, total_steps)
+                    bar.setValue(current_steps)
+                    pct = int(round((100.0 * current_steps) / max(total_steps, 1)))
+                    bar.setFormat(f"{pct}%")
+                else:
+                    item.setText(str(pages))
         if rows is not None:
             item = self.progress_table.item(row, 3)
             if item:
                 item.setText(str(rows))
-            if bar.maximum() > 0:
+            if row_info.get("progress_mode") != "steps" and bar.maximum() > 0:
                 bar.setValue(min(int(rows), bar.maximum()))
         if done:
-            bar.setRange(0, 100)
-            bar.setValue(100)
+            total_steps = int(row_info.get("progress_total_steps") or 0)
+            if row_info.get("progress_mode") == "steps" and total_steps > 0:
+                pages_item = self.progress_table.item(row, 2)
+                if pages_item is not None:
+                    pages_item.setText(f"{total_steps}/{total_steps}")
+                bar.setRange(0, total_steps)
+                bar.setValue(total_steps)
+                bar.setFormat("100%")
+            else:
+                bar.setRange(0, 100)
+                bar.setValue(100)
+                bar.setFormat("100%")
         if tooltip:
             for col in range(self.progress_table.columnCount()):
                 item = self.progress_table.item(row, col)
                 if item is not None:
                     item.setToolTip(tooltip)
+        if str(self.download_active_ticker or "") == str(ticker):
+            self._refresh_download_header_progress(ticker)
 
     def _render_batches(self, batches: List[BatchRow]) -> None:
         self.batch_model.set_batches(batches)
@@ -10721,6 +16401,84 @@ WantedBy=default.target
             self._render_batches(batches)
             self._update_metrics(runs)
 
+    def picker_snapshot_frame(self) -> pd.DataFrame | None:
+        return self._picker_snapshot_frame
+
+    def _request_picker_snapshot_refresh(self, *, force: bool = False) -> None:
+        if not force and self._picker_snapshot_frame is not None:
+            return
+        if self._picker_snapshot_worker is not None:
+            self._picker_snapshot_refresh_pending = self._picker_snapshot_refresh_pending or force
+            return
+        self._picker_snapshot_worker = AcquisitionSnapshotWorker(self.catalog.db_path, self)
+        self._picker_snapshot_worker.loaded.connect(self._on_picker_snapshot_loaded)
+        self._picker_snapshot_worker.error.connect(self._on_picker_snapshot_error)
+        self._picker_snapshot_worker.finished.connect(self._picker_snapshot_worker.deleteLater)
+        self._picker_snapshot_worker.start()
+
+    def _invalidate_picker_snapshot(self) -> None:
+        self._picker_snapshot_frame = None
+        if self.download_procs or self.download_finalize_workers:
+            self._picker_snapshot_refresh_pending = True
+            return
+        self._request_picker_snapshot_refresh(force=True)
+
+    def _on_picker_snapshot_loaded(self, frame: object) -> None:
+        self._picker_snapshot_worker = None
+        self._picker_snapshot_frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+        if self._picker_snapshot_refresh_pending:
+            self._picker_snapshot_refresh_pending = False
+            self._request_picker_snapshot_refresh(force=True)
+
+    def _on_picker_snapshot_error(self, _message: str) -> None:
+        self._picker_snapshot_worker = None
+        if self._picker_snapshot_refresh_pending:
+            self._picker_snapshot_refresh_pending = False
+            self._request_picker_snapshot_refresh(force=True)
+
+    def _active_download_slot_count(self) -> int:
+        return len(self.download_policy_workers) + len(self.download_procs) + len(self.download_finalize_workers)
+
+    def _maybe_start_downloads(self) -> None:
+        if self._closing:
+            return
+        if self.download_paused:
+            return
+        concurrency = max(1, int(self.concurrency_spin.value()))
+        while self.download_queue and self._active_download_slot_count() < concurrency:
+            self._start_next_download()
+        if self._download_stop_requested:
+            if not self.download_procs and not self.download_finalize_workers:
+                self.download_active_ticker = None
+            return
+        if not self.download_queue and not self.download_policy_workers and not self.download_procs and not self.download_finalize_workers:
+            recovery_source = str(self._active_download_source or self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
+            recoverable_tickers = self._recoverable_download_tickers()
+            self._finish_current_acquisition_run()
+            if recoverable_tickers:
+                self._active_download_source = recovery_source
+                self._retain_download_rows(recoverable_tickers)
+                self.download_queue = list(recoverable_tickers)
+                self.download_paused = True
+                self.download_active_ticker = None
+                self.download_progress.setVisible(False)
+                self.download_status.setText(
+                    "Downloads finished with failed/interrupted tickers. Click Resume to retry them, or use the Acquisition Catalog failure tools."
+                )
+                self._persist_download_session_state()
+                if self._picker_snapshot_refresh_pending:
+                    self._picker_snapshot_refresh_pending = False
+                    self._request_picker_snapshot_refresh(force=True)
+                return
+            if not str(self.download_status.text() or "").startswith("Download stopped"):
+                self.download_status.setText("Downloads complete.")
+            self.download_progress.setVisible(False)
+            self.download_active_ticker = None
+            self._persist_download_session_state(clear=True)
+            if self._picker_snapshot_refresh_pending:
+                self._picker_snapshot_refresh_pending = False
+                self._request_picker_snapshot_refresh(force=True)
+
     # -- actions -------------------------------------------------------------
     def refresh(self, refresh_heatmap: bool = True) -> None:
         self._load_tasks()
@@ -10730,9 +16488,27 @@ WantedBy=default.target
         batches = self.catalog.load_batches()
         self._render_batches(batches)
         self._update_metrics(runs)
+        if (
+            hasattr(self, "tabs")
+            and (
+                self.tabs.currentWidget() is getattr(self, "asset_information_tab", None)
+                or self.asset_catalog_frame.empty
+            )
+        ):
+            self._refresh_asset_information_tab()
+        if (
+            hasattr(self, "tabs")
+            and (
+                self.tabs.currentWidget() is getattr(self, "asset_screener_tab", None)
+                or self.asset_screener_frame.empty
+            )
+        ):
+            self._refresh_asset_screener_tab()
         self._update_optimization_panel()
         self._update_walk_forward_panel()
         self._update_monte_carlo_panel()
+        self._update_deployment_panel()
+        self._update_live_monitor_panel()
         if refresh_heatmap:
             self._update_heatmap()
         status = f"DB: {self.catalog.db_path} ({len(runs)} runs, {len(batches)} batches)"
@@ -11431,6 +17207,1295 @@ WantedBy=default.target
             f"P95 Max DD: {MonteCarloStudyDialog._fmt(summary.get('max_drawdown_p95'))}"
         )
 
+    def _ensure_default_deployment_targets(self) -> None:
+        existing = self.catalog.load_deployment_targets()
+        existing_ids = {str(item) for item in existing.get("target_id", pd.Series(dtype=str)).tolist()}
+        engine_root = Path("/home/ethan/algo_trading_engine")
+        engine_exists = engine_root.exists()
+        defaults = [
+            {
+                "target_id": "algo_engine_live",
+                "name": "Algo Engine Live",
+                "mode": "live",
+                "broker_scope": "public",
+                "transport_mode": "co_located" if engine_exists else "remote_http",
+                "base_url": "http://127.0.0.1" if engine_exists else "",
+                "webhook_path": "/live_webhook",
+                "status_path": "/live_status",
+                "dashboard_path": "/live",
+                "logs_path": "/logs_data?scope=live",
+                "project_root": str(engine_root) if engine_exists else "",
+                "db_path": str(engine_root / "live.db") if engine_exists else "",
+                "log_db_path": str(engine_root / "engine_logs.db") if engine_exists else "",
+                "secret_ref": "LIVE_WEBHOOK_SECRET",
+                "is_active": True,
+            },
+            {
+                "target_id": "algo_engine_paper",
+                "name": "Algo Engine Paper",
+                "mode": "paper",
+                "broker_scope": "paper",
+                "transport_mode": "co_located" if engine_exists else "remote_http",
+                "base_url": "http://127.0.0.1" if engine_exists else "",
+                "webhook_path": "/webhook",
+                "status_path": "/status",
+                "dashboard_path": "/",
+                "logs_path": "/logs_data?scope=all",
+                "project_root": str(engine_root) if engine_exists else "",
+                "db_path": str(engine_root / "paper.db") if engine_exists else "",
+                "log_db_path": str(engine_root / "engine_logs.db") if engine_exists else "",
+                "secret_ref": "WEBHOOK_SECRET",
+                "is_active": True,
+            },
+        ]
+        for payload in defaults:
+            if str(payload["target_id"]) in existing_ids:
+                continue
+            self.catalog.save_deployment_target(**payload)
+
+    @staticmethod
+    def _deployment_kind_label(kind: str) -> str:
+        mapping = {
+            "single_strategy": "Single Strategy",
+            "portfolio_shared_strategy": "Portfolio Shared Strategy",
+            "portfolio_strategy_blocks": "Portfolio Strategy Blocks",
+        }
+        return mapping.get(str(kind or ""), str(kind or "").replace("_", " ").title() or "Unknown")
+
+    @staticmethod
+    def _decode_json_dict(raw) -> dict:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(str(raw))
+        except Exception:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    @staticmethod
+    def _decode_json_list(raw) -> list:
+        if isinstance(raw, list):
+            return list(raw)
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(str(raw))
+        except Exception:
+            return []
+        return list(decoded) if isinstance(decoded, list) else []
+
+    @staticmethod
+    def _deployment_fmt_money(value) -> str:
+        if value is None or pd.isna(value):
+            return "—"
+        try:
+            return f"{float(value):,.2f}"
+        except Exception:
+            return "—"
+
+    @staticmethod
+    def _deployment_fmt_ratio(value) -> str:
+        if value is None or pd.isna(value):
+            return "—"
+        try:
+            return f"{float(value):.3f}"
+        except Exception:
+            return "—"
+
+    @staticmethod
+    def _deployment_fmt_pct(value) -> str:
+        if value is None or pd.isna(value):
+            return "—"
+        try:
+            return f"{float(value) * 100:.1f}%"
+        except Exception:
+            return "—"
+
+    @staticmethod
+    def _deployment_construction_config_from_batch_params(params: dict) -> dict:
+        return {
+            "allocation_ownership": str(params.get("_portfolio_allocation_ownership", ALLOCATION_OWNERSHIP_STRATEGY)),
+            "ranking_mode": str(params.get("_portfolio_ranking_mode", RANKING_MODE_NONE)),
+            "max_ranked_assets": int(params.get("_portfolio_rank_count", 1) or 1),
+            "min_rank_score": float(params.get("_portfolio_score_threshold", 0.0) or 0.0),
+            "weighting_mode": str(params.get("_portfolio_weighting_mode", WEIGHTING_MODE_PRESERVE)),
+            "min_active_weight": float(params.get("_portfolio_min_active_weight", 0.0) or 0.0),
+            "max_asset_weight": float(params.get("_portfolio_max_asset_weight", 0.0) or 0.0),
+            "cash_reserve_weight": float(params.get("_portfolio_cash_reserve_weight", 0.0) or 0.0),
+            "rebalance_mode": str(params.get("_portfolio_rebalance_mode", REBALANCE_MODE_ON_CHANGE)),
+            "rebalance_every_n_bars": int(params.get("_portfolio_rebalance_every_n_bars", 20) or 20),
+            "rebalance_weight_drift_threshold": float(params.get("_portfolio_rebalance_drift_threshold", 0.05) or 0.05),
+        }
+
+    @staticmethod
+    def _dataset_ids_from_strategy_blocks(strategy_blocks: Sequence[dict]) -> list[str]:
+        dataset_ids: list[str] = []
+        seen: set[str] = set()
+        for block in list(strategy_blocks or []):
+            block_ids = [str(item) for item in list(block.get("asset_dataset_ids") or []) if str(item).strip()]
+            if not block_ids:
+                block_ids = [
+                    str(asset.get("dataset_id") or "")
+                    for asset in list(block.get("assets") or [])
+                    if str(asset.get("dataset_id") or "").strip()
+                ]
+            for dataset_id in block_ids:
+                if dataset_id not in seen:
+                    dataset_ids.append(dataset_id)
+                    seen.add(dataset_id)
+        return dataset_ids
+
+    def _deployment_targets_by_id(self) -> dict[str, dict]:
+        frame = self.deployment_targets_frame if not self.deployment_targets_frame.empty else self.catalog.load_deployment_targets()
+        if frame.empty:
+            return {}
+        return {
+            str(row.get("target_id", "") or ""): row.to_dict()
+            for _, row in frame.iterrows()
+            if str(row.get("target_id", "") or "").strip()
+        }
+
+    def _populate_deployment_target_combo(self, combo: QtWidgets.QComboBox) -> None:
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        frame = self.deployment_targets_frame if not self.deployment_targets_frame.empty else self.catalog.load_deployment_targets()
+        for _, row in frame.iterrows():
+            if not bool(row.get("is_active", True)):
+                continue
+            mode_label = str(row.get("mode", "") or "").title()
+            broker_scope = str(row.get("broker_scope", "") or "").replace("_", " ").title()
+            combo.addItem(f"{row.get('name', '')} | {mode_label} | {broker_scope}", str(row.get("target_id", "")))
+        if combo.count() > 0:
+            index = combo.findData(current)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _deployment_candidate_sources(self) -> list[dict]:
+        candidates = self.catalog.load_optimization_candidates("")
+        if candidates.empty:
+            return []
+        studies = self.catalog.load_optimization_studies()
+        study_map = {
+            str(row.get("study_id", "") or ""): row.to_dict()
+            for _, row in studies.iterrows()
+            if str(row.get("study_id", "") or "").strip()
+        }
+        batch_params_map = self._batch_params_dict_by_batch_id()
+        batch_rows = {str(batch.batch_id): batch for batch in self.catalog.load_batches()}
+        rows: list[dict] = []
+        for _, candidate in candidates.iterrows():
+            candidate_row = candidate.to_dict()
+            study_id = str(candidate_row.get("study_id", "") or "")
+            study_row = study_map.get(study_id, {})
+            params_payload = self._decode_json_dict(candidate_row.get("params_json"))
+            batch_id = str(study_row.get("batch_id", "") or "")
+            if not batch_id and study_id in batch_params_map:
+                batch_id = study_id
+            if not batch_id:
+                batch_id = str(params_payload.get("source_batch_id", "") or "")
+            batch_params = batch_params_map.get(batch_id, {})
+            batch_row = batch_rows.get(batch_id)
+
+            is_portfolio_study = bool(study_row) and self._is_portfolio_optimization_study(study_row, batch_params_map)
+            deployment_kind = "single_strategy"
+            structure_payload: dict = {}
+            dataset_ids: list[str] = []
+
+            if str(candidate_row.get("source_type", "") or "") == "fixed_portfolio_definition" or str(params_payload.get("source_kind", "")) == "portfolio_fixed_blocks":
+                deployment_kind = "portfolio_strategy_blocks"
+                structure_payload = {
+                    "strategy_blocks": list(params_payload.get("strategy_blocks") or batch_params.get("_portfolio_strategy_blocks") or []),
+                    "portfolio_dataset_ids": list(params_payload.get("portfolio_dataset_ids") or self._dataset_ids_from_strategy_blocks(params_payload.get("strategy_blocks") or batch_params.get("_portfolio_strategy_blocks") or [])),
+                    "construction_config": dict(params_payload.get("construction_config") or self._deployment_construction_config_from_batch_params(batch_params)),
+                    "source_kind": str(params_payload.get("source_kind") or "portfolio_fixed_blocks"),
+                    "source_batch_id": str(params_payload.get("source_batch_id", "") or batch_id),
+                }
+                dataset_ids = list(structure_payload.get("portfolio_dataset_ids") or [])
+            elif is_portfolio_study:
+                if list(batch_params.get("_portfolio_strategy_blocks") or []):
+                    deployment_kind = "portfolio_strategy_blocks"
+                    structure_payload = {
+                        "strategy_blocks": list(batch_params.get("_portfolio_strategy_blocks") or []),
+                        "portfolio_dataset_ids": self._portfolio_batch_dataset_ids(batch_row, batch_params) if batch_row else [],
+                        "construction_config": self._deployment_construction_config_from_batch_params(batch_params),
+                        "source_kind": "portfolio_study",
+                        "source_batch_id": batch_id,
+                    }
+                    dataset_ids = list(structure_payload.get("portfolio_dataset_ids") or [])
+                else:
+                    deployment_kind = "portfolio_shared_strategy"
+                    dataset_ids = self._portfolio_batch_dataset_ids(batch_row, batch_params) if batch_row else []
+                    if not dataset_ids:
+                        dataset_ids = [str(item) for item in list(study_row.get("dataset_scope") or []) if str(item).strip()]
+                    structure_payload = {
+                        "portfolio_dataset_ids": dataset_ids,
+                        "construction_config": self._deployment_construction_config_from_batch_params(batch_params),
+                        "source_kind": "portfolio_study",
+                        "source_batch_id": batch_id,
+                    }
+            else:
+                dataset_ids = [str(item) for item in list(study_row.get("dataset_scope") or []) if str(item).strip()]
+
+            strategy = str(
+                study_row.get("strategy", "")
+                or getattr(batch_row, "strategy", "")
+                or params_payload.get("strategy_name", "")
+                or ""
+            )
+            if not strategy and deployment_kind == "portfolio_strategy_blocks":
+                strategy = "Portfolio Strategy Blocks"
+            scope_label = "—"
+            if deployment_kind == "single_strategy":
+                if len(dataset_ids) == 1:
+                    scope_label = dataset_ids[0]
+                elif dataset_ids:
+                    scope_label = f"{len(dataset_ids)} datasets"
+            elif deployment_kind == "portfolio_shared_strategy":
+                scope_label = f"{len(dataset_ids)} assets" if dataset_ids else "Portfolio"
+            else:
+                block_count = len(list(structure_payload.get("strategy_blocks") or []))
+                asset_count = len(dataset_ids)
+                scope_label = f"{asset_count} assets | {block_count} blocks" if asset_count or block_count else "Portfolio Blocks"
+
+            source_label = "Optimization Study"
+            if str(candidate_row.get("source_type", "") or "") == "fixed_portfolio_definition":
+                source_label = "Fixed Portfolio Definition"
+            elif is_portfolio_study:
+                source_label = "Portfolio Study"
+
+            rows.append(
+                {
+                    "candidate_id": str(candidate_row.get("candidate_id", "") or ""),
+                    "study_id": study_id,
+                    "batch_id": batch_id,
+                    "deployment_kind": deployment_kind,
+                    "strategy": strategy,
+                    "scope_label": scope_label,
+                    "timeframe": str(candidate_row.get("timeframe", "") or ""),
+                    "source_label": source_label,
+                    "updated_at": candidate_row.get("updated_at"),
+                    "notes": str(candidate_row.get("notes", "") or ""),
+                    "params_json": str(candidate_row.get("params_json", "") or "{}"),
+                    "structure_json": json.dumps(structure_payload or {}, sort_keys=True),
+                    "validation_refs_json": json.dumps(
+                        {
+                            "candidate_id": str(candidate_row.get("candidate_id", "") or ""),
+                            "study_id": study_id,
+                            "batch_id": batch_id,
+                            "source_type": str(candidate_row.get("source_type", "") or ""),
+                        },
+                        sort_keys=True,
+                    ),
+                    "dataset_ids": list(dataset_ids),
+                    "candidate_row": candidate_row,
+                }
+            )
+        rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+        return rows
+
+    def _selected_deployment_candidate_source(self) -> dict | None:
+        if not hasattr(self, "deployment_candidate_table"):
+            return None
+        selection_model = self.deployment_candidate_table.selectionModel()
+        if selection_model is None:
+            return None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None
+        item = self.deployment_candidate_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return payload if isinstance(payload, dict) else None
+
+    def _refresh_deployment_candidate_details(self) -> None:
+        selected = self._selected_deployment_candidate_source()
+        if not selected:
+            self.deployment_candidate_details.clear()
+            return
+        notes = [
+            f"Kind: {self._deployment_kind_label(str(selected.get('deployment_kind', '') or ''))}",
+            f"Strategy: {selected.get('strategy', '') or '—'}",
+            f"Scope: {selected.get('scope_label', '') or '—'}",
+            f"Timeframe: {selected.get('timeframe', '') or '—'}",
+            f"Source: {selected.get('source_label', '') or '—'}",
+            f"Candidate ID: {selected.get('candidate_id', '') or '—'}",
+            "",
+            str(selected.get("notes", "") or "No candidate notes."),
+        ]
+        self.deployment_candidate_details.setPlainText("\n".join(notes))
+
+    def _parse_json_input(self, text: str, *, field_name: str) -> dict:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            raise ValueError(f"{field_name} must be valid JSON. {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"{field_name} must decode to a JSON object.")
+        return payload
+
+    def _manual_dataset_scope_list(self) -> list[str]:
+        return [
+            item.strip()
+            for item in str(self.manual_deployment_dataset_scope_edit.text() or "").split(",")
+            if item.strip()
+        ]
+
+    def _manual_deployment_payload_from_form(self) -> dict:
+        kind = str(self.manual_deployment_kind_combo.currentData() or "single_strategy")
+        strategy = str(self.manual_deployment_strategy_edit.text() or "").strip()
+        if not strategy:
+            raise ValueError("Strategy is required.")
+        params_payload = self._parse_json_input(self.manual_deployment_params_edit.toPlainText(), field_name="Params JSON")
+        structure_payload = self._parse_json_input(
+            self.manual_deployment_structure_edit.toPlainText(), field_name="Structure JSON"
+        )
+        dataset_scope = self._manual_dataset_scope_list()
+        symbol = str(self.manual_deployment_symbol_edit.text() or "").strip()
+        if kind == "single_strategy" and not symbol and not dataset_scope:
+            raise ValueError("Single-strategy deployment needs either a symbol or a dataset scope entry.")
+        if kind != "single_strategy" and not dataset_scope and not list(structure_payload.get("portfolio_dataset_ids") or []):
+            raise ValueError("Portfolio deployment needs a dataset scope or portfolio_dataset_ids in Structure JSON.")
+        target_id = str(self.manual_deployment_target_combo.currentData() or "")
+        if not target_id:
+            raise ValueError("Choose a deployment target first.")
+        sizing_payload = {
+            "qty_type": str(self.manual_deployment_sizing_type_combo.currentData() or "fixed"),
+            "qty_value": float(self.manual_deployment_sizing_value_spin.value()),
+        }
+        if kind != "single_strategy" and dataset_scope and "portfolio_dataset_ids" not in structure_payload:
+            structure_payload["portfolio_dataset_ids"] = list(dataset_scope)
+        return {
+            "deployment_kind": kind,
+            "strategy": strategy,
+            "strategy_version": str(self.manual_deployment_strategy_version_edit.text() or "").strip(),
+            "symbol": symbol,
+            "dataset_scope": list(dataset_scope),
+            "timeframe": str(self.manual_deployment_timeframe_edit.text() or "").strip(),
+            "params_json": params_payload,
+            "structure_json": structure_payload,
+            "target_id": target_id,
+            "sizing_json": sizing_payload,
+            "notes": str(self.manual_deployment_notes_edit.toPlainText() or "").strip(),
+        }
+
+    def _save_manual_deployment_definition_from_form(self) -> None:
+        try:
+            payload = self._manual_deployment_payload_from_form()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Manual Deployment", str(exc))
+            return
+        dataset_scope = list(payload.get("dataset_scope") or [])
+        self.catalog.save_manual_deployment_definition(
+            deployment_kind=str(payload.get("deployment_kind", "")),
+            strategy=str(payload.get("strategy", "")),
+            strategy_version=str(payload.get("strategy_version", "")),
+            dataset_id=dataset_scope[0] if len(dataset_scope) == 1 else "",
+            symbol=str(payload.get("symbol", "")),
+            dataset_scope_json=dataset_scope,
+            timeframe=str(payload.get("timeframe", "")),
+            params_json=payload.get("params_json") or {},
+            structure_json=payload.get("structure_json") or {},
+            target_id=str(payload.get("target_id", "")),
+            mode=str(self._deployment_targets_by_id().get(str(payload.get("target_id", "")), {}).get("mode", "")),
+            sizing_json=payload.get("sizing_json") or {},
+            notes=str(payload.get("notes", "")),
+        )
+        self.refresh(refresh_heatmap=False)
+        self.status_label.setText("Manual deployment definition saved.")
+
+    def _create_manual_deployment_from_form(self) -> None:
+        try:
+            payload = self._manual_deployment_payload_from_form()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Manual Deployment", str(exc))
+            return
+        source_id = self.catalog.save_manual_deployment_definition(
+            deployment_kind=str(payload.get("deployment_kind", "")),
+            strategy=str(payload.get("strategy", "")),
+            strategy_version=str(payload.get("strategy_version", "")),
+            dataset_id=(list(payload.get("dataset_scope") or []) or [""])[0] if len(list(payload.get("dataset_scope") or [])) == 1 else "",
+            symbol=str(payload.get("symbol", "")),
+            dataset_scope_json=list(payload.get("dataset_scope") or []),
+            timeframe=str(payload.get("timeframe", "")),
+            params_json=payload.get("params_json") or {},
+            structure_json=payload.get("structure_json") or {},
+            target_id=str(payload.get("target_id", "")),
+            mode=str(self._deployment_targets_by_id().get(str(payload.get("target_id", "")), {}).get("mode", "")),
+            sizing_json=payload.get("sizing_json") or {},
+            notes=str(payload.get("notes", "")),
+        )
+        self._create_deployment_records(
+            deployment_kind=str(payload.get("deployment_kind", "")),
+            source_type="manual",
+            source_id=str(source_id),
+            candidate_id="",
+            strategy=str(payload.get("strategy", "")),
+            strategy_version=str(payload.get("strategy_version", "")),
+            dataset_ids=list(payload.get("dataset_scope") or []),
+            symbol=str(payload.get("symbol", "")),
+            timeframe=str(payload.get("timeframe", "")),
+            params_json=payload.get("params_json") or {},
+            structure_json=payload.get("structure_json") or {},
+            validation_refs_json={"manual_definition_id": str(source_id)},
+            target_id=str(payload.get("target_id", "")),
+            sizing_json=payload.get("sizing_json") or {},
+            notes=str(payload.get("notes", "")),
+        )
+
+    def _create_deployment_from_selected_candidate(self) -> None:
+        selected = self._selected_deployment_candidate_source()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No candidate selected", "Select a validated candidate first.")
+            return
+        target_id = str(self.deployment_candidate_target_combo.currentData() or "")
+        if not target_id:
+            QtWidgets.QMessageBox.warning(self, "Missing target", "Choose a deployment target first.")
+            return
+        self._create_deployment_records(
+            deployment_kind=str(selected.get("deployment_kind", "")),
+            source_type="validated_candidate",
+            source_id=str(selected.get("study_id", "") or selected.get("batch_id", "") or selected.get("candidate_id", "")),
+            candidate_id=str(selected.get("candidate_id", "")),
+            strategy=str(selected.get("strategy", "")),
+            strategy_version="",
+            dataset_ids=list(selected.get("dataset_ids") or []),
+            symbol=str((selected.get("dataset_ids") or [""])[0] if len(list(selected.get("dataset_ids") or [])) == 1 else ""),
+            timeframe=str(selected.get("timeframe", "")),
+            params_json=self._decode_json_dict(selected.get("params_json")),
+            structure_json=self._decode_json_dict(selected.get("structure_json")),
+            validation_refs_json=self._decode_json_dict(selected.get("validation_refs_json")),
+            target_id=target_id,
+            sizing_json={
+                "qty_type": str(self.deployment_candidate_sizing_type_combo.currentData() or "fixed"),
+                "qty_value": float(self.deployment_candidate_sizing_value_spin.value()),
+            },
+            notes=str(selected.get("notes", "")),
+        )
+
+    def _create_deployment_records(
+        self,
+        *,
+        deployment_kind: str,
+        source_type: str,
+        source_id: str,
+        candidate_id: str,
+        strategy: str,
+        strategy_version: str,
+        dataset_ids: list[str],
+        symbol: str,
+        timeframe: str,
+        params_json: dict,
+        structure_json: dict,
+        validation_refs_json: dict,
+        target_id: str,
+        sizing_json: dict,
+        notes: str,
+    ) -> None:
+        target_row = self._deployment_targets_by_id().get(str(target_id), {})
+        mode = str(target_row.get("mode", "") or "")
+        parent_id = self.catalog.save_deployment(
+            deployment_kind=str(deployment_kind),
+            source_type=str(source_type),
+            source_id=str(source_id),
+            candidate_id=str(candidate_id or ""),
+            strategy=str(strategy),
+            strategy_version=str(strategy_version or ""),
+            dataset_id=dataset_ids[0] if len(dataset_ids) == 1 else "",
+            symbol=str(symbol or ""),
+            timeframe=str(timeframe or ""),
+            params_json=params_json or {},
+            structure_json=structure_json or {},
+            validation_refs_json=validation_refs_json or {},
+            target_id=str(target_id or ""),
+            mode=mode,
+            sizing_json=sizing_json or {},
+            status="draft",
+            notes=str(notes or ""),
+        )
+        if str(deployment_kind or "").startswith("portfolio_"):
+            if str(deployment_kind) == "portfolio_strategy_blocks":
+                blocks = list(structure_json.get("strategy_blocks") or [])
+                for block in blocks:
+                    block_id = str(block.get("block_id") or block.get("display_name") or block.get("strategy_name") or "block")
+                    block_strategy = str(block.get("strategy_name") or strategy or "")
+                    block_params = dict(block.get("strategy_params") or params_json or {})
+                    block_dataset_ids = [str(item) for item in list(block.get("asset_dataset_ids") or []) if str(item).strip()]
+                    if not block_dataset_ids:
+                        block_dataset_ids = [
+                            str(asset.get("dataset_id") or "")
+                            for asset in list(block.get("assets") or [])
+                            if str(asset.get("dataset_id") or "").strip()
+                        ]
+                    for dataset_id in block_dataset_ids:
+                        child_id = self.catalog.save_deployment(
+                            parent_deployment_id=parent_id,
+                            deployment_kind="single_strategy",
+                            source_type="portfolio_child",
+                            source_id=parent_id,
+                            candidate_id=str(candidate_id or ""),
+                            strategy=block_strategy,
+                            strategy_version=str(strategy_version or ""),
+                            dataset_id=dataset_id,
+                            symbol=dataset_id,
+                            timeframe=str(timeframe or ""),
+                            params_json=block_params,
+                            structure_json={},
+                            validation_refs_json=validation_refs_json or {},
+                            target_id=str(target_id or ""),
+                            mode=mode,
+                            sizing_json=sizing_json or {},
+                            status="draft",
+                            notes=f"Child leg of portfolio deployment {parent_id}",
+                        )
+                        self.catalog.save_deployment_child_link(
+                            parent_deployment_id=parent_id,
+                            child_deployment_id=child_id,
+                            child_role="strategy_block_asset",
+                            dataset_id=dataset_id,
+                            symbol=dataset_id,
+                            strategy_block_id=block_id,
+                        )
+            else:
+                portfolio_dataset_ids = [str(item) for item in list(structure_json.get("portfolio_dataset_ids") or dataset_ids) if str(item).strip()]
+                for dataset_id in portfolio_dataset_ids:
+                    child_id = self.catalog.save_deployment(
+                        parent_deployment_id=parent_id,
+                        deployment_kind="single_strategy",
+                        source_type="portfolio_child",
+                        source_id=parent_id,
+                        candidate_id=str(candidate_id or ""),
+                        strategy=str(strategy),
+                        strategy_version=str(strategy_version or ""),
+                        dataset_id=dataset_id,
+                        symbol=dataset_id,
+                        timeframe=str(timeframe or ""),
+                        params_json=params_json or {},
+                        structure_json={},
+                        validation_refs_json=validation_refs_json or {},
+                        target_id=str(target_id or ""),
+                        mode=mode,
+                        sizing_json=sizing_json or {},
+                        status="draft",
+                        notes=f"Child leg of portfolio deployment {parent_id}",
+                    )
+                    self.catalog.save_deployment_child_link(
+                        parent_deployment_id=parent_id,
+                        child_deployment_id=child_id,
+                        child_role="asset_leg",
+                        dataset_id=dataset_id,
+                        symbol=dataset_id,
+                        strategy_block_id="",
+                    )
+        self.refresh(refresh_heatmap=False)
+        self.status_label.setText(f"Deployment draft {parent_id[:10]} created.")
+
+    def _update_deployment_panel(self) -> None:
+        if not hasattr(self, "deployment_candidate_table") or not hasattr(self, "deployment_table"):
+            return
+        self.deployment_targets_frame = self.catalog.load_deployment_targets()
+        self.manual_deployment_definitions_frame = self.catalog.load_manual_deployment_definitions()
+        self.deployments_frame = self.catalog.load_deployments()
+        self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
+        self.deployment_metric_snapshots_frame = self.catalog.load_latest_deployment_metric_snapshots()
+        self._populate_deployment_target_combo(self.deployment_candidate_target_combo)
+        self._populate_deployment_target_combo(self.manual_deployment_target_combo)
+
+        candidate_sources = self._deployment_candidate_sources()
+        self.deployment_candidate_table.setRowCount(len(candidate_sources))
+        if not candidate_sources:
+            self.deployment_candidate_summary_label.setText("No validated candidates are queued yet.")
+        else:
+            for row_idx, row in enumerate(candidate_sources):
+                values = [
+                    str(row.get("candidate_id", ""))[:10],
+                    self._deployment_kind_label(str(row.get("deployment_kind", "") or "")),
+                    str(row.get("strategy", "") or "—"),
+                    str(row.get("scope_label", "") or "—"),
+                    str(row.get("timeframe", "") or "—"),
+                    str(row.get("source_label", "") or "—"),
+                    WalkForwardSetupDialog._fmt_timestamp(row.get("updated_at")),
+                ]
+                tooltip = f"Candidate ID: {row.get('candidate_id', '')}\nStudy: {row.get('study_id', '')}\nBatch: {row.get('batch_id', '')}"
+                for col_idx, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    if col_idx == 0:
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(row))
+                    item.setToolTip(tooltip)
+                    self.deployment_candidate_table.setItem(row_idx, col_idx, item)
+            if self.deployment_candidate_table.rowCount() > 0 and not self.deployment_candidate_table.selectedItems():
+                self.deployment_candidate_table.selectRow(0)
+            latest = candidate_sources[0]
+            self.deployment_candidate_summary_label.setText(
+                f"Validated candidates: {len(candidate_sources)} | Latest: {latest['strategy']} | "
+                f"Kind: {self._deployment_kind_label(str(latest.get('deployment_kind', '') or ''))}"
+            )
+        self._refresh_deployment_candidate_details()
+
+        manual_count = len(self.manual_deployment_definitions_frame)
+        if manual_count == 0:
+            self.manual_definition_summary_label.setText("No manual deployment definitions saved yet.")
+        else:
+            latest_manual = self.manual_deployment_definitions_frame.iloc[0]
+            self.manual_definition_summary_label.setText(
+                f"Manual definitions: {manual_count} | Latest: {latest_manual.get('strategy', '')} | "
+                f"Kind: {self._deployment_kind_label(str(latest_manual.get('deployment_kind', '') or ''))}"
+            )
+
+        parent_deployments = self.deployments_frame.loc[
+            self.deployments_frame["parent_deployment_id"].fillna("").astype(str) == ""
+        ].reset_index(drop=True) if not self.deployments_frame.empty else pd.DataFrame()
+        self.deployment_table.setRowCount(len(parent_deployments))
+        if parent_deployments.empty:
+            self.deployment_table_summary_label.setText("No deployment drafts saved yet.")
+            self.deployment_summary_label.setText("No deployments have been created yet.")
+        else:
+            target_map = self._deployment_targets_by_id()
+            for row_idx, (_, row) in enumerate(parent_deployments.iterrows()):
+                target_row = target_map.get(str(row.get("target_id", "") or ""), {})
+                values = [
+                    str(row.get("deployment_id", ""))[:10],
+                    self._deployment_kind_label(str(row.get("deployment_kind", "") or "")),
+                    str(row.get("strategy", "") or "—"),
+                    self._deployment_scope_label(row.to_dict()),
+                    str(target_row.get("name", "") or row.get("target_id", "") or "—"),
+                    str(row.get("status", "") or "draft"),
+                    WalkForwardSetupDialog._fmt_timestamp(row.get("updated_at")),
+                ]
+                for col_idx, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    if col_idx == 0:
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, row.to_dict())
+                    self.deployment_table.setItem(row_idx, col_idx, item)
+            if self.deployment_table.rowCount() > 0 and not self.deployment_table.selectedItems():
+                self.deployment_table.selectRow(0)
+            live_count = int(parent_deployments["status"].fillna("").astype(str).eq("live").sum())
+            paused_count = int(parent_deployments["status"].fillna("").astype(str).eq("paused").sum())
+            portfolio_count = int(parent_deployments["deployment_kind"].fillna("").astype(str).str.startswith("portfolio_").sum())
+            self.deployment_table_summary_label.setText(
+                f"Deployments: {len(parent_deployments)} | Portfolio: {portfolio_count} | Live: {live_count} | Paused: {paused_count}"
+            )
+            latest = parent_deployments.iloc[0]
+            self.deployment_summary_label.setText(
+                f"Latest deployment: {latest['deployment_id']} | Strategy: {latest['strategy']} | "
+                f"Kind: {self._deployment_kind_label(str(latest.get('deployment_kind', '') or ''))} | "
+                f"Status: {latest.get('status', '') or 'draft'}"
+            )
+        self._refresh_selected_deployment_details()
+
+    def _deployment_scope_label(self, deployment_row: dict) -> str:
+        symbol = str(deployment_row.get("symbol", "") or "").strip()
+        if symbol:
+            return symbol
+        dataset_id = str(deployment_row.get("dataset_id", "") or "").strip()
+        if dataset_id:
+            return dataset_id
+        structure = self._decode_json_dict(deployment_row.get("structure_json"))
+        if str(deployment_row.get("deployment_kind", "") or "") == "portfolio_strategy_blocks":
+            dataset_ids = list(structure.get("portfolio_dataset_ids") or self._dataset_ids_from_strategy_blocks(structure.get("strategy_blocks") or []))
+            return f"{len(dataset_ids)} assets | {len(list(structure.get('strategy_blocks') or []))} blocks"
+        dataset_ids = [str(item) for item in list(structure.get("portfolio_dataset_ids") or []) if str(item).strip()]
+        if dataset_ids:
+            return f"{len(dataset_ids)} assets"
+        return "—"
+
+    def _selected_deployment_row(self) -> dict | None:
+        if not hasattr(self, "deployment_table"):
+            return None
+        selection_model = self.deployment_table.selectionModel()
+        if selection_model is None:
+            return None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None
+        item = self.deployment_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return payload if isinstance(payload, dict) else None
+
+    def _refresh_selected_deployment_details(self) -> None:
+        selected = self._selected_deployment_row()
+        if not selected:
+            self.deployment_details.clear()
+            return
+        metric_match = self.deployment_metric_snapshots_frame.loc[
+            self.deployment_metric_snapshots_frame["deployment_id"].fillna("").astype(str)
+            == str(selected.get("deployment_id", "") or "")
+        ] if not self.deployment_metric_snapshots_frame.empty else pd.DataFrame()
+        metric_row = metric_match.iloc[0].to_dict() if not metric_match.empty else {}
+        health = self._decode_json_dict(metric_row.get("health_json"))
+        account = dict(health.get("account") or {})
+        current_position = self._decode_json_dict(metric_row.get("current_position_json"))
+        matched_positions = list(current_position.get("positions") or [])
+        child_links = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == str(selected.get("deployment_id", "") or "")
+        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
+        target_row = self._deployment_targets_by_id().get(str(selected.get("target_id", "") or ""), {})
+        lines = [
+            f"Deployment ID: {selected.get('deployment_id', '')}",
+            f"Kind: {self._deployment_kind_label(str(selected.get('deployment_kind', '') or ''))}",
+            f"Strategy: {selected.get('strategy', '') or '—'}",
+            f"Scope: {self._deployment_scope_label(selected)}",
+            f"Target: {target_row.get('name', '') or selected.get('target_id', '') or '—'}",
+            f"Mode: {selected.get('mode', '') or '—'}",
+            f"Status: {selected.get('status', '') or 'draft'}",
+            f"Child legs: {len(child_links)}",
+            f"Last Sync: {selected.get('last_sync_at', '') or metric_row.get('snapshot_ts') or '—'}",
+            f"Open PnL: {self._deployment_fmt_money(metric_row.get('open_pnl'))}",
+            f"Matched Orders: {int(health.get('matched_orders', 0) or 0)}",
+            f"Problem Orders: {int(health.get('problem_orders', 0) or 0)}",
+            f"Open Positions: {len(matched_positions)}",
+            f"Account Equity: {self._deployment_fmt_money(account.get('equity'))}",
+            "",
+            f"Notes: {selected.get('notes', '') or 'None'}",
+        ]
+        if not child_links.empty:
+            lines.extend(["", "Child Legs:"])
+            for _, row in child_links.iterrows():
+                lines.append(
+                    f"- {row.get('child_deployment_id', '')[:10]} | dataset={row.get('dataset_id', '') or '—'} | block={row.get('strategy_block_id', '') or '—'}"
+                )
+        self.deployment_details.setPlainText("\n".join(lines))
+
+    def _set_selected_deployment_status(self, status: str) -> None:
+        selected = self._selected_deployment_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        timestamp = pd.Timestamp.utcnow().isoformat()
+        update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
+        if status == "armed":
+            update_kwargs["armed_at"] = timestamp
+        elif status == "stopped":
+            update_kwargs["stopped_at"] = timestamp
+        self.catalog.update_deployment_status(str(selected.get("deployment_id", "")), **update_kwargs)
+        related_children = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == str(selected.get("deployment_id", "") or "")
+        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
+        for _, row in related_children.iterrows():
+            self.catalog.update_deployment_status(str(row.get("child_deployment_id", "") or ""), **update_kwargs)
+        self.refresh(refresh_heatmap=False)
+        self.status_label.setText(f"Deployment status updated to {status}.")
+
+    def _deployment_dashboard_url(self, deployment_row: dict) -> str:
+        target_row = self._deployment_targets_by_id().get(str(deployment_row.get("target_id", "") or ""), {})
+        base_url = str(target_row.get("base_url", "") or "").rstrip("/")
+        dashboard_path = str(target_row.get("dashboard_path", "") or "").strip()
+        if dashboard_path.startswith("http://") or dashboard_path.startswith("https://"):
+            return dashboard_path
+        if base_url and dashboard_path:
+            return f"{base_url}{dashboard_path if dashboard_path.startswith('/') else '/' + dashboard_path}"
+        return ""
+
+    def _open_selected_deployment_dashboard(self) -> None:
+        selected = self._selected_deployment_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        url = self._deployment_dashboard_url(selected)
+        if not url:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Dashboard Unavailable",
+                "The selected deployment target does not currently have a configured dashboard URL.",
+            )
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def _open_selected_deployment_candidate_source(self) -> None:
+        selected = self._selected_deployment_candidate_source()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No candidate selected", "Select a validated candidate first.")
+            return
+        study_id = str(selected.get("study_id", "") or "")
+        if not study_id:
+            QtWidgets.QMessageBox.information(self, "Source Unavailable", "This candidate does not have an openable source study.")
+            return
+        studies = self.catalog.load_optimization_studies()
+        if studies.empty or studies.loc[studies["study_id"] == study_id].empty:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Source Unavailable",
+                f"The source study '{study_id}' is not an optimization study that can be opened directly from here.",
+            )
+            return
+        self._open_optimization_study(study_id)
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (str(table_name or "").strip(),),
+        ).fetchone()
+        return row is not None
+
+    def _dataset_symbol_map(self) -> dict[str, str]:
+        datasets = self.catalog.load_acquisition_datasets(include_untracked_local=True)
+        if datasets.empty:
+            return {}
+        mapping: dict[str, str] = {}
+        for _, row in datasets.iterrows():
+            dataset_id = str(row.get("dataset_id") or "").strip()
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if dataset_id and symbol and dataset_id not in mapping:
+                mapping[dataset_id] = symbol
+        return mapping
+
+    def _symbol_from_dataset_id(self, dataset_id: str) -> str:
+        dataset_id = str(dataset_id or "").strip()
+        if not dataset_id:
+            return ""
+        mapped = self._dataset_symbol_map().get(dataset_id, "")
+        if mapped:
+            return mapped
+        parts = [part.strip() for part in dataset_id.split(":") if part.strip()]
+        if len(parts) >= 2:
+            return parts[1].upper()
+        return dataset_id.upper()
+
+    def _deployment_symbol_scope(self, deployment_row: dict) -> set[str]:
+        symbols: set[str] = set()
+        direct_symbol = str(deployment_row.get("symbol", "") or "").strip().upper()
+        if direct_symbol:
+            symbols.add(direct_symbol)
+        dataset_id = str(deployment_row.get("dataset_id", "") or "").strip()
+        if dataset_id:
+            resolved = self._symbol_from_dataset_id(dataset_id)
+            if resolved:
+                symbols.add(resolved)
+        structure = self._decode_json_dict(deployment_row.get("structure_json"))
+        for scoped_dataset in list(structure.get("portfolio_dataset_ids") or []):
+            resolved = self._symbol_from_dataset_id(str(scoped_dataset))
+            if resolved:
+                symbols.add(resolved)
+        for block in list(structure.get("strategy_blocks") or []):
+            for scoped_dataset in list(block.get("asset_dataset_ids") or []):
+                resolved = self._symbol_from_dataset_id(str(scoped_dataset))
+                if resolved:
+                    symbols.add(resolved)
+        if not self.deployment_child_links_frame.empty:
+            child_rows = self.deployment_child_links_frame.loc[
+                self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str)
+                == str(deployment_row.get("deployment_id", "") or "")
+            ]
+            for _, row in child_rows.iterrows():
+                symbol = str(row.get("symbol") or "").strip().upper()
+                if symbol:
+                    symbols.add(symbol)
+                scoped_dataset = str(row.get("dataset_id") or "").strip()
+                if scoped_dataset:
+                    resolved = self._symbol_from_dataset_id(scoped_dataset)
+                    if resolved:
+                        symbols.add(resolved)
+        return {symbol for symbol in symbols if symbol}
+
+    @staticmethod
+    def _position_open_pnl(position_row: dict) -> float | None:
+        for key in ("unrealized_pl", "unrealized_pnl"):
+            value = position_row.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except Exception:
+                pass
+        current_value = position_row.get("current_value")
+        cost_basis_total = position_row.get("cost_basis_total")
+        try:
+            if current_value is not None and cost_basis_total is not None:
+                return float(current_value) - float(cost_basis_total)
+        except Exception:
+            pass
+        raw_payload = DashboardWindow._decode_json_dict(position_row.get("raw_payload"))
+        for key in ("unrealized_pnl", "unrealizedPnl", "unrealized_pl", "unrealizedProfitLoss"):
+            value = raw_payload.get(key)
+            if isinstance(value, dict):
+                value = value.get("value")
+            try:
+                if value is not None:
+                    return float(value)
+            except Exception:
+                continue
+        return None
+
+    def _read_external_snapshot_from_sqlite(self, target_row: dict) -> dict:
+        db_path = Path(str(target_row.get("db_path") or "").strip())
+        if not db_path.exists():
+            return {}
+        normalized_scope = str(target_row.get("broker_scope") or target_row.get("mode") or "").strip().lower()
+        positions_table = "live_positions"
+        account_query = "SELECT equity, cash, buying_power, updated_ts FROM account_snapshots ORDER BY id DESC LIMIT 1"
+        if normalized_scope in {"alpaca", "alpaca_paper"}:
+            positions_table = "alpaca_positions"
+        elif normalized_scope in {"paper"}:
+            positions_table = "positions"
+            account_query = "SELECT equity, cash, updated_ts FROM account WHERE id=1"
+        elif normalized_scope in {"coinbase"}:
+            positions_table = "coinbase_positions"
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            orders = (
+                [dict(row) for row in conn.execute("SELECT * FROM orders ORDER BY updated_ts DESC, id DESC LIMIT 500").fetchall()]
+                if self._table_exists(conn, "orders")
+                else []
+            )
+            fills = (
+                [dict(row) for row in conn.execute("SELECT * FROM fills ORDER BY fill_ts DESC, id DESC LIMIT 1000").fetchall()]
+                if self._table_exists(conn, "fills")
+                else []
+            )
+            positions = (
+                [dict(row) for row in conn.execute(f"SELECT * FROM {positions_table} ORDER BY symbol ASC").fetchall()]
+                if self._table_exists(conn, positions_table)
+                else []
+            )
+            account_row = conn.execute(account_query).fetchone() if ("account" in account_query or self._table_exists(conn, "account_snapshots")) else None
+        latest_ts = 0
+        for row in orders:
+            latest_ts = max(latest_ts, int(row.get("updated_ts") or row.get("created_ts") or 0))
+        for row in fills:
+            latest_ts = max(latest_ts, int(row.get("fill_ts") or 0))
+        for row in positions:
+            latest_ts = max(latest_ts, int(row.get("updated_ts") or 0))
+        if account_row is not None:
+            latest_ts = max(latest_ts, int(account_row["updated_ts"] or 0))
+        snapshot_ts = (
+            pd.Timestamp.utcfromtimestamp(int(latest_ts)).isoformat() + "+00:00"
+            if latest_ts
+            else pd.Timestamp.utcnow().isoformat()
+        )
+        return {
+            "source": "sqlite",
+            "snapshot_ts": snapshot_ts,
+            "orders": orders,
+            "fills": fills,
+            "positions": positions,
+            "account": dict(account_row) if account_row is not None else {},
+        }
+
+    def _read_external_snapshot_from_http(self, target_row: dict) -> dict:
+        base_url = str(target_row.get("base_url") or "").rstrip("/")
+        status_path = str(target_row.get("status_path") or "").strip()
+        if not base_url or not status_path:
+            return {}
+        url = f"{base_url}{status_path if status_path.startswith('/') else '/' + status_path}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return {}
+        return {
+            "source": "http",
+            "snapshot_ts": pd.Timestamp.utcnow().isoformat(),
+            "orders": list(payload.get("orders") or []),
+            "fills": list(payload.get("fills") or []),
+            "positions": list(payload.get("positions") or []),
+            "account": dict(payload.get("account") or {}),
+        }
+
+    def _fetch_target_external_snapshot(self, target_row: dict) -> dict:
+        transport_mode = str(target_row.get("transport_mode") or "").strip().lower()
+        if transport_mode == "co_located":
+            snapshot = self._read_external_snapshot_from_sqlite(target_row)
+            if snapshot:
+                return snapshot
+        return self._read_external_snapshot_from_http(target_row)
+
+    def _aggregate_external_snapshot_for_deployment(self, deployment_row: dict, snapshot: dict) -> dict:
+        deployment_id = str(deployment_row.get("deployment_id", "") or "")
+        child_ids = set()
+        if not self.deployment_child_links_frame.empty:
+            child_rows = self.deployment_child_links_frame.loc[
+                self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == deployment_id
+            ]
+            child_ids = {str(value) for value in child_rows.get("child_deployment_id", pd.Series(dtype=str)).fillna("").tolist() if str(value)}
+        matched_ids = {deployment_id, *child_ids}
+        symbols = self._deployment_symbol_scope(deployment_row)
+        matched_orders: list[dict] = []
+        matched_order_ids: set[int] = set()
+        for order in list(snapshot.get("orders") or []):
+            payload = self._decode_json_dict(order.get("raw_payload"))
+            payload_ids = {
+                str(payload.get("deployment_id") or ""),
+                str(payload.get("parent_deployment_id") or ""),
+                str(payload.get("candidate_id") or ""),
+            }
+            symbol = str(order.get("symbol") or payload.get("symbol") or "").strip().upper()
+            if matched_ids.intersection({item for item in payload_ids if item}) or (symbol and symbol in symbols):
+                matched_orders.append({**order, "_raw_payload": payload})
+                try:
+                    matched_order_ids.add(int(order.get("id")))
+                except Exception:
+                    pass
+        matched_fills = [
+            fill
+            for fill in list(snapshot.get("fills") or [])
+            if int(fill.get("order_id") or -1) in matched_order_ids
+        ]
+        matched_positions: list[dict] = []
+        for position in list(snapshot.get("positions") or []):
+            symbol = str(position.get("symbol") or "").strip().upper()
+            if symbol and symbol in symbols:
+                matched_positions.append(position)
+
+        open_pnl_values = [self._position_open_pnl(position) for position in matched_positions]
+        open_pnl = sum(float(value) for value in open_pnl_values if value is not None) if open_pnl_values else None
+        problem_orders = [
+            order
+            for order in matched_orders
+            if str(order.get("status") or "").strip().lower() in {"rejected", "cancelled", "canceled", "error"}
+        ]
+        trade_count = len(matched_fills) if matched_fills else len(
+            [order for order in matched_orders if str(order.get("status") or "").strip().lower() in {"filled", "partial"}]
+        )
+        health = {
+            "source": snapshot.get("source") or "",
+            "account": dict(snapshot.get("account") or {}),
+            "matched_orders": len(matched_orders),
+            "matched_fills": len(matched_fills),
+            "problem_orders": len(problem_orders),
+            "open_positions": len(matched_positions),
+            "symbols": sorted(symbols),
+        }
+        return {
+            "snapshot_ts": str(snapshot.get("snapshot_ts") or pd.Timestamp.utcnow().isoformat()),
+            "realized_pnl": None,
+            "open_pnl": open_pnl,
+            "trade_count": trade_count,
+            "win_count": None,
+            "loss_count": None,
+            "win_rate": None,
+            "profit_factor": None,
+            "sharpe": None,
+            "current_position_json": {"positions": matched_positions},
+            "health_json": health,
+            "problem_order_count": len(problem_orders),
+        }
+
+    def _sync_external_deployment_state(self) -> None:
+        deployments = self.catalog.load_deployments()
+        if deployments.empty:
+            QtWidgets.QMessageBox.information(self, "No deployments", "Create a deployment first.")
+            return
+        self.deployments_frame = deployments
+        self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
+        target_map = self._deployment_targets_by_id()
+        parent_deployments = deployments.loc[
+            deployments["parent_deployment_id"].fillna("").astype(str) == ""
+        ].reset_index(drop=True)
+        if parent_deployments.empty:
+            QtWidgets.QMessageBox.information(self, "No parent deployments", "There are no parent deployments to sync.")
+            return
+        snapshots_by_target: dict[str, dict] = {}
+        failures: list[str] = []
+        updated = 0
+        for target_id in sorted({str(value) for value in parent_deployments["target_id"].fillna("").tolist() if str(value)}):
+            target_row = target_map.get(target_id, {})
+            if not target_row:
+                failures.append(f"{target_id}: missing target configuration")
+                continue
+            snapshot = self._fetch_target_external_snapshot(target_row)
+            if not snapshot:
+                failures.append(f"{target_row.get('name') or target_id}: snapshot unavailable")
+                continue
+            snapshots_by_target[target_id] = snapshot
+        for _, deployment in parent_deployments.iterrows():
+            deployment_row = deployment.to_dict()
+            target_id = str(deployment_row.get("target_id") or "")
+            snapshot = snapshots_by_target.get(target_id)
+            if not snapshot:
+                continue
+            aggregate = self._aggregate_external_snapshot_for_deployment(deployment_row, snapshot)
+            self.catalog.save_deployment_metric_snapshot(
+                deployment_id=str(deployment_row.get("deployment_id") or ""),
+                snapshot_ts=str(aggregate.get("snapshot_ts") or pd.Timestamp.utcnow().isoformat()),
+                realized_pnl=aggregate.get("realized_pnl"),
+                open_pnl=aggregate.get("open_pnl"),
+                trade_count=aggregate.get("trade_count"),
+                win_count=aggregate.get("win_count"),
+                loss_count=aggregate.get("loss_count"),
+                win_rate=aggregate.get("win_rate"),
+                profit_factor=aggregate.get("profit_factor"),
+                sharpe=aggregate.get("sharpe"),
+                current_position_json=aggregate.get("current_position_json"),
+                health_json=aggregate.get("health_json"),
+            )
+            self.catalog.update_deployment_status(
+                str(deployment_row.get("deployment_id") or ""),
+                status=str(deployment_row.get("status") or "draft"),
+                status_reason=(
+                    f"{int(aggregate.get('problem_order_count') or 0)} problem order(s)"
+                    if int(aggregate.get("problem_order_count") or 0) > 0
+                    else ""
+                ),
+                last_sync_at=str(aggregate.get("snapshot_ts") or ""),
+                last_error_at=(
+                    str(aggregate.get("snapshot_ts") or "")
+                    if int(aggregate.get("problem_order_count") or 0) > 0
+                    else ""
+                ),
+            )
+            updated += 1
+        self.refresh(refresh_heatmap=False)
+        summary = f"Synchronized external state for {updated} deployment{'s' if updated != 1 else ''}."
+        if failures:
+            summary += " " + " | ".join(failures[:3])
+        self.status_label.setText(summary)
+
+    def _update_live_monitor_panel(self) -> None:
+        if not hasattr(self, "live_monitor_table"):
+            return
+        self.deployments_frame = self.catalog.load_deployments()
+        self.deployment_metric_snapshots_frame = self.catalog.load_latest_deployment_metric_snapshots()
+        self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
+        target_map = self._deployment_targets_by_id()
+        metric_map = {
+            str(row.get("deployment_id", "") or ""): row.to_dict()
+            for _, row in self.deployment_metric_snapshots_frame.iterrows()
+        } if not self.deployment_metric_snapshots_frame.empty else {}
+        parent_deployments = self.deployments_frame.loc[
+            self.deployments_frame["parent_deployment_id"].fillna("").astype(str) == ""
+        ].reset_index(drop=True) if not self.deployments_frame.empty else pd.DataFrame()
+        self.live_monitor_table.setRowCount(len(parent_deployments))
+        if parent_deployments.empty:
+            self.live_monitor_summary_label.setText("No deployment monitor state is available yet.")
+            self.live_monitor_details.clear()
+            return
+        for row_idx, (_, row) in enumerate(parent_deployments.iterrows()):
+            metric_row = metric_map.get(str(row.get("deployment_id", "") or ""), {})
+            target_row = target_map.get(str(row.get("target_id", "") or ""), {})
+            values = [
+                str(row.get("deployment_id", ""))[:10],
+                self._deployment_kind_label(str(row.get("deployment_kind", "") or "")),
+                str(row.get("strategy", "") or "—"),
+                self._deployment_scope_label(row.to_dict()),
+                str(target_row.get("name", "") or row.get("target_id", "") or "—"),
+                str(row.get("status", "") or "draft"),
+                self._deployment_fmt_money(metric_row.get("realized_pnl")),
+                self._deployment_fmt_money(metric_row.get("open_pnl")),
+                str(int(metric_row.get("trade_count", 0) or 0)),
+                self._deployment_fmt_pct(metric_row.get("win_rate")),
+                self._deployment_fmt_ratio(metric_row.get("sharpe")),
+                WalkForwardSetupDialog._fmt_timestamp(row.get("last_sync_at") or metric_row.get("snapshot_ts")),
+            ]
+            for col_idx, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if col_idx == 0:
+                    payload = row.to_dict()
+                    payload["_metric_row"] = metric_row
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, payload)
+                self.live_monitor_table.setItem(row_idx, col_idx, item)
+        if self.live_monitor_table.rowCount() > 0 and not self.live_monitor_table.selectedItems():
+            self.live_monitor_table.selectRow(0)
+        live_count = int(parent_deployments["status"].fillna("").astype(str).eq("live").sum())
+        paused_count = int(parent_deployments["status"].fillna("").astype(str).eq("paused").sum())
+        error_count = int(parent_deployments["status"].fillna("").astype(str).eq("error").sum())
+        portfolio_count = int(parent_deployments["deployment_kind"].fillna("").astype(str).str.startswith("portfolio_").sum())
+        self.live_monitor_summary_label.setText(
+            f"Deployments: {len(parent_deployments)} | Portfolio: {portfolio_count} | Live: {live_count} | Paused: {paused_count} | Error: {error_count}"
+        )
+        self._refresh_live_monitor_details()
+
+    def _selected_live_monitor_row(self) -> dict | None:
+        if not hasattr(self, "live_monitor_table"):
+            return None
+        selection_model = self.live_monitor_table.selectionModel()
+        if selection_model is None:
+            return None
+        rows = selection_model.selectedRows()
+        if not rows:
+            return None
+        item = self.live_monitor_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return payload if isinstance(payload, dict) else None
+
+    def _refresh_live_monitor_details(self) -> None:
+        selected = self._selected_live_monitor_row()
+        if not selected:
+            self.live_monitor_details.clear()
+            return
+        metric_row = dict(selected.get("_metric_row") or {})
+        health = self._decode_json_dict(metric_row.get("health_json"))
+        account = dict(health.get("account") or {})
+        current_position = self._decode_json_dict(metric_row.get("current_position_json"))
+        matched_positions = list(current_position.get("positions") or [])
+        child_links = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == str(selected.get("deployment_id", "") or "")
+        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
+        lines = [
+            f"Deployment ID: {selected.get('deployment_id', '')}",
+            f"Kind: {self._deployment_kind_label(str(selected.get('deployment_kind', '') or ''))}",
+            f"Strategy: {selected.get('strategy', '') or '—'}",
+            f"Scope: {self._deployment_scope_label(selected)}",
+            f"Status: {selected.get('status', '') or 'draft'}",
+            f"Realized PnL: {self._deployment_fmt_money(metric_row.get('realized_pnl'))}",
+            f"Open PnL: {self._deployment_fmt_money(metric_row.get('open_pnl'))}",
+            f"Trades: {int(metric_row.get('trade_count', 0) or 0)}",
+            f"Win Rate: {self._deployment_fmt_pct(metric_row.get('win_rate'))}",
+            f"Sharpe: {self._deployment_fmt_ratio(metric_row.get('sharpe'))}",
+            f"Matched Orders: {int(health.get('matched_orders', 0) or 0)}",
+            f"Problem Orders: {int(health.get('problem_orders', 0) or 0)}",
+            f"Open Positions: {len(matched_positions)}",
+            f"Account Equity: {self._deployment_fmt_money(account.get('equity'))}",
+            f"Child legs: {len(child_links)}",
+            "",
+            f"Notes: {selected.get('notes', '') or 'None'}",
+        ]
+        if not child_links.empty:
+            lines.extend(["", "Child Legs:"])
+            for _, row in child_links.iterrows():
+                lines.append(
+                    f"- {row.get('child_deployment_id', '')[:10]} | dataset={row.get('dataset_id', '') or '—'} | block={row.get('strategy_block_id', '') or '—'}"
+                )
+        self.live_monitor_details.setPlainText("\n".join(lines))
+
+    def _set_selected_live_monitor_status(self, status: str) -> None:
+        selected = self._selected_live_monitor_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        target_id = str(selected.get("deployment_id", "") or "")
+        if not target_id:
+            return
+        timestamp = pd.Timestamp.utcnow().isoformat()
+        update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
+        if status == "armed":
+            update_kwargs["armed_at"] = timestamp
+        elif status == "stopped":
+            update_kwargs["stopped_at"] = timestamp
+        self.catalog.update_deployment_status(target_id, **update_kwargs)
+        related_children = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == target_id
+        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
+        for _, row in related_children.iterrows():
+            self.catalog.update_deployment_status(str(row.get("child_deployment_id", "") or ""), **update_kwargs)
+        self.refresh(refresh_heatmap=False)
+        self.status_label.setText(f"Deployment status updated to {status}.")
+
+    def _open_selected_live_monitor_dashboard(self) -> None:
+        selected = self._selected_live_monitor_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        url = self._deployment_dashboard_url(selected)
+        if not url:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Dashboard Unavailable",
+                "The selected deployment target does not currently have a configured dashboard URL.",
+            )
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
     def _selected_walk_forward_source_for_monte_carlo(self) -> str | None:
         if not hasattr(self, "monte_carlo_source_table"):
             return None
@@ -11586,7 +18651,7 @@ WantedBy=default.target
             QtWidgets.QMessageBox.warning(self, "Missing CSV", f"CSV not found: {csv_path}")
             return
         try:
-            artifact = ingest_csv_to_store(csv_path, dataset_id=dataset_id)
+            artifact = ingest_csv_to_store(csv_path, dataset_id=dataset_id, resolution=self.tf_combo.currentText().strip() or None)
             acq_run_id = f"import_{uuid.uuid4().hex[:8]}"
             rc = ResultCatalog(self.catalog.db_path)
             started_at = pd.Timestamp.utcnow().isoformat()
@@ -11615,6 +18680,7 @@ WantedBy=default.target
                 coverage_end=artifact.end,
                 bar_count=artifact.bar_count,
                 ingested=True,
+                quality_snapshot=artifact.quality_snapshot,
             )
             rc.finish_acquisition_run(
                 acq_run_id,
@@ -11626,6 +18692,7 @@ WantedBy=default.target
                 notes=f"Imported {artifact.bar_count} bars into {artifact.dataset_id}.",
             )
             self._refresh_dataset_options(select_id=dataset_id)
+            self._invalidate_picker_snapshot()
             self.status_label.setText(f"Added {csv_path.name} → {dataset_id} and cataloged it.")
         except Exception as exc:
             self._show_error_dialog("Import Error", str(exc), details=traceback.format_exc())
@@ -12551,14 +19618,32 @@ WantedBy=default.target
         if universe is not None:
             label = f"Universe: {universe.get('name', '')} ({len(dataset_ids)} datasets)"
         elif len(dataset_ids) == 1 and not self.study_dataset_ids:
-            label = f"Current dataset only: {dataset_ids[0]}"
-        elif len(dataset_ids) <= 3:
-            label = ", ".join(dataset_ids)
+            label = f"Current dataset only: {_format_dataset_scope_label(dataset_ids, frame=self.picker_snapshot_frame())}"
         else:
-            label = f"{len(dataset_ids)} datasets selected"
+            label = _format_dataset_scope_label(dataset_ids, frame=self.picker_snapshot_frame())
         self.study_dataset_summary.setText(label)
         self.study_dataset_summary.setToolTip("\n".join(dataset_ids))
         self._update_portfolio_allocation_summary()
+
+    def _choose_current_dataset(self) -> None:
+        available = self._available_dataset_ids()
+        if not available:
+            QtWidgets.QMessageBox.information(self, "No datasets", "No datasets are available in the local store yet.")
+            return
+        current = self.dataset_combo.currentText().strip()
+        dlg = DatasetPickerDialog(
+            available,
+            current,
+            self,
+            title="Choose Current Dataset",
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=self.picker_snapshot_frame(),
+        )
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        selected = dlg.selected_dataset()
+        if selected:
+            self.dataset_combo.setCurrentText(selected)
 
     def _choose_study_datasets(self) -> None:
         available = self._available_dataset_ids()
@@ -12566,7 +19651,13 @@ WantedBy=default.target
             QtWidgets.QMessageBox.information(self, "No datasets", "No datasets are available in the local store yet.")
             return
         initial = self._selected_study_dataset_ids()
-        dlg = DatasetSelectionDialog(available, initial, self)
+        dlg = DatasetSelectionDialog(
+            available,
+            initial,
+            self,
+            catalog_path=self.catalog.db_path,
+            snapshot_frame=self.picker_snapshot_frame(),
+        )
         if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return
         selected = dlg.selected_datasets()
@@ -12597,10 +19688,20 @@ WantedBy=default.target
         self.study_universe_id = str(self.study_universe_combo.currentData() or "")
         self._update_study_dataset_summary()
 
+    def _shutdown_asset_worker(self, worker: QtCore.QThread | None) -> None:
+        if worker is None or not worker.isRunning():
+            return
+        worker.requestInterruption()
+        worker.quit()
+        worker.wait()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._closing = True
         if self._magellan_warm_timer.isActive():
             self._magellan_warm_timer.stop()
+        self._prepare_download_session_for_shutdown()
+        self._shutdown_asset_worker(self.asset_provider_worker)
+        self._shutdown_asset_worker(self.asset_reference_worker)
         if self.worker and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait(2000)
@@ -13015,6 +20116,9 @@ WantedBy=default.target
         lines = [ln.strip() for ln in message.splitlines() if ln.strip()]
         if not lines:
             return "Unknown error"
+        for line in reversed(lines):
+            if "partial progress was saved to" not in line.lower():
+                return line
         return lines[-1]
 
 
@@ -17587,13 +24691,127 @@ class TradesTableModel(QtCore.QAbstractTableModel):
         return str(section + 1)
 
 
+class TickerStatusRowWidget(QtWidgets.QFrame):
+    def __init__(self, symbol: str, status: dict, checked: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self.symbol = str(symbol or "").strip().upper()
+        self.status = dict(status or {})
+        status_color = QtGui.QColor(str(self.status.get("status_color") or PALETTE["red"]))
+        tint = self.status.get("status_tint")
+        tint_color = QtGui.QColor(tint) if isinstance(tint, QtGui.QColor) else _picker_tint(status_color.name(), 0.22)
+        hover_color = QtGui.QColor(tint_color)
+        hover_color.setAlphaF(min(0.42, max(hover_color.alphaF(), 0.30)))
+        border_color = QtGui.QColor(status_color)
+        border_color.setAlphaF(0.72)
+        badge_color = QtGui.QColor(status_color)
+        badge_color.setAlphaF(0.95)
+        self.setObjectName("TickerStatusRow")
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"""
+            QFrame#TickerStatusRow {{
+                background: {_picker_css_rgba(tint_color, PALETTE['panel2'])};
+                border: 1px solid {_picker_css_rgba(border_color, PALETTE['blue'])};
+                border-radius: 10px;
+            }}
+            QFrame#TickerStatusRow:hover {{
+                background: {_picker_css_rgba(hover_color, PALETTE['panel2'])};
+            }}
+            QLabel#TickerSymbol {{
+                color: {PALETTE['text']};
+                font-size: 13px;
+                font-weight: 700;
+            }}
+            QLabel#TickerBadge {{
+                color: {PALETTE['text']};
+                background: {_picker_css_rgba(badge_color, status_color.name())};
+                border-radius: 9px;
+                padding: 3px 9px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QCheckBox {{
+                spacing: 0px;
+                background: transparent;
+            }}
+            QCheckBox::indicator {{
+                width: 22px;
+                height: 22px;
+                border-radius: 6px;
+                border: 1px solid rgba(231, 238, 252, 0.88);
+                background: rgba(255, 255, 255, 0.10);
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: {PALETTE['blue']};
+                background: rgba(77, 163, 255, 0.18);
+            }}
+            QCheckBox::indicator:checked {{
+                border-color: {PALETTE['blue']};
+                background: {PALETTE['blue']};
+            }}
+            """
+        )
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+        self.checkbox = QtWidgets.QCheckBox(self)
+        self.checkbox.setChecked(bool(checked))
+        self.checkbox.setText("")
+        self.checkbox.setToolTip(str(self.status.get("tooltip") or ""))
+        layout.addWidget(self.checkbox, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        icon_label = QtWidgets.QLabel(self)
+        icon_label.setPixmap(_picker_status_icon(status_color.name()).pixmap(12, 12))
+        layout.addWidget(icon_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.symbol_label = QtWidgets.QLabel(self.symbol, self)
+        self.symbol_label.setObjectName("TickerSymbol")
+        self.symbol_label.setToolTip(str(self.status.get("tooltip") or ""))
+        layout.addWidget(self.symbol_label, 1, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.badge_label = QtWidgets.QLabel(str(self.status.get("status_label") or "Missing"), self)
+        self.badge_label.setObjectName("TickerBadge")
+        self.badge_label.setToolTip(str(self.status.get("tooltip") or ""))
+        layout.addWidget(self.badge_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+    def is_checked(self) -> bool:
+        return self.checkbox.isChecked()
+
+    def set_checked(self, checked: bool) -> None:
+        self.checkbox.setChecked(bool(checked))
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            child = self.childAt(point)
+            if child is not self.checkbox:
+                self.checkbox.toggle()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class TickerPickerDialog(DashboardDialog):
-    def __init__(self, symbols: list[str], preselected: set[str], parent=None) -> None:
+    def __init__(
+        self,
+        symbols: list[str],
+        preselected: set[str],
+        parent=None,
+        *,
+        catalog_path: Path | str | None = None,
+        snapshot_frame: pd.DataFrame | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Choose Tickers")
         self.resize(520, 640)
         self.selected: list[str] = []
         self.setObjectName("Panel")
+        self._catalog_path = _picker_catalog_path(catalog_path) if catalog_path is not None else None
+        self._symbols = [str(item).strip().upper() for item in list(symbols or []) if str(item).strip()]
+        self._preselected = set(str(item).strip().upper() for item in list(preselected or set()) if str(item).strip())
+        self._status_map: dict[str, dict] = {}
+        self._snapshot_worker: AcquisitionSnapshotWorker | None = None
+        self._pending_population_rows: list[tuple[str, dict, bool]] = []
+        self._populate_cursor = 0
+        self._populate_batch_size = 320
+        self._post_populate_message = ""
         self.setStyleSheet(
             f"""
             QDialog#Panel {{
@@ -17603,23 +24821,67 @@ class TickerPickerDialog(DashboardDialog):
             QLabel {{
                 color: {PALETTE['text']};
             }}
-            QListWidget {{
-                background: {PALETTE['panel2']};
-                border: 1px solid {PALETTE['border']};
-                border-radius: 8px;
-                padding: 6px;
+            QLabel#Sub {{
+                color: {PALETTE['muted']};
             }}
-            QListWidget::item {{
-                padding: 6px 8px;
+            QLineEdit {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {PALETTE['text']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
+                border-radius: 10px;
+                padding: 7px 10px;
+            }}
+            QLineEdit:focus {{
+                border-color: {PALETTE['blue']};
+            }}
+            QTreeWidget {{
+                background: {PALETTE['panel2']};
+                color: {PALETTE['text']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
+                border-radius: 10px;
+                padding: 6px;
+                outline: 0;
+            }}
+            QTreeWidget::item {{
+                padding: 7px 8px;
+            }}
+            QTreeWidget::item:selected {{
+                background: rgba(77, 163, 255, 0.24);
                 color: {PALETTE['text']};
             }}
-            QListWidget::item:selected {{
-                background: rgba(77, 163, 255, 0.2);
+            QTreeWidget::item:hover {{
+                background: rgba(255, 255, 255, 0.08);
+            }}
+            QHeaderView::section {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['muted']};
+                border: none;
+                border-bottom: 1px solid rgba(231, 238, 252, 0.22);
+                padding: 8px 10px;
+                font-weight: 700;
+            }}
+            QTreeView::indicator {{
+                width: 20px;
+                height: 20px;
+                border-radius: 5px;
+                border: 1px solid rgba(231, 238, 252, 0.78);
+                background: rgba(255, 255, 255, 0.08);
+            }}
+            QTreeView::indicator:hover {{
+                border-color: {PALETTE['blue']};
+                background: rgba(77, 163, 255, 0.14);
+            }}
+            QTreeView::indicator:checked {{
+                border-color: {PALETTE['blue']};
+                background: {PALETTE['blue']};
+            }}
+            QTreeView::indicator:unchecked {{
+                background: rgba(255, 255, 255, 0.03);
             }}
             QPushButton {{
                 background: {PALETTE['panel2']};
                 color: {PALETTE['text']};
-                border: 1px solid {PALETTE['border']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
                 border-radius: 8px;
                 padding: 6px 10px;
             }}
@@ -17633,63 +24895,197 @@ class TickerPickerDialog(DashboardDialog):
         info = QtWidgets.QLabel("Select tickers to schedule for data acquisition.")
         info.setObjectName("Sub")
         layout.addWidget(info)
+        legend = QtWidgets.QLabel("Ready = ingested and current | Stale / Raw Only = needs attention | Error / Missing = not usable yet")
+        legend.setObjectName("Sub")
+        legend.setWordWrap(True)
+        layout.addWidget(legend)
 
         self.search_edit = QtWidgets.QLineEdit()
         self.search_edit.setPlaceholderText("Filter symbols...")
         self.search_edit.textChanged.connect(self._apply_filter)
         layout.addWidget(self.search_edit)
 
-        self.list_widget = QtWidgets.QListWidget()
-        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        layout.addWidget(self.list_widget, 1)
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Ticker", "Status"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.tree.setAllColumnsShowFocus(True)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.tree, 1)
+
+        self.loading_label = QtWidgets.QLabel("")
+        self.loading_label.setObjectName("Sub")
+        self.loading_label.setWordWrap(True)
+        layout.addWidget(self.loading_label)
 
         btn_row = QtWidgets.QHBoxLayout()
-        select_all = QtWidgets.QPushButton("Select All")
-        clear_all = QtWidgets.QPushButton("Clear")
+        self.select_all_btn = QtWidgets.QPushButton("Select All")
+        self.select_missing_btn = QtWidgets.QPushButton("Select Missing")
+        self.clear_all_btn = QtWidgets.QPushButton("Clear")
         ok_btn = QtWidgets.QPushButton("OK")
         cancel_btn = QtWidgets.QPushButton("Cancel")
-        select_all.clicked.connect(self._select_all)
-        clear_all.clicked.connect(self._clear_all)
+        self.select_all_btn.clicked.connect(self._select_all)
+        self.select_missing_btn.clicked.connect(self._select_missing)
+        self.clear_all_btn.clicked.connect(self._clear_all)
         ok_btn.clicked.connect(self._accept)
         cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(select_all)
-        btn_row.addWidget(clear_all)
+        btn_row.addWidget(self.select_all_btn)
+        btn_row.addWidget(self.select_missing_btn)
+        btn_row.addWidget(self.clear_all_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
+        self.ok_btn = ok_btn
 
-        self._all_symbols = symbols
-        self._populate(symbols, preselected)
+        if snapshot_frame is not None:
+            self._set_loading_state("Preparing ticker status…")
+            QtCore.QTimer.singleShot(0, lambda frame=snapshot_frame: self._apply_snapshot(frame))
+        elif self._catalog_path is not None:
+            self._set_loading_state("Loading ticker status…")
+            self._start_snapshot_worker()
+        else:
+            self._set_loading_state("Preparing ticker list…")
+            QtCore.QTimer.singleShot(0, lambda: self._apply_snapshot(pd.DataFrame()))
 
-    def _populate(self, symbols: list[str], preselected: set[str]) -> None:
-        self.list_widget.clear()
-        for sym in symbols:
-            item = QtWidgets.QListWidgetItem(sym)
+    def _set_loading_state(self, message: str) -> None:
+        loading = bool(message)
+        self.loading_label.setText(message)
+        self.tree.setEnabled(not loading)
+        self.search_edit.setEnabled(not loading)
+        self.select_all_btn.setEnabled(not loading)
+        self.select_missing_btn.setEnabled(not loading)
+        self.clear_all_btn.setEnabled(not loading)
+        self.ok_btn.setEnabled(not loading)
+
+    def _start_snapshot_worker(self) -> None:
+        if self._catalog_path is None or self._snapshot_worker is not None:
+            return
+        self._snapshot_worker = AcquisitionSnapshotWorker(self._catalog_path, self)
+        self._snapshot_worker.loaded.connect(self._on_snapshot_loaded)
+        self._snapshot_worker.error.connect(self._on_snapshot_error)
+        self._snapshot_worker.finished.connect(self._snapshot_worker.deleteLater)
+        self._snapshot_worker.start()
+
+    def _apply_snapshot(self, frame: pd.DataFrame) -> None:
+        self._status_map = _ticker_status_map(self._symbols, frame=frame)
+        self._queue_population(self._symbols, self._preselected)
+
+    def _on_snapshot_loaded(self, frame: object) -> None:
+        self._snapshot_worker = None
+        resolved = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+        self._apply_snapshot(resolved)
+
+    def _on_snapshot_error(self, message: str) -> None:
+        self._snapshot_worker = None
+        self._post_populate_message = f"Status loading failed: {message}"
+        self._apply_snapshot(pd.DataFrame())
+
+    def _queue_population(self, symbols: list[str], preselected: set[str]) -> None:
+        self.tree.clear()
+        self._pending_population_rows = [
+            (sym, dict(self._status_map.get(sym.upper()) or _picker_status_meta("missing")), sym in preselected)
+            for sym in symbols
+        ]
+        self._populate_cursor = 0
+        total = len(self._pending_population_rows)
+        if total <= 0:
+            self._set_loading_state("")
+            if self._post_populate_message:
+                self.loading_label.setText(self._post_populate_message)
+                self._post_populate_message = ""
+            return
+        self._set_loading_state(f"Rendering ticker list… 0 / {total:,}")
+        QtCore.QTimer.singleShot(0, self._populate_batch)
+
+    def _populate_batch(self) -> None:
+        total = len(self._pending_population_rows)
+        if total <= 0:
+            self._set_loading_state("")
+            return
+        start = self._populate_cursor
+        end = min(total, start + self._populate_batch_size)
+        items: list[QtWidgets.QTreeWidgetItem] = []
+        text_brush = QtGui.QBrush(QtGui.QColor(PALETTE["text"]))
+        for sym, status, checked in self._pending_population_rows[start:end]:
+            status_label = str(status.get("status_label") or "Missing")
+            item = QtWidgets.QTreeWidgetItem([sym, status_label])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, sym)
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, f"{sym} {status_label}")
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 2, str(status.get("status_code") or "missing"))
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Checked if sym in preselected else QtCore.Qt.CheckState.Unchecked)
-            self.list_widget.addItem(item)
+            item.setCheckState(0, QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+            tooltip = str(status.get("tooltip") or "")
+            for column in range(2):
+                item.setToolTip(column, tooltip)
+                item.setForeground(column, text_brush)
+                item.setBackground(column, QtGui.QBrush(status.get("status_tint") or _picker_tint(PALETTE["red"], 0.18)))
+            item.setIcon(1, _picker_status_icon(str(status.get("status_color") or PALETTE["red"])))
+            status_font = item.font(1)
+            status_font.setBold(True)
+            item.setFont(1, status_font)
+            item.setTextAlignment(1, int(QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.AlignmentFlag.AlignVCenter))
+            items.append(item)
+        if items:
+            self.tree.addTopLevelItems(items)
+        self._populate_cursor = end
+        if end < total:
+            self.loading_label.setText(f"Rendering ticker list… {end:,} / {total:,}")
+            QtCore.QTimer.singleShot(0, self._populate_batch)
+            return
+        self._apply_filter(self.search_edit.text())
+        self._set_loading_state("")
+        if self._post_populate_message:
+            self.loading_label.setText(self._post_populate_message)
+            self._post_populate_message = ""
 
     def _apply_filter(self, text: str) -> None:
         needle = text.strip().upper()
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            item.setHidden(bool(needle) and needle not in item.text())
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item is None:
+                continue
+            haystack = str(item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or item.text(0)).upper()
+            item.setHidden(bool(needle) and needle not in haystack)
 
     def _select_all(self) -> None:
-        for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item is not None and not item.isHidden():
+                item.setCheckState(0, QtCore.Qt.CheckState.Checked)
+
+    def _select_missing(self) -> None:
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item is None or item.isHidden():
+                continue
+            status_code = str(item.data(0, QtCore.Qt.ItemDataRole.UserRole + 2) or "").strip().lower()
+            item.setCheckState(
+                0,
+                QtCore.Qt.CheckState.Checked if status_code == "missing" else QtCore.Qt.CheckState.Unchecked,
+            )
 
     def _clear_all(self) -> None:
-        for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item is not None and not item.isHidden():
+                item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
 
     def _accept(self) -> None:
         selected = []
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item.checkState() == QtCore.Qt.CheckState.Checked:
-                selected.append(item.text())
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if item is None or item.checkState(0) != QtCore.Qt.CheckState.Checked:
+                continue
+            symbol = str(item.data(0, QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+            if symbol:
+                selected.append(symbol)
         self.selected = selected
         self.accept()
 

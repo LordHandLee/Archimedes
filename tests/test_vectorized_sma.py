@@ -456,6 +456,64 @@ class VectorizedSMATest(unittest.TestCase):
         self.assertEqual(len(study_benchmark.per_batch), 2)
         self.assertEqual(len(frame.attrs["batch_benchmarks"]), 2)
 
+    def test_vectorized_execute_param_grid_emits_chunk_progress(self) -> None:
+        orchestrator = ExecutionOrchestrator()
+        progress_events: list[tuple[int, int]] = []
+        results = orchestrator.execute_param_grid(
+            data=self.bars,
+            dataset_id="progress_grid",
+            strategy_cls=SMACrossStrategy,
+            param_grid=[
+                {"fast": 4, "slow": 18, "target": 1.0},
+                {"fast": 5, "slow": 18, "target": 1.0},
+                {"fast": 6, "slow": 18, "target": 1.0},
+                {"fast": 7, "slow": 18, "target": 1.0},
+                {"fast": 8, "slow": 18, "target": 1.0},
+            ],
+            config=replace(self.config, vectorized_param_batch_size=2),
+            requested_execution_mode=ExecutionMode.VECTORIZED,
+            progress_cb=lambda done, total: progress_events.append((done, total)),
+        )
+        self.assertEqual(len(results), 5)
+        self.assertGreaterEqual(len(progress_events), 3)
+        self.assertEqual(progress_events[0], (0, 5))
+        self.assertIn((2, 5), progress_events)
+        self.assertIn((4, 5), progress_events)
+        self.assertEqual(progress_events[-1], (5, 5))
+
+    def test_independent_asset_grid_search_emits_intermediate_progress(self) -> None:
+        bars_b = self.bars.copy()
+        bars_b["open"] += 1.25
+        bars_b["high"] += 1.25
+        bars_b["low"] += 1.25
+        bars_b["close"] += 1.25
+
+        progress_events: list[tuple[int, int]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            catalog = ResultCatalog(Path(tmpdir) / "grid.sqlite")
+            frame = run_independent_asset_grid_search(
+                targets=[
+                    IndependentAssetTarget(dataset_id="asset_a", data_loader=lambda _: self.bars),
+                    IndependentAssetTarget(dataset_id="asset_b", data_loader=lambda _: bars_b),
+                ],
+                strategy_cls=SMACrossStrategy,
+                base_config=replace(self.config, vectorized_param_batch_size=2),
+                grid=GridSpec(
+                    params={"fast": [4, 5, 6, 7], "slow": [18]},
+                    timeframes=["1 minutes"],
+                    horizons=[(None, None)],
+                    execution_mode=ExecutionMode.VECTORIZED,
+                ),
+                catalog=catalog,
+                make_heatmap=False,
+                progress_cb=lambda done, total: progress_events.append((done, total)),
+            )
+        self.assertEqual(len(frame), 8)
+        self.assertGreaterEqual(len(progress_events), 4)
+        self.assertEqual(progress_events[0], (0, 8))
+        self.assertTrue(any(0 < done < total for done, total in progress_events))
+        self.assertEqual(progress_events[-1], (8, 8))
+
 
 if __name__ == "__main__":
     unittest.main()

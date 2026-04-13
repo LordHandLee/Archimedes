@@ -190,6 +190,11 @@ class GridSearch:
                     config=config,
                     requested_execution_mode=requested_mode,
                     workload_type=WorkloadType.OPTIMIZATION_BATCH,
+                    progress_cb=(
+                        (lambda batch_done, batch_total: progress_cb(done + batch_done, total))
+                        if progress_cb
+                        else None
+                    ),
                 )
                 if orchestrator.last_batch_benchmark is not None:
                     self.last_batch_benchmarks.append(orchestrator.last_batch_benchmark)
@@ -216,9 +221,7 @@ class GridSearch:
                             "engine_version": result.engine_version,
                         }
                     )
-                    done += 1
-                    if progress_cb:
-                        progress_cb(done, total)
+                done += len(batch_results)
 
         df = pd.DataFrame(records)
         df.attrs["batch_benchmarks"] = tuple(self.last_batch_benchmarks)

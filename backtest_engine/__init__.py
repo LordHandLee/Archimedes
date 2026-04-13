@@ -2,8 +2,10 @@
 
 from .acquisition import (
     IngestedDatasetArtifact,
+    backfill_missing_quality_snapshots,
     build_download_csv_path,
     build_download_dataset_id,
+    compute_and_store_quality_snapshot,
     gap_fill_dataset_from_secondary,
     ingest_csv_to_store,
     infer_dataset_id_from_csv_path,
@@ -237,8 +239,10 @@ __all__ = [
     "WorkloadType",
     "build_horizons",
     "duration_seconds",
+    "backfill_missing_quality_snapshots",
     "build_download_csv_path",
     "build_download_dataset_id",
+    "compute_and_store_quality_snapshot",
     "compute_freshness_state",
     "AcquisitionProviderFetchTuning",
     "available_acquisition_providers",

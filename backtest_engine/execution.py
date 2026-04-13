@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Sequence, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Type
 
 import pandas as pd
 
@@ -518,6 +518,7 @@ class ExecutionOrchestrator:
         base_data: Optional[pd.DataFrame] = None,
         requested_execution_mode: ExecutionMode | str = ExecutionMode.AUTO,
         workload_type: WorkloadType | str = WorkloadType.OPTIMIZATION_BATCH,
+        progress_cb: Callable[[int, int], None] | None = None,
     ) -> List[ExecutionResult]:
         started = perf_counter()
         requested_mode = ExecutionMode.from_value(requested_execution_mode)
@@ -544,11 +545,14 @@ class ExecutionOrchestrator:
                 requested_mode=requested_mode,
                 resolved_mode=ExecutionMode.VECTORIZED,
                 fallback_reason=resolution.fallback_reason,
+                progress_cb=progress_cb,
             )
             self._last_batch_benchmark = self._get_vectorized_engine().last_batch_benchmark
             return results
         results: List[ExecutionResult] = []
         workload = WorkloadType.from_value(workload_type)
+        if progress_cb:
+            progress_cb(0, len(param_grid))
         for params in param_grid:
             results.append(
                 self._get_reference_engine().execute(
@@ -568,6 +572,8 @@ class ExecutionOrchestrator:
                     fallback_reason=resolution.fallback_reason,
                 )
             )
+            if progress_cb:
+                progress_cb(len(results), len(param_grid))
         duration_seconds = perf_counter() - started
         cached_runs = sum(1 for result in results if result.cached)
         self._last_batch_benchmark = BatchExecutionBenchmark(

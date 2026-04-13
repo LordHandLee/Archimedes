@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Dict, Iterable, List, Sequence, Type
+from typing import Callable, Dict, Iterable, List, Sequence, Type
 
 import numpy as np
 import pandas as pd
@@ -110,6 +110,7 @@ class VectorizedEngine:
         base_data: pd.DataFrame | None = None,
         fallback_reason: str | None = None,
         logical_run_ids: Sequence[str | None] | None = None,
+        progress_cb: Callable[[int, int], None] | None = None,
     ) -> List[ExecutionResult]:
         started = perf_counter()
         object.__setattr__(self, "_last_batch_benchmark", None)
@@ -138,6 +139,7 @@ class VectorizedEngine:
             logical_ids = list(logical_run_ids)
             if len(logical_ids) != len(param_list):
                 raise ValueError("logical_run_ids length must match the parameter grid length.")
+        total_params = len(param_list)
 
         run_keys: List[tuple[str, str]] = []
         for i, params in enumerate(param_list):
@@ -181,6 +183,10 @@ class VectorizedEngine:
                 continue
             uncached_indices.append(i)
             uncached_params.append(params)
+
+        completed = total_params - len(uncached_indices)
+        if progress_cb:
+            progress_cb(completed, total_params)
 
         if uncached_indices:
             run_started_at = pd.Timestamp.now("UTC").isoformat()
@@ -249,6 +255,9 @@ class VectorizedEngine:
                         engine_version=self.engine_version,
                         fallback_reason=fallback_reason,
                     )
+                completed += len(chunk_params)
+                if progress_cb:
+                    progress_cb(completed, total_params)
 
         output = [result for result in results if result is not None]
         duration_seconds = perf_counter() - started

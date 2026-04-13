@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 
-from .acquisition import build_download_csv_path, build_download_dataset_id
+from .acquisition import (
+    build_download_csv_path,
+    build_download_dataset_id,
+    load_download_artifact_state,
+)
 from .catalog import AcquisitionDatasetRecord, ResultCatalog
 from .duckdb_store import DuckDBStore
 
@@ -30,6 +35,7 @@ ACQUISITION_PLAN_COMPOUND_MULTI_WINDOW_REFRESH = "compound_multi_window_refresh"
 ACQUISITION_PLAN_CROSS_SOURCE_GAP_FILL = "cross_source_gap_fill"
 ACQUISITION_PLAN_CROSS_SOURCE_GAP_FILL_PLUS_INCREMENTAL_REFRESH = "cross_source_gap_fill_plus_incremental_refresh"
 ACQUISITION_PLAN_GAP_REPAIR_REBUILD = ACQUISITION_PLAN_GAP_REPAIR_REFRESH
+ACQUISITION_PLAN_RESUME_INTERRUPTED_DOWNLOAD = "resume_interrupted_download"
 
 
 @dataclass(frozen=True)
@@ -162,6 +168,19 @@ def _normalize_request_windows(windows: list[tuple[str, str]]) -> tuple[tuple[st
     return tuple((start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")) for start, end in merged)
 
 
+def _saved_request_windows(payload: object) -> tuple[tuple[str, str], ...]:
+    windows: list[tuple[str, str]] = []
+    for item in list(payload or []):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        start = str(item[0] or "").strip()
+        end = str(item[1] or "").strip()
+        if not start or not end:
+            continue
+        windows.append((start, end))
+    return _normalize_request_windows(windows)
+
+
 def _find_secondary_gap_fill_candidate(
     *,
     catalog: ResultCatalog,
@@ -262,6 +281,8 @@ def decide_acquisition_policy(
     parquet_path = Path(record.parquet_path) if record and record.parquet_path else resolved_store.dataset_path(dataset_id)
     parquet_exists = parquet_path.exists()
     csv_exists = csv_path.exists()
+    download_state = load_download_artifact_state(csv_path)
+    download_state_status = str(download_state.get("status") or "").strip().lower()
     coverage_start = record.coverage_start if record else None
     coverage_end = record.coverage_end if record else None
     bar_count = record.bar_count if record else None
@@ -282,7 +303,17 @@ def decide_acquisition_policy(
     suspicious_gap_ranges: list[dict] = []
     gap_repair_request_start: str | None = None
     gap_repair_request_end: str | None = None
-    if parquet_exists and ingested:
+    if record and record.quality_analyzed_at:
+        quality_state = str(record.quality_state or "unknown")
+        suspicious_gap_count = int(record.suspicious_gap_count or 0)
+        max_suspicious_gap = record.max_suspicious_gap
+        gap_repair_request_start = str(record.repair_request_start or "").strip() or None
+        gap_repair_request_end = str(record.repair_request_end or "").strip() or None
+        try:
+            suspicious_gap_ranges = list(json.loads(record.suspicious_gap_ranges_json or "[]"))
+        except Exception:
+            suspicious_gap_ranges = []
+    elif parquet_exists and ingested:
         try:
             quality = resolved_store.inspect_dataset_quality(dataset_id, resolution)
             quality_state = str(quality.get("quality_state") or "unknown")
@@ -354,6 +385,45 @@ def decide_acquisition_policy(
             request_start=None,
             request_end=None,
             merge_with_existing=False,
+        )
+    resumable_download_statuses = {"queued", "running", "paused", "interrupted", "retry_wait", "stopped"}
+    if csv_exists and download_state_status in resumable_download_statuses:
+        saved_windows = _saved_request_windows(download_state.get("request_windows"))
+        try:
+            saved_window_index = max(0, int(download_state.get("window_index") or 0))
+        except Exception:
+            saved_window_index = 0
+        remaining_windows = saved_windows[saved_window_index:] if saved_windows else ()
+        request_start = remaining_windows[0][0] if remaining_windows else None
+        request_end = remaining_windows[0][1] if remaining_windows else None
+        return AcquisitionPolicyDecision(
+            dataset_id=dataset_id,
+            source=source,
+            symbol=str(symbol).strip().upper(),
+            resolution=resolution,
+            history_window=history_window,
+            action=ACQUISITION_ACTION_DOWNLOAD,
+            reason=(
+                "A resumable raw CSV checkpoint already exists for this dataset, so the provider download will resume "
+                "before any ingestion step."
+            ),
+            freshness_state=freshness_state,
+            csv_path=str(csv_path),
+            parquet_path=str(parquet_path) if parquet_exists else None,
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
+            bar_count=bar_count,
+            ingested=ingested,
+            quality_state=quality_state,
+            suspicious_gap_count=suspicious_gap_count,
+            max_suspicious_gap=max_suspicious_gap,
+            plan_type=ACQUISITION_PLAN_RESUME_INTERRUPTED_DOWNLOAD,
+            request_start=request_start,
+            request_end=request_end,
+            merge_with_existing=bool(download_state.get("merge_with_existing") or parquet_exists),
+            request_windows=remaining_windows,
+            secondary_source=str(download_state.get("secondary_source") or "").strip() or None,
+            secondary_dataset_id=str(download_state.get("secondary_dataset_id") or "").strip() or None,
         )
     if csv_exists and (not parquet_exists or not ingested):
         return AcquisitionPolicyDecision(

@@ -108,6 +108,7 @@ def build_provider_runtime_environment(
     *,
     catalog: object | None = None,
     secret_path: Path | str = PROVIDER_SECRETS_PATH,
+    client_id_override: int | str | None = None,
 ) -> dict[str, str]:
     normalized = _normalize_provider_id(provider_id)
     settings = load_provider_settings(normalized, catalog=catalog)
@@ -117,10 +118,25 @@ def build_provider_runtime_environment(
         api_key = str(secrets.get("api_key") or "").strip()
         if api_key:
             env["MASSIVE_API_KEY"] = api_key
+    elif normalized == "alpaca":
+        api_key = str(secrets.get("api_key") or "").strip()
+        secret_key = str(secrets.get("secret_key") or "").strip()
+        base_url = str(settings.get("base_url") or "").strip()
+        data_url = str(settings.get("data_url") or "").strip()
+        if api_key:
+            env["ALPACA_API_KEY_ID"] = api_key
+        if secret_key:
+            env["ALPACA_API_SECRET_KEY"] = secret_key
+        if base_url:
+            env["ALPACA_BASE_URL"] = base_url
+        if data_url:
+            env["ALPACA_DATA_URL"] = data_url
     elif normalized == "interactive_brokers":
         host = str(settings.get("host") or "").strip()
         port = str(settings.get("port") or "").strip()
-        client_id = str(settings.get("client_id") or "").strip()
+        client_id = str(
+            client_id_override if client_id_override is not None else settings.get("client_id") or ""
+        ).strip()
         if host:
             env["IB_HOST"] = host
         if port:
@@ -141,6 +157,13 @@ def provider_settings_status(
     secrets = load_provider_secrets(normalized, secret_path=secret_path)
     if normalized == "massive":
         return "API key saved" if str(secrets.get("api_key") or "").strip() else "API key missing"
+    if normalized == "alpaca":
+        api_key = str(secrets.get("api_key") or "").strip()
+        secret_key = str(secrets.get("secret_key") or "").strip()
+        base_url = str(settings.get("base_url") or "").strip()
+        if api_key and secret_key and base_url:
+            return f"Configured ({base_url})"
+        return "API key / secret / base URL incomplete"
     if normalized == "interactive_brokers":
         host = str(settings.get("host") or "").strip()
         port = str(settings.get("port") or "").strip()

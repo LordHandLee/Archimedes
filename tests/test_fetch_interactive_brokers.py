@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -82,6 +83,61 @@ class InteractiveBrokersFetchHelperTests(unittest.TestCase):
         self.assertTrue(_MODULE._is_benign_historical_error(162, "API historical data query cancelled: 9001"))
         self.assertTrue(_MODULE._is_benign_historical_error(366, "No historical data query found for ticker id:9002"))
         self.assertFalse(_MODULE._is_benign_historical_error(162, "HMDS query returned no data"))
+
+    def test_retryable_historical_exception_detects_hmds_disconnects(self) -> None:
+        self.assertTrue(
+            _MODULE._is_retryable_historical_exception(
+                RuntimeError("Interactive Brokers error 165: HMDS server disconnect occurred. Attempting reconnection...")
+            )
+        )
+        self.assertFalse(_MODULE._is_retryable_historical_exception(RuntimeError("Contract description is ambiguous.")))
+
+    def test_request_window_with_retries_recovers_after_transient_disconnect(self) -> None:
+        calls = 0
+        start = pd.Timestamp("2026-01-01", tz="UTC")
+        end = pd.Timestamp("2026-01-08", tz="UTC")
+
+        def _request(window_start: pd.Timestamp, window_end: pd.Timestamp):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError(
+                    "Interactive Brokers error 165 for request 1: Historical Market Data Service query message:"
+                    "HMDS server disconnect occurred.  Attempting reconnection..."
+                )
+            return _MODULE._HistoricalResult(rows=[], start=str(window_start), end=str(window_end))
+
+        result = _MODULE._request_window_with_retries(
+            _request,
+            window_start=start,
+            window_end=end,
+            max_attempts=2,
+        )
+        self.assertEqual(result.start, str(start))
+        self.assertEqual(calls, 2)
+
+    def test_checkpoint_helpers_round_trip_and_resume_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.csv"
+            frame = pd.DataFrame(
+                {
+                    "open": [1.0, 2.0],
+                    "high": [1.1, 2.1],
+                    "low": [0.9, 1.9],
+                    "close": [1.05, 2.05],
+                    "volume": [100, 200],
+                },
+                index=pd.to_datetime(["2026-01-01 14:30:00+00:00", "2026-01-01 14:31:00+00:00"], utc=True),
+            )
+            frame.index.name = "timestamp"
+            _MODULE._append_checkpoint_rows(path, frame)
+            loaded = _MODULE._load_checkpoint_frame(path)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(loaded.index.max(), pd.Timestamp("2026-01-01 14:31:00+00:00"))
+            self.assertEqual(
+                _MODULE._advance_resume_start(loaded.index.max()),
+                pd.Timestamp("2026-01-01 14:31:01+00:00"),
+            )
 
 
 if __name__ == "__main__":

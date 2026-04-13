@@ -170,6 +170,27 @@ class DuckDBStore:
             return stamp
         return stamp
 
+    @staticmethod
+    def _intraday_core_session_mask(index: pd.DatetimeIndex) -> pd.Series:
+        local = index.tz_convert("America/New_York")
+        minutes = (local.hour * 60) + local.minute
+        return pd.Series((minutes >= 570) & (minutes <= 960), index=range(len(index)))
+
+    @staticmethod
+    def _intraday_local_day_mask(index: pd.DatetimeIndex) -> pd.Series:
+        local = index.tz_convert("America/New_York")
+        return pd.Series(local[1:].normalize() == local[:-1].normalize())
+
+    @staticmethod
+    def _intraday_analysis_index(index: pd.DatetimeIndex) -> tuple[pd.DatetimeIndex, str]:
+        if index.empty:
+            return index, "unknown"
+        core_mask = DuckDBStore._intraday_core_session_mask(index)
+        core_ratio = float(core_mask.mean()) if len(core_mask) else 0.0
+        if core_ratio >= 0.9:
+            return pd.DatetimeIndex(index[core_mask.to_numpy()]), "nyse_core"
+        return index, "local_intraday"
+
     def inspect_dataset_quality(self, dataset_id: str, resolution: str) -> dict:
         path = self.dataset_path(dataset_id)
         if not path.exists():
@@ -183,22 +204,33 @@ class DuckDBStore:
         suspicious_gap_ranges: list[dict[str, str]] = []
         repair_request_start: str | None = None
         repair_request_end: str | None = None
+        session_profile: str | None = None
 
         if expected_interval is not None and len(timestamps) >= 2:
-            diffs = timestamps[1:] - timestamps[:-1]
-            diff_series = pd.Series(diffs)
-            gap_after_series = pd.Series(pd.Index(timestamps[:-1]))
-            gap_before_series = pd.Series(pd.Index(timestamps[1:]))
             if expected_interval < pd.Timedelta(days=1):
-                same_day_mask = pd.Series(timestamps[1:].normalize() == timestamps[:-1].normalize())
-                suspicious_mask = same_day_mask & (diff_series > (expected_interval * 3))
+                analysis_index, session_profile = self._intraday_analysis_index(timestamps)
+                if len(analysis_index) >= 2:
+                    diffs = analysis_index[1:] - analysis_index[:-1]
+                    diff_series = pd.Series(diffs)
+                    gap_after_series = pd.Series(pd.Index(analysis_index[:-1]))
+                    gap_before_series = pd.Series(pd.Index(analysis_index[1:]))
+                    same_day_mask = self._intraday_local_day_mask(analysis_index)
+                    suspicious_mask = same_day_mask & (diff_series > (expected_interval * 3))
+                else:
+                    diff_series = pd.Series(dtype="timedelta64[ns]")
+                    gap_after_series = pd.Series(dtype="datetime64[ns, UTC]")
+                    gap_before_series = pd.Series(dtype="datetime64[ns, UTC]")
+                    suspicious_mask = pd.Series(dtype=bool)
             else:
+                diffs = timestamps[1:] - timestamps[:-1]
+                diff_series = pd.Series(diffs)
+                gap_after_series = pd.Series(pd.Index(timestamps[:-1]))
+                gap_before_series = pd.Series(pd.Index(timestamps[1:]))
                 suspicious_mask = diff_series > (expected_interval * 3)
             suspicious_diffs = diff_series[suspicious_mask]
             suspicious_gap_count = int(len(suspicious_diffs))
             if suspicious_gap_count:
                 max_suspicious_gap = suspicious_diffs.max()
-                quality_state = "gappy"
                 suspicious_rows = pd.DataFrame(
                     {
                         "gap_after": gap_after_series[suspicious_mask].reset_index(drop=True),
@@ -218,8 +250,19 @@ class DuckDBStore:
                             "request_end": gap_before.strftime("%Y-%m-%d"),
                         }
                     )
-                repair_request_start = suspicious_gap_ranges[0]["request_start"]
-                repair_request_end = suspicious_gap_ranges[-1]["request_end"]
+                if expected_interval < pd.Timedelta(days=1):
+                    total_points = max(int(len(analysis_index)), 1)
+                    gap_ratio = float(suspicious_gap_count) / float(total_points)
+                    minor_intraday_limit = max(pd.Timedelta(minutes=60), expected_interval * 12)
+                    if max_suspicious_gap is not None and max_suspicious_gap <= minor_intraday_limit and gap_ratio <= 0.005:
+                        quality_state = "sparse_intraday"
+                    else:
+                        quality_state = "gappy"
+                else:
+                    quality_state = "gappy"
+                if quality_state == "gappy":
+                    repair_request_start = suspicious_gap_ranges[0]["request_start"]
+                    repair_request_end = suspicious_gap_ranges[-1]["request_end"]
             else:
                 quality_state = "gap_free"
         elif expected_interval is not None:
@@ -235,6 +278,7 @@ class DuckDBStore:
             "suspicious_gap_ranges": suspicious_gap_ranges,
             "repair_request_start": repair_request_start,
             "repair_request_end": repair_request_end,
+            "session_profile": session_profile,
         }
 
     def compare_dataset_parity(

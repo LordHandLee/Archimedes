@@ -76,6 +76,14 @@ _BAR_SIZE_MAP = {
     "1mo": "1 month",
 }
 
+_RETRYABLE_HISTORICAL_ERROR_SNIPPETS = (
+    "hmds server disconnect occurred",
+    "attempting reconnection",
+    "hmds data farm connection is broken",
+    "data farm connection is broken",
+    "pacing violation",
+)
+
 
 def _normalize_bar_size(value: str) -> str:
     normalized = " ".join(str(value or "").strip().lower().split())
@@ -192,6 +200,39 @@ def _is_benign_historical_error(error_code: int, error_text: str) -> bool:
     )
 
 
+def _is_retryable_historical_exception(exc: BaseException) -> bool:
+    normalized = str(exc or "").lower()
+    return any(snippet in normalized for snippet in _RETRYABLE_HISTORICAL_ERROR_SNIPPETS)
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    return min(30.0, 3.0 * (2**attempt))
+
+
+def _request_window_with_retries(
+    request_window: Callable[[pd.Timestamp, pd.Timestamp], _HistoricalResult],
+    *,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    max_attempts: int = 3,
+) -> _HistoricalResult:
+    last_exc: BaseException | None = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            return request_window(window_start, window_end)
+        except TimeoutError as exc:
+            last_exc = exc
+        except RuntimeError as exc:
+            if not _is_retryable_historical_exception(exc):
+                raise
+            last_exc = exc
+        if attempt + 1 < max_attempts:
+            time.sleep(_retry_backoff_seconds(attempt))
+    if last_exc is None:
+        raise RuntimeError("Historical data request failed without a captured exception.")
+    raise last_exc
+
+
 def _fetch_window_with_adaptive_retry(
     request_window: Callable[[pd.Timestamp, pd.Timestamp], _HistoricalResult],
     *,
@@ -200,7 +241,13 @@ def _fetch_window_with_adaptive_retry(
     bar_size: str,
 ) -> list[_HistoricalResult]:
     try:
-        return [request_window(window_start, window_end)]
+        return [
+            _request_window_with_retries(
+                request_window,
+                window_start=window_start,
+                window_end=window_end,
+            )
+        ]
     except TimeoutError as exc:
         span = window_end - window_start
         min_span = _minimum_retry_window(bar_size)
@@ -260,6 +307,32 @@ def _parse_ib_bar_time(value: str) -> pd.Timestamp:
     return parsed.tz_convert("UTC")
 
 
+def _load_checkpoint_frame(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    frame = pd.read_csv(path, parse_dates=["timestamp"])
+    if frame.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["timestamp"])
+    frame = frame.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+    frame = frame.set_index("timestamp")
+    return frame
+
+
+def _append_checkpoint_rows(path: Path, frame: pd.DataFrame) -> None:
+    if frame.empty:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = frame.reset_index().rename(columns={"index": "timestamp"})
+    write_header = not path.exists() or path.stat().st_size == 0
+    ordered.to_csv(path, mode="a", index=False, header=write_header)
+
+
+def _advance_resume_start(last_timestamp: pd.Timestamp) -> pd.Timestamp:
+    return _ensure_utc_timestamp(last_timestamp) + pd.Timedelta(seconds=1)
+
+
 def _build_contract(
     ticker: str,
     *,
@@ -303,7 +376,7 @@ class _IBHistoricalApp(EWrapper, EClient):
         message = RuntimeError(f"Interactive Brokers error {errorCode} for request {reqId}: {errorString}")
         if queue is not None:
             queue.put(("error", message))
-        elif int(errorCode) not in {2104, 2106, 2158}:  # common connection/status noise
+        elif int(errorCode) not in {2104, 2105, 2106, 2158}:  # common connection/status noise
             sys.stderr.write(f"{message}\n")
 
     def historicalData(self, reqId, bar):  # noqa: N802
@@ -439,6 +512,8 @@ def fetch_bars(
     timeout_seconds: float,
     discover_head_timestamp: bool = False,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
 ) -> pd.DataFrame:
     if _IBAPI_IMPORT_ERROR is not None:
         raise RuntimeError(
@@ -452,8 +527,30 @@ def fetch_bars(
         start_ts = end_ts - _history_to_offset(history_window)
     else:
         start_ts = _ensure_utc_timestamp(start)
+    requested_start_ts = start_ts
     if start_ts >= end_ts:
         raise ValueError("Start time must be before end time.")
+
+    checkpoint_frame = pd.DataFrame()
+    last_checkpoint_ts: pd.Timestamp | None = None
+    checkpoint_row_count = 0
+    if checkpoint_path is not None and checkpoint_path.exists() and not resume:
+        checkpoint_path.unlink()
+    if checkpoint_path is not None and resume and checkpoint_path.exists():
+        checkpoint_frame = _load_checkpoint_frame(checkpoint_path)
+        if not checkpoint_frame.empty:
+            last_checkpoint_ts = _ensure_utc_timestamp(checkpoint_frame.index.max())
+            checkpoint_row_count = int(len(checkpoint_frame))
+            start_ts = max(start_ts, _advance_resume_start(last_checkpoint_ts))
+            if progress_cb:
+                progress_cb(0, checkpoint_row_count)
+    if start_ts >= end_ts:
+        if checkpoint_path is not None and checkpoint_path.exists():
+            frame = _load_checkpoint_frame(checkpoint_path)
+            return frame.loc[(frame.index >= requested_start_ts) & (frame.index <= end_ts)]
+        if not checkpoint_frame.empty:
+            return checkpoint_frame.loc[(checkpoint_frame.index >= requested_start_ts) & (checkpoint_frame.index <= end_ts)]
+        raise RuntimeError("Requested range is already fully covered by the existing checkpoint.")
 
     contract = _build_contract(
         ticker,
@@ -509,13 +606,33 @@ def fetch_bars(
             )
             for result in window_results:
                 completed_requests += 1
+                result_rows: list[dict] = []
                 for row in result.rows:
                     stamp = row["timestamp"]
                     if stamp < window_start or stamp > window_end:
                         continue
-                    all_rows.append(row)
+                    if last_checkpoint_ts is not None and stamp <= last_checkpoint_ts:
+                        continue
+                    result_rows.append(row)
+                if checkpoint_path is not None:
+                    if result_rows:
+                        checkpoint_chunk = pd.DataFrame(result_rows)
+                        checkpoint_chunk["timestamp"] = pd.to_datetime(
+                            checkpoint_chunk["timestamp"], utc=True, errors="coerce"
+                        )
+                        checkpoint_chunk = checkpoint_chunk.dropna(subset=["timestamp"])
+                        checkpoint_chunk = checkpoint_chunk.drop_duplicates(subset=["timestamp"], keep="last")
+                        checkpoint_chunk = checkpoint_chunk.sort_values("timestamp").set_index("timestamp")
+                        _append_checkpoint_rows(checkpoint_path, checkpoint_chunk)
+                        last_checkpoint_ts = _ensure_utc_timestamp(checkpoint_chunk.index.max())
+                        checkpoint_row_count += int(len(checkpoint_chunk))
+                else:
+                    all_rows.extend(result_rows)
                 if progress_cb:
-                    progress_cb(completed_requests, len(all_rows))
+                    progress_rows = len(all_rows)
+                    if checkpoint_path is not None:
+                        progress_rows = checkpoint_row_count
+                    progress_cb(completed_requests, progress_rows)
             if pace_seconds > 0 and index < len(windows):
                 time.sleep(pace_seconds)
     finally:
@@ -524,12 +641,16 @@ def fetch_bars(
         finally:
             thread.join(timeout=1.0)
 
-    if not all_rows:
-        raise RuntimeError("Interactive Brokers returned no historical bars for this request.")
-
-    frame = pd.DataFrame(all_rows)
-    frame = frame.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
-    frame = frame.set_index("timestamp")
+    if checkpoint_path is not None and checkpoint_path.exists():
+        frame = _load_checkpoint_frame(checkpoint_path)
+        frame = frame.loc[(frame.index >= requested_start_ts) & (frame.index <= end_ts)]
+        frame.reset_index().to_csv(checkpoint_path, index=False)
+    else:
+        if not all_rows:
+            raise RuntimeError("Interactive Brokers returned no historical bars for this request.")
+        frame = pd.DataFrame(all_rows)
+        frame = frame.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+        frame = frame.set_index("timestamp")
     return frame
 
 
@@ -613,6 +734,8 @@ def main() -> None:
             timeout_seconds=float(args.timeout_seconds),
             discover_head_timestamp=bool(args.discover_head_timestamp),
             progress_cb=emit_progress,
+            checkpoint_path=args.out,
+            resume=bool(args.resume),
         )
         args.out.parent.mkdir(parents=True, exist_ok=True)
         frame.reset_index().to_csv(args.out, index=False)
@@ -632,13 +755,23 @@ def main() -> None:
             print(f"Saved {len(frame)} rows to {args.out}")
     except Exception as exc:
         details = traceback.format_exc()
+        message = str(exc)
+        if args.out.exists():
+            try:
+                checkpoint_rows = len(_load_checkpoint_frame(args.out))
+            except Exception:
+                checkpoint_rows = 0
+            if checkpoint_rows > 0:
+                checkpoint_note = f"Partial progress was saved to {args.out} ({checkpoint_rows} rows)."
+                message = f"{message} [{checkpoint_note}]"
+                details = f"{details.rstrip()}\n\n{checkpoint_note}\n"
         if args.progress:
             print(
                 json.dumps(
                     {
                         "type": "error",
                         "ticker": args.ticker.upper(),
-                        "message": str(exc),
+                        "message": message,
                         "details": details,
                     }
                 ),

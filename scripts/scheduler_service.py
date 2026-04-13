@@ -279,6 +279,7 @@ def run_task(task: ScheduledTask) -> None:
                         out_path,
                         dataset_id=dataset_id,
                         merge_existing=bool(decision.merge_with_existing),
+                        resolution=resolution,
                     )
                     success_count += 1
                     ingested_count += 1
@@ -304,6 +305,7 @@ def run_task(task: ScheduledTask) -> None:
                         universe_id=universe_id,
                         resolution=resolution,
                         history_window=history_window,
+                        quality_snapshot=artifact.quality_snapshot,
                     )
                 except Exception as exc:
                     failed_count += 1
@@ -345,6 +347,7 @@ def run_task(task: ScheduledTask) -> None:
                             str(decision.secondary_dataset_id or ""),
                             start=window_start,
                             end=window_end,
+                            resolution=resolution,
                         )
                     success_count += 1
                     ingested_count += 1
@@ -374,6 +377,7 @@ def run_task(task: ScheduledTask) -> None:
                         universe_id=universe_id,
                         resolution=resolution,
                         history_window=history_window,
+                        quality_snapshot=artifact.quality_snapshot if artifact is not None else None,
                     )
                 except Exception as exc:
                     failed_count += 1
@@ -413,6 +417,7 @@ def run_task(task: ScheduledTask) -> None:
                             str(decision.secondary_dataset_id or ""),
                             start=window_start,
                             end=window_end,
+                            resolution=resolution,
                         )
                     log_file.write(
                         f"[{datetime.utcnow().isoformat()}] SECONDARY_GAP_FILL {ticker} "
@@ -509,6 +514,7 @@ def run_task(task: ScheduledTask) -> None:
                         out_path,
                         dataset_id=dataset_id,
                         merge_existing=bool(decision.merge_with_existing or window_idx > 1 or len(windows) > 1),
+                        resolution=resolution,
                     )
                 except Exception as exc:
                     failed_count += 1
@@ -543,6 +549,7 @@ def run_task(task: ScheduledTask) -> None:
                 universe_id=universe_id,
                 resolution=resolution,
                 history_window=history_window,
+                quality_snapshot=artifact.quality_snapshot if artifact is not None else None,
             )
             log_file.write(f"[{datetime.utcnow().isoformat()}] DONE {ticker}\n")
             log_file.flush()

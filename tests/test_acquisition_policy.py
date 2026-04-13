@@ -245,6 +245,63 @@ class AcquisitionPolicyTests(unittest.TestCase):
             self.assertEqual(decision.request_end, "2026-04-08")
             self.assertTrue(decision.merge_with_existing)
 
+    def test_fresh_sparse_intraday_dataset_is_not_forced_into_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            catalog = ResultCatalog(root / "catalog.sqlite")
+            store = DuckDBStore(db_path=root / "history.duckdb", data_dir=root / "parquet")
+            timestamps: list[pd.Timestamp] = []
+            day_starts = [
+                pd.Timestamp("2026-04-07T13:30:00Z"),
+                pd.Timestamp("2026-04-08T13:30:00Z"),
+                pd.Timestamp("2026-04-09T13:30:00Z"),
+                pd.Timestamp("2026-04-10T13:30:00Z"),
+            ]
+            for day_idx, start in enumerate(day_starts):
+                for minute in range(390):
+                    if day_idx < 2 and minute in {120, 121, 122, 123, 240, 241, 242, 243}:
+                        continue
+                    timestamps.append(start + pd.Timedelta(minutes=minute))
+            frame = pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(timestamps, utc=True),
+                    "open": [1.0 + (idx * 0.001) for idx in range(len(timestamps))],
+                    "high": [1.1 + (idx * 0.001) for idx in range(len(timestamps))],
+                    "low": [0.9 + (idx * 0.001) for idx in range(len(timestamps))],
+                    "close": [1.05 + (idx * 0.001) for idx in range(len(timestamps))],
+                    "volume": [10] * len(timestamps),
+                }
+            )
+            parquet_path = store.write_parquet("O_interactive_brokers_1d_1m", frame)
+            quality_snapshot = store.inspect_dataset_quality("O_interactive_brokers_1d_1m", "1m")
+            quality_snapshot["quality_analyzed_at"] = pd.Timestamp.now("UTC").isoformat()
+            catalog.upsert_acquisition_dataset(
+                dataset_id="O_interactive_brokers_1d_1m",
+                source="interactive_brokers",
+                symbol="O",
+                resolution="1m",
+                history_window="1d",
+                parquet_path=str(parquet_path),
+                coverage_start=str(frame["timestamp"].min().isoformat()),
+                coverage_end=str(frame["timestamp"].max().isoformat()),
+                bar_count=len(frame),
+                ingested=True,
+                last_status="ingested",
+                quality_snapshot=quality_snapshot,
+            )
+            decision = decide_acquisition_policy(
+                "O",
+                source="interactive_brokers",
+                resolution="1m",
+                history_window="1d",
+                catalog=catalog,
+                store=store,
+                data_dir=root,
+                now=pd.Timestamp("2026-04-11T12:00:00Z"),
+            )
+            self.assertEqual(decision.quality_state, "sparse_intraday")
+            self.assertEqual(decision.action, ACQUISITION_ACTION_SKIP_FRESH)
+
     def test_stale_dataset_gets_incremental_refresh_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

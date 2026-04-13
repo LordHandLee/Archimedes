@@ -80,7 +80,7 @@ Current implementation note:
 - a durable acquisition catalog now tracks runs, attempts, coverage, and ingest state
 - an initial acquisition policy layer can choose between `download`, `ingest existing CSV`, and `skip fresh`
 - users can explicitly override freshness with a `force refresh` policy when they want a re-download anyway
-- dataset-level acquisition review is now reachable from multiple UI surfaces, not only the Automate tab
+- dataset-level acquisition review is now reachable from multiple UI surfaces, not only the Data Collection tab
 - local datasets now have an initial suspicious-gap quality check, but not a full automatic gap-repair engine yet
 - the acquisition layer now has an initial refresh planner that can recommend `incremental refresh`, `backfill`, or `full rebuild`, but it still remains an early v1 policy layer
 - isolated fresh-but-gappy datasets can now trigger same-source gap-repair refresh windows, including non-contiguous multi-window repair when needed
