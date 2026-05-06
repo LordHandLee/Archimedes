@@ -26,6 +26,34 @@ def sanitize_series_name(name: str) -> str:
     return cleaned or "Series"
 
 
+def _json_safe(value):
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    if isinstance(value, pd.Timestamp):
+        return ChartSnapshotExporter._iso_utc(value)
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _utc_epoch_ns(index: pd.Index | pd.Series | Sequence[object]) -> np.ndarray:
+    timestamps = pd.to_datetime(index, utc=True, errors="coerce")
+    if isinstance(timestamps, pd.Series):
+        values = timestamps.dt.tz_convert("UTC").to_numpy(dtype="datetime64[ns]")
+    else:
+        values = pd.DatetimeIndex(timestamps).tz_convert("UTC").to_numpy(dtype="datetime64[ns]")
+    return values.astype("int64")
+
+
 @dataclass
 class ChartSnapshotArtifact:
     run_id: str
@@ -103,7 +131,7 @@ class ChartSnapshotExporter:
         if not trades_out_df.empty:
             self._write_feather(trades_out_df, trades_path)
 
-        manifest = self._build_manifest(
+        manifest = _json_safe(self._build_manifest(
             run=run,
             bars=price_bars_df,
             overlay_order=overlay_order,
@@ -118,13 +146,121 @@ class ChartSnapshotExporter:
                 "panes": panes_path.name,
             },
             series_styles=series_styles or {},
-        )
+        ))
         manifest_path = snapshot_root / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":"), allow_nan=False), encoding="utf-8")
 
         return ChartSnapshotArtifact(
             run_id=str(run.run_id),
             snapshot_root=snapshot_root.resolve(),
+            manifest_path=manifest_path.resolve(),
+        )
+
+    def export_market_snapshot(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        bars: pd.DataFrame,
+        overlays: Mapping[str, pd.Series] | None = None,
+        panes: Mapping[str, pd.Series] | None = None,
+        series_styles: Mapping[str, dict] | None = None,
+        equity_curve: pd.Series | None = None,
+        trades_df: pd.DataFrame | None = None,
+        snapshot_root: str | Path | None = None,
+        title: str = "",
+        subtitle: str = "",
+        status_text: str = "",
+        overwrite: bool = True,
+    ) -> ChartSnapshotArtifact:
+        if bars is None or bars.empty:
+            raise ValueError("Cannot export a market snapshot without price bars.")
+        aligned_bars = bars.sort_index().copy()
+        if aligned_bars.index.tz is None:
+            aligned_bars.index = aligned_bars.index.tz_localize("UTC")
+        else:
+            aligned_bars.index = aligned_bars.index.tz_convert("UTC")
+
+        cleaned_symbol = sanitize_series_name(str(symbol or "MARKET").upper())
+        cleaned_timeframe = sanitize_series_name(str(timeframe or "1m"))
+        resolved_root = (
+            Path(snapshot_root)
+            if snapshot_root is not None
+            else self.root_dir / "market" / cleaned_symbol / cleaned_timeframe
+        )
+        if overwrite and resolved_root.exists():
+            shutil.rmtree(resolved_root)
+        resolved_root.mkdir(parents=True, exist_ok=True)
+
+        price_bars_df = self._build_price_bars_dataframe(aligned_bars)
+        overlays_df, overlay_order = self._build_series_dataframe(aligned_bars, overlays or {})
+        panes_df, pane_order = self._build_series_dataframe(aligned_bars, panes or {})
+        equity_df = pd.DataFrame()
+        if equity_curve is not None and not equity_curve.empty:
+            aligned_equity = pd.to_numeric(equity_curve.sort_index(), errors="coerce").astype(float)
+            if aligned_equity.index.tz is None:
+                aligned_equity.index = aligned_equity.index.tz_localize("UTC")
+            else:
+                aligned_equity.index = aligned_equity.index.tz_convert("UTC")
+            aligned_equity = aligned_equity[~aligned_equity.index.duplicated(keep="last")]
+            aligned_equity = aligned_equity.reindex(aligned_bars.index, method="ffill").bfill()
+            if aligned_equity.notna().any():
+                equity_df = self._build_equity_dataframe(aligned_bars, aligned_equity.rename("equity"))
+        trades_out_df = trades_df.copy() if trades_df is not None else pd.DataFrame()
+
+        price_bars_path = resolved_root / "price_bars.feather"
+        overlays_path = resolved_root / "overlays.feather"
+        panes_path = resolved_root / "panes.feather"
+        equity_path = resolved_root / "equity.feather"
+        trades_path = resolved_root / "trades.feather"
+        self._write_feather(price_bars_df, price_bars_path)
+        self._write_feather(overlays_df, overlays_path)
+        self._write_feather(panes_df, panes_path)
+        if not equity_df.empty:
+            self._write_feather(equity_df, equity_path)
+        if not trades_out_df.empty:
+            self._write_feather(trades_out_df, trades_path)
+
+        market_run = SimpleNamespace(
+            run_id=f"market-{cleaned_symbol}-{cleaned_timeframe}",
+            dataset_id=str(symbol or "").upper(),
+            strategy="MarketChart",
+            params={},
+            timeframe=str(timeframe or ""),
+            start=aligned_bars.index[0],
+            end=aligned_bars.index[-1],
+            starting_cash=None,
+            metrics={},
+        )
+        manifest = self._build_manifest(
+            run=market_run,
+            bars=price_bars_df,
+            overlay_order=overlay_order,
+            pane_order=pane_order,
+            equity_df=equity_df,
+            trades_df=trades_out_df,
+            files={
+                "price_bars": price_bars_path.name,
+                "trades": trades_path.name if not trades_out_df.empty else "",
+                "equity": equity_path.name if not equity_df.empty else "",
+                "overlays": overlays_path.name,
+                "panes": panes_path.name,
+            },
+            series_styles=series_styles or {},
+        )
+        if title:
+            manifest["title"] = str(title)
+        if subtitle:
+            manifest["subtitle"] = str(subtitle)
+        if status_text:
+            manifest["status_text"] = str(status_text)
+        manifest = _json_safe(manifest)
+        manifest_path = resolved_root / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+
+        return ChartSnapshotArtifact(
+            run_id=str(market_run.run_id),
+            snapshot_root=resolved_root.resolve(),
             manifest_path=manifest_path.resolve(),
         )
 
@@ -499,7 +635,7 @@ class ChartSnapshotExporter:
         volume = frame["volume"].to_numpy(dtype=float) if "volume" in frame.columns else np.zeros(len(frame), dtype=float)
         return pd.DataFrame(
             {
-                "ts_utc_ns": frame.index.view("int64").astype("int64"),
+                "ts_utc_ns": _utc_epoch_ns(frame.index),
                 "open": frame["open"].to_numpy(dtype=float),
                 "high": frame["high"].to_numpy(dtype=float),
                 "low": frame["low"].to_numpy(dtype=float),
@@ -665,7 +801,7 @@ class ChartSnapshotExporter:
             "SMA Fast": "#4da3ff",
             "SMA Slow": "#ffd166",
             "Half-Life Mean": "#4da3ff",
-            "Z-Score": "#ffcc66",
+            "Z-Score": "#a28bff",
             "Upper": "#27d07d",
             "Lower": "#ff6b6b",
             "Exit Upper": "#7ee787",
@@ -723,7 +859,7 @@ class ChartSnapshotExporter:
     ) -> tuple[pd.DataFrame, list[str]]:
         frame = pd.DataFrame(
             {
-                "ts_utc_ns": bars.index.view("int64").astype("int64"),
+                "ts_utc_ns": _utc_epoch_ns(bars.index),
                 "bar_index": np.arange(len(bars), dtype=np.int32),
             }
         )
@@ -749,7 +885,7 @@ class ChartSnapshotExporter:
         drawdown = (aligned / aligned.cummax()) - 1.0
         return pd.DataFrame(
             {
-                "ts_utc_ns": bars.index.view("int64").astype("int64"),
+                "ts_utc_ns": _utc_epoch_ns(bars.index),
                 "bar_index": np.arange(len(bars), dtype=np.int32),
                 "equity": aligned.to_numpy(dtype=float),
                 "drawdown": drawdown.to_numpy(dtype=float),

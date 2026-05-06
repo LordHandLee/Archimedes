@@ -52,6 +52,11 @@ class MagellanClient(QtCore.QObject):
             self._last_error = ""
             return True
 
+        if self._process and self._process.state() == QtCore.QProcess.ProcessState.NotRunning:
+            self._process.deleteLater()
+            self._process = None
+            self._owns_process = False
+
         if self._process and self._process.state() != QtCore.QProcess.ProcessState.NotRunning:
             if self._wait_for_server(timeout_ms):
                 self._last_error = ""
@@ -91,6 +96,39 @@ class MagellanClient(QtCore.QObject):
         self.shutdown()
         return False
 
+    def warmup_async(self) -> bool:
+        if self.is_running(timeout_ms=25):
+            self._last_error = ""
+            return True
+
+        if self._process and self._process.state() == QtCore.QProcess.ProcessState.NotRunning:
+            self._process.deleteLater()
+            self._process = None
+            self._owns_process = False
+
+        if self._process and self._process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            return True
+
+        viewer_path = self.viewer_path
+        if viewer_path is None:
+            self._last_error = (
+                "Magellan viewer binary was not found. "
+                "Set MAGELLAN_VIEWER_PATH or place the build at ~/Magellan/charting_engine/build/magellan_chart_viewer."
+            )
+            return False
+
+        process = QtCore.QProcess(self)
+        process.setProgram(str(viewer_path))
+        process.setArguments([])
+        process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        process.finished.connect(self._handle_process_finished)
+        process.errorOccurred.connect(self._handle_process_error)
+        process.start()
+        self._process = process
+        self._owns_process = True
+        self._last_error = ""
+        return True
+
     def open_live_session(
         self,
         session_id: str,
@@ -112,11 +150,59 @@ class MagellanClient(QtCore.QObject):
             payload["snapshot_path"] = str(snapshot_path)
         self._send_json(payload, timeout_ms=timeout_ms)
 
+    def open_embedded_live_session(
+        self,
+        session_id: str,
+        *,
+        parent_window_id: str | int,
+        width: int,
+        height: int,
+        title: str = "",
+        subtitle: str = "",
+        status_text: str = "",
+        snapshot_path: str | Path | None = None,
+        timeout_ms: int = 1000,
+    ) -> None:
+        payload = {
+            "type": "open_live",
+            "session_id": session_id,
+            "title": title,
+            "subtitle": subtitle,
+            "status_text": status_text,
+            "embed_parent_id": str(parent_window_id),
+            "embed_width": int(width),
+            "embed_height": int(height),
+        }
+        if snapshot_path:
+            payload["snapshot_path"] = str(snapshot_path)
+        self._send_json(payload, timeout_ms=timeout_ms)
+
     def open_snapshot(self, snapshot_path: str | Path, timeout_ms: int = 1000) -> None:
         path_text = str(snapshot_path).strip()
         if not path_text:
             raise MagellanError("Snapshot path is required.")
         self._send_message(path_text.encode("utf-8"), timeout_ms=timeout_ms)
+
+    def open_embedded_snapshot(
+        self,
+        snapshot_path: str | Path,
+        *,
+        parent_window_id: str | int,
+        width: int,
+        height: int,
+        timeout_ms: int = 1000,
+    ) -> None:
+        path_text = str(snapshot_path).strip()
+        if not path_text:
+            raise MagellanError("Snapshot path is required.")
+        payload = {
+            "type": "open_snapshot",
+            "snapshot_path": path_text,
+            "embed_parent_id": str(parent_window_id),
+            "embed_width": int(width),
+            "embed_height": int(height),
+        }
+        self._send_json(payload, timeout_ms=timeout_ms)
 
     def send_live_update(
         self,
@@ -144,6 +230,118 @@ class MagellanClient(QtCore.QObject):
             "equity_series": equity_series or [],
             "trade_markers": trade_markers or [],
         }
+        self._send_json(payload, timeout_ms=timeout_ms)
+
+    def replace_series(
+        self,
+        session_id: str,
+        *,
+        title: str = "",
+        subtitle: str = "",
+        status_text: str = "",
+        overlay_series: list[dict] | None = None,
+        pane_series: list[dict] | None = None,
+        equity_series: list[dict] | None = None,
+        replace_overlays: bool = False,
+        replace_panes: bool = False,
+        replace_equity: bool = False,
+        timeout_ms: int = 1000,
+    ) -> None:
+        payload = {
+            "type": "replace_series",
+            "session_id": session_id,
+            "title": title,
+            "subtitle": subtitle,
+            "status_text": status_text,
+            "replace_overlays": bool(replace_overlays),
+            "replace_panes": bool(replace_panes),
+            "replace_equity": bool(replace_equity),
+        }
+        if replace_overlays:
+            payload["overlay_series"] = overlay_series or []
+        if replace_panes:
+            payload["pane_series"] = pane_series or []
+        if replace_equity:
+            payload["equity_series"] = equity_series or []
+        self._send_json(payload, timeout_ms=timeout_ms)
+
+    def replace_bars(
+        self,
+        session_id: str,
+        *,
+        title: str = "",
+        subtitle: str = "",
+        status_text: str = "",
+        bars: list[dict] | None = None,
+        trade_markers: list[dict] | None = None,
+        replace_trade_markers: bool = False,
+        timeout_ms: int = 1000,
+    ) -> None:
+        payload = {
+            "type": "replace_bars",
+            "session_id": session_id,
+            "title": title,
+            "subtitle": subtitle,
+            "status_text": status_text,
+            "bars": bars or [],
+            "replace_trade_markers": bool(replace_trade_markers),
+        }
+        if replace_trade_markers:
+            payload["trade_markers"] = trade_markers or []
+        self._send_json(payload, timeout_ms=timeout_ms)
+
+    def reload_live_seed(
+        self,
+        session_id: str,
+        *,
+        snapshot_path: str | Path,
+        title: str = "",
+        subtitle: str = "",
+        status_text: str = "",
+        timeout_ms: int = 1000,
+    ) -> None:
+        payload = {
+            "type": "reload_live_seed",
+            "session_id": session_id,
+            "snapshot_path": str(snapshot_path),
+            "title": title,
+            "subtitle": subtitle,
+            "status_text": status_text,
+        }
+        self._send_json(payload, timeout_ms=timeout_ms)
+
+    def resize_embedded(
+        self,
+        session_id: str,
+        *,
+        width: int,
+        height: int,
+        timeout_ms: int = 1000,
+    ) -> None:
+        payload = {
+            "type": "resize_embedded",
+            "session_id": session_id,
+            "width": int(width),
+            "height": int(height),
+        }
+        self._send_json(payload, timeout_ms=timeout_ms)
+
+    def close_session(
+        self,
+        session_id: str = "",
+        *,
+        snapshot_path: str | Path | None = None,
+        request_id: int | None = None,
+        timeout_ms: int = 1000,
+    ) -> None:
+        payload = {
+            "type": "close_session",
+            "session_id": str(session_id or ""),
+        }
+        if snapshot_path is not None:
+            payload["snapshot_path"] = str(snapshot_path)
+        if request_id is not None:
+            payload["request_id"] = int(request_id)
         self._send_json(payload, timeout_ms=timeout_ms)
 
     def shutdown(self, timeout_ms: int = 2000) -> None:
@@ -180,8 +378,14 @@ class MagellanClient(QtCore.QObject):
             self._last_error = f"Unable to connect to Magellan IPC server {self.server_name}."
             raise MagellanError(self._last_error)
 
-        socket.write(payload)
-        socket.write(b"\n")
+        use_framed_ipc = str(os.getenv("MAGELLAN_IPC_FRAMED", "")).strip().lower() in {"1", "true", "yes", "on"}
+        if use_framed_ipc:
+            header = f"MAGELLAN_IPC_V1 {len(payload)}\n".encode("ascii")
+            socket.write(header)
+            socket.write(payload)
+        else:
+            socket.write(payload)
+            socket.write(b"\n")
         if not socket.waitForBytesWritten(timeout_ms):
             self._last_error = "Timed out while sending data to Magellan."
             socket.disconnectFromServer()
@@ -205,6 +409,26 @@ class MagellanClient(QtCore.QObject):
             return ""
         data = bytes(self._process.readAllStandardOutput())
         return data.decode("utf-8", errors="ignore")
+
+    def _handle_process_finished(self, _exit_code: int, _exit_status: QtCore.QProcess.ExitStatus) -> None:
+        process = self.sender()
+        if process is self._process:
+            self._process = None
+            self._owns_process = False
+        if isinstance(process, QtCore.QProcess):
+            process.deleteLater()
+
+    def _handle_process_error(self, _error: QtCore.QProcess.ProcessError) -> None:
+        process = self.sender()
+        if isinstance(process, QtCore.QProcess):
+            error_text = process.errorString().strip()
+            if error_text:
+                self._last_error = error_text
+            if process.state() == QtCore.QProcess.ProcessState.NotRunning:
+                if process is self._process:
+                    self._process = None
+                    self._owns_process = False
+                process.deleteLater()
 
     @staticmethod
     def _resolve_viewer_path(viewer_path: str | Path | None) -> Path | None:

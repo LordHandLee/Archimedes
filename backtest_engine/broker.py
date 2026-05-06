@@ -5,6 +5,8 @@ from typing import List
 
 import pandas as pd
 
+from .sizing import POSITION_SIZING_NONE, effective_max_gross_leverage, normalize_position_sizing_model
+
 
 @dataclass
 class Trade:
@@ -41,6 +43,11 @@ class Broker:
         fill_ratio: float = 1.0,
         allow_short: bool = False,
         prevent_scale_in: bool = False,
+        margin_enabled: bool = False,
+        max_gross_leverage: float = 1.0,
+        position_sizing_model: str = POSITION_SIZING_NONE,
+        min_position_shares: float = 1.0,
+        sizing_multiplier_by_ts: pd.Series | None = None,
     ) -> None:
         self.starting_cash = float(starting_cash)
         self.cash = float(starting_cash)
@@ -52,6 +59,12 @@ class Broker:
         self.fill_ratio = max(0.0, min(1.0, float(fill_ratio)))  # partial fills per bar
         self.allow_short = allow_short
         self.prevent_scale_in = prevent_scale_in
+        self.margin_enabled = bool(margin_enabled)
+        self.max_gross_leverage = max(1.0, float(max_gross_leverage or 1.0))
+        self.position_sizing_model = normalize_position_sizing_model(position_sizing_model)
+        self.min_position_shares = max(0.0, float(min_position_shares or 0.0))
+        self.sizing_multiplier_by_ts = sizing_multiplier_by_ts
+        self.current_timestamp: pd.Timestamp | None = None
 
         self.position_qty: float = 0.0
         self.avg_price: float = 0.0
@@ -128,9 +141,14 @@ class Broker:
         """
         Move position to a target fraction of equity (e.g., 1.0 = 100% long).
         """
+        target = self._apply_position_sizing_target(float(target), earliest_ts=earliest_ts)
         equity = self._mark_to_market(mark_price)
         desired_notional = target * equity
         desired_qty = desired_notional / mark_price
+        if self.position_sizing_model != POSITION_SIZING_NONE and target != 0.0:
+            min_shares = float(self.min_position_shares)
+            if min_shares > 0.0 and 0.0 < abs(desired_qty) < min_shares:
+                desired_qty = min_shares if desired_qty > 0.0 else -min_shares
         delta = desired_qty - self.position_qty
         if abs(delta) > 1e-9:
             self.pending_orders.append(
@@ -146,6 +164,7 @@ class Broker:
 
     # --- Execution -----------------------------------------------------------
     def flush_orders(self, bar: pd.Series, timestamp: pd.Timestamp) -> List[Trade]:
+        self.current_timestamp = timestamp
         fills: List[Trade] = []
         if not self.pending_orders:
             return fills
@@ -190,11 +209,16 @@ class Broker:
         max_affordable_qty = float("inf")
         buying_to_cover = qty > 0 and self.position_qty < 0
         if qty > 0 and not buying_to_cover and (adj_price * (1 + fee_rate)) > 0:
-            max_affordable_qty = max(self.cash / (adj_price * (1 + fee_rate)), 0.0)
+            max_affordable_qty = self._max_affordable_buy_qty(adj_price, fee_rate)
             if qty > max_affordable_qty:
                 qty = max_affordable_qty
                 if qty < 1e-12:
                     return None
+
+        if side == "sell" and self.allow_short and qty < 0:
+            qty = self._cap_short_qty(qty, adj_price)
+            if abs(qty) < 1e-12:
+                return None
 
         notional = qty * adj_price
         fee = abs(notional) * fee_rate
@@ -290,6 +314,62 @@ class Broker:
 
     def current_equity(self, price: float) -> float:
         return self._mark_to_market(price)
+
+    def _apply_position_sizing_target(self, target: float, *, earliest_ts: pd.Timestamp | None = None) -> float:
+        if self.position_sizing_model == POSITION_SIZING_NONE:
+            return float(target)
+        series = self.sizing_multiplier_by_ts
+        if series is None or series.empty:
+            return float(target)
+        timestamp = earliest_ts or self.current_timestamp
+        if timestamp is None:
+            return float(target)
+        ts = pd.Timestamp(timestamp)
+        ts = ts.tz_convert("UTC") if ts.tzinfo else ts.tz_localize("UTC")
+        aligned = series
+        if aligned.index.tz is None:
+            aligned = aligned.copy()
+            aligned.index = aligned.index.tz_localize("UTC")
+        else:
+            aligned = aligned.tz_convert("UTC")
+        candidates = aligned.loc[aligned.index <= ts]
+        if candidates.empty:
+            return float(target)
+        try:
+            multiplier = float(candidates.iloc[-1])
+        except Exception:
+            return float(target)
+        if not pd.notna(multiplier):
+            return float(target)
+        return float(target) * max(0.0, multiplier)
+
+    def _max_affordable_buy_qty(self, adj_price: float, fee_rate: float) -> float:
+        denominator = adj_price * (1.0 + fee_rate)
+        if denominator <= 0:
+            return 0.0
+        if not self.margin_enabled:
+            return max(self.cash / denominator, 0.0)
+        equity = max(self._mark_to_market(adj_price), 0.0)
+        max_gross = equity * effective_max_gross_leverage(self)
+        current_gross = abs(self.position_qty) * adj_price
+        available_notional = max(max_gross - current_gross, 0.0)
+        return available_notional / denominator
+
+    def _cap_short_qty(self, qty: float, adj_price: float) -> float:
+        if qty >= 0 or adj_price <= 0:
+            return qty
+        prev_short_qty = abs(min(self.position_qty, 0.0))
+        requested_short_qty = abs(min(self.position_qty + qty, 0.0))
+        if requested_short_qty <= prev_short_qty:
+            return qty
+        equity = max(self._mark_to_market(adj_price), 0.0)
+        max_gross = equity * effective_max_gross_leverage(self)
+        current_long_notional = max(self.position_qty, 0.0) * adj_price
+        allowed_short_qty = max(max_gross - current_long_notional, 0.0) / adj_price
+        if requested_short_qty <= allowed_short_qty:
+            return qty
+        target_new_qty = -allowed_short_qty
+        return target_new_qty - self.position_qty
 
     def _fee_for_side(self, side: str) -> float:
         return float(self.fee_schedule.get(side, self.fee_rate))

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pandas as pd
@@ -84,6 +87,18 @@ class InteractiveBrokersFetchHelperTests(unittest.TestCase):
         self.assertTrue(_MODULE._is_benign_historical_error(366, "No historical data query found for ticker id:9002"))
         self.assertFalse(_MODULE._is_benign_historical_error(162, "HMDS query returned no data"))
 
+    def test_primary_exchange_candidates_prefer_known_soxl_listing(self) -> None:
+        self.assertEqual(_MODULE._primary_exchange_candidates("SOXL", None)[:2], ["ARCA", None])
+        self.assertEqual(_MODULE._primary_exchange_candidates("AAPL", "NASDAQ")[0], "NASDAQ")
+
+    def test_security_definition_errors_are_detected_for_primary_retry(self) -> None:
+        self.assertTrue(
+            _MODULE._is_security_definition_exception(
+                RuntimeError("Interactive Brokers error 200 for request 9001: No security definition has been found for the request")
+            )
+        )
+        self.assertFalse(_MODULE._is_security_definition_exception(RuntimeError("Timed out waiting for data")))
+
     def test_retryable_historical_exception_detects_hmds_disconnects(self) -> None:
         self.assertTrue(
             _MODULE._is_retryable_historical_exception(
@@ -138,6 +153,47 @@ class InteractiveBrokersFetchHelperTests(unittest.TestCase):
                 _MODULE._advance_resume_start(loaded.index.max()),
                 pd.Timestamp("2026-01-01 14:31:01+00:00"),
             )
+
+    def test_main_treats_saved_partial_checkpoint_as_done_for_terminal_no_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.csv"
+            frame = pd.DataFrame(
+                {
+                    "open": [1.0, 2.0],
+                    "high": [1.1, 2.1],
+                    "low": [0.9, 1.9],
+                    "close": [1.05, 2.05],
+                    "volume": [100, 200],
+                },
+                index=pd.to_datetime(["2026-01-01 14:30:00+00:00", "2026-01-01 14:31:00+00:00"], utc=True),
+            )
+            frame.index.name = "timestamp"
+            _MODULE._append_checkpoint_rows(path, frame)
+
+            original_fetch_bars = _MODULE.fetch_bars
+            original_argv = list(sys.argv)
+            stdout = io.StringIO()
+
+            def _raise_no_data(*_args, **_kwargs):
+                raise RuntimeError(
+                    "Interactive Brokers error 162 for request 9003: Historical Market Data Service error "
+                    "message:HMDS query returned no data: AACBR@SMART Trades"
+                )
+
+            try:
+                _MODULE.fetch_bars = _raise_no_data
+                sys.argv = ["fetch_interactive_brokers.py", "AACBR", "--out", str(path), "--progress"]
+                with redirect_stdout(stdout):
+                    _MODULE.main()
+            finally:
+                _MODULE.fetch_bars = original_fetch_bars
+                sys.argv = original_argv
+
+            payloads = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
+            self.assertEqual(payloads[0]["type"], "start")
+            self.assertEqual(payloads[-1]["type"], "done")
+            self.assertTrue(bool(payloads[-1].get("partial")))
+            self.assertEqual(payloads[-1]["rows"], 2)
 
 
 if __name__ == "__main__":

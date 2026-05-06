@@ -6,6 +6,7 @@ from typing import Sequence
 
 
 DEFAULT_ACQUISITION_PROVIDER = "massive"
+COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER = "massive_interactive_brokers"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,17 @@ _PROVIDER_REGISTRY: dict[str, AcquisitionProviderSpec] = {
             "Uses conservative chunked requests for minute history; actual earliest coverage varies by contract."
         ),
     ),
+    COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER: AcquisitionProviderSpec(
+        provider_id=COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER,
+        label="Massive and Interactive Brokers",
+        fetch_script_relpath="",
+        default_resolution="1m",
+        default_history_window="provider_defaults",
+        description=(
+            "Coordinator option that runs Interactive Brokers and Massive side by side. "
+            "Interactive Brokers uses the selected concurrency; Massive stays single-symbol."
+        ),
+    ),
     "massive": AcquisitionProviderSpec(
         provider_id="massive",
         label="Massive",
@@ -52,6 +64,11 @@ _PROVIDER_REGISTRY: dict[str, AcquisitionProviderSpec] = {
         default_history_window="max",
         description="Daily EOD downloader backed by the public Stooq CSV endpoint.",
     ),
+}
+
+
+_COMPOSITE_PROVIDER_MEMBERS: dict[str, tuple[str, ...]] = {
+    COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER: ("interactive_brokers", "massive"),
 }
 
 
@@ -73,6 +90,19 @@ def provider_display_name(provider_id: str | None) -> str:
         return str(provider_id or DEFAULT_ACQUISITION_PROVIDER).replace("_", " ").title()
 
 
+def is_composite_acquisition_provider(provider_id: str | None) -> bool:
+    normalized = str(provider_id or "").strip().lower()
+    return normalized in _COMPOSITE_PROVIDER_MEMBERS
+
+
+def expand_acquisition_source(provider_id: str | None) -> tuple[str, ...]:
+    normalized = get_acquisition_provider(provider_id).provider_id
+    members = _COMPOSITE_PROVIDER_MEMBERS.get(normalized)
+    if members:
+        return members
+    return (normalized,)
+
+
 def resolve_acquisition_source(
     explicit_source: str | None = None,
     preferred_source: str | None = None,
@@ -87,7 +117,10 @@ def resolve_acquisition_source(
 
 
 def provider_fetch_script_path(provider_id: str | None) -> Path:
-    return Path(get_acquisition_provider(provider_id).fetch_script_relpath)
+    spec = get_acquisition_provider(provider_id)
+    if is_composite_acquisition_provider(spec.provider_id):
+        raise ValueError(f"Composite acquisition provider '{spec.label}' does not have a fetch script.")
+    return Path(spec.fetch_script_relpath)
 
 
 def _normalize_resolution_alias(value: str | None) -> str:
@@ -126,9 +159,11 @@ def provider_fetch_tuning(
     history_window: str | None = None,
 ) -> AcquisitionProviderFetchTuning:
     normalized_provider = get_acquisition_provider(provider_id).provider_id
+    if is_composite_acquisition_provider(normalized_provider):
+        return AcquisitionProviderFetchTuning()
     normalized_resolution = _normalize_resolution_alias(resolution)
     if normalized_provider == "massive":
-        return AcquisitionProviderFetchTuning(pace_seconds="12.5")
+        return AcquisitionProviderFetchTuning(pace_seconds="15.0")
     if normalized_provider == "interactive_brokers":
         if normalized_resolution == "1m":
             # Live gateway benchmarking showed a sharp latency knee beyond seven-day
@@ -153,6 +188,8 @@ def build_provider_fetch_command(
     extra_args: Sequence[str] | None = None,
 ) -> list[str]:
     spec = get_acquisition_provider(provider_id)
+    if is_composite_acquisition_provider(spec.provider_id):
+        raise ValueError(f"Composite acquisition provider '{spec.label}' must be expanded before building a fetch command.")
     tuning = provider_fetch_tuning(spec.provider_id, resolution=resolution, history_window=history_window)
     cmd = [
         python_executable,
@@ -171,6 +208,8 @@ def build_provider_fetch_command(
     explicit_args = [str(arg) for arg in (extra_args or [])]
     if tuning.default_chunk_duration and "--chunk-duration" not in explicit_args:
         cmd.extend(["--chunk-duration", tuning.default_chunk_duration])
+    if spec.provider_id == "interactive_brokers" and "--discover-head-timestamp" not in explicit_args:
+        cmd.append("--discover-head-timestamp")
     if explicit_args:
         cmd.extend(explicit_args)
     return cmd

@@ -144,6 +144,7 @@ bar_index        int32
 Notes:
 
 - `ts_utc_ns` is the canonical timestamp for storage and cross-language reads.
+- `ts_utc_ns` must contain Unix epoch **nanoseconds** as `int64`, not microseconds. For pandas data, normalize with UTC timestamps and write the `datetime64[ns]` integer value. The Magellan viewer now defensively infers seconds, milliseconds, microseconds, and nanoseconds for display, but this engine should still emit true nanoseconds so every consumer sees the same time scale.
 - `bar_index` is a stable dense integer index for fast screen-space mapping.
 - Keep timestamps in UTC on disk. Convert to local display time in the renderer.
 
@@ -189,6 +190,10 @@ Notes:
 
 - `drawdown` is precomputed to avoid repeating chart math in every frontend.
 - If equity is sampled once per displayed bar, `bar_index` lines up directly with `price_bars`.
+- Magellan plots `equity` and optional benchmark-style equity columns on the shared equity-pane y-axis.
+- Magellan intentionally does **not** plot `drawdown` on the shared equity y-axis because mixing drawdown values near zero with account equity values flattens the visible equity curve.
+- If the chart should show a green buy-and-hold / benchmark line, this engine must compute and write a separate numeric column such as `buy_hold_equity` or `benchmark_equity` aligned to `bar_index`.
+- A simple long-only buy-and-hold baseline can be computed as `starting_cash * close / first_close` over the displayed price bars, unless a different benchmark definition is desired.
 
 ## overlays.feather
 
@@ -254,13 +259,16 @@ Recommended section:
       "Upper": { "color": "#27d07d", "line_width": 1.0 },
       "Lower": { "color": "#ff6b6b", "line_width": 1.0 },
       "ATR": { "color": "#a28bff", "line_width": 1.0 },
-      "equity": { "color": "#4da3ff", "line_width": 1.3 }
+      "equity": { "color": "#4da3ff", "line_width": 1.3 },
+      "buy_hold_equity": { "color": "#27d07d", "line_width": 1.0 }
     }
   }
 }
 ```
 
 This lets the frontend stay generic.
+
+If `buy_hold_equity` or `benchmark_equity` is omitted, Magellan will only draw the strategy equity curve in the equity pane. It cannot reconstruct benchmark equity accurately because benchmark definition, starting cash, splits/dividends, and session alignment belong in this engine.
 
 ## Python Object Model
 

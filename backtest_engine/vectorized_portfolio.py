@@ -9,6 +9,12 @@ import pandas as pd
 from .engine import BacktestConfig
 from .metrics import PerformanceMetrics, compute_metrics
 from .sample_strategies import compute_zscore_mean_reversion_features
+from .sizing import (
+    POSITION_SIZING_NONE,
+    apply_position_sizing_to_weights,
+    effective_max_gross_leverage,
+    normalize_position_sizing_model,
+)
 from .strategy import Strategy
 from .vectorized_engine import VectorizedEngine
 from .vectorized_strategies import VectorizedSupport, get_vectorized_adapter
@@ -363,14 +369,25 @@ class VectorizedPortfolioEngine:
                 strategy_contexts=strategy_contexts,
                 normalize_weights=normalize_weights,
                 construction_config=construction,
+                config=config,
             )
             target_weights_changed = not np.allclose(desired_weights, target_weights, atol=1e-12, rtol=0.0)
             periodic_due = self._is_periodic_rebalance_bar(bar_idx, construction)
             drift_due = self._is_drift_rebalance_due(current_actual_weights, target_weights, construction)
             if target_weights_changed or periodic_due or drift_due:
                 portfolio_equity = reference_equity
+                target_qty_new = self._weights_to_qty(
+                    desired_weights,
+                    portfolio_equity,
+                    reference_prices,
+                    config=config,
+                )
+                if periodic_due or drift_due:
+                    target_qty = target_qty_new
+                else:
+                    changed_mask = np.abs(desired_weights - target_weights) > 1e-12
+                    target_qty[changed_mask] = target_qty_new[changed_mask]
                 target_weights = desired_weights
-                target_qty = self._weights_to_qty(target_weights, portfolio_equity, reference_prices)
 
             deltas = target_qty - positions
             if config.prevent_scale_in:
@@ -700,10 +717,16 @@ class VectorizedPortfolioEngine:
     ) -> _PortfolioIntent:
         strategy_name = asset.strategy_cls.__name__
         if strategy_name == "SMACrossStrategy":
-            return self._build_sma_intent(asset=asset, data=data, config=config)
-        if strategy_name == "ZScoreMeanReversionStrategy":
-            return self._build_zscore_intent(asset=asset, data=data, config=config)
-        raise RuntimeError(f"Strategy {strategy_name} has no portfolio intent builder.")
+            intent = self._build_sma_intent(asset=asset, data=data, config=config)
+        elif strategy_name == "ZScoreMeanReversionStrategy":
+            intent = self._build_zscore_intent(asset=asset, data=data, config=config)
+        else:
+            raise RuntimeError(f"Strategy {strategy_name} has no portfolio intent builder.")
+        return _PortfolioIntent(
+            strategy_weights=apply_position_sizing_to_weights(intent.strategy_weights, data, config),
+            candidate_weights=apply_position_sizing_to_weights(intent.candidate_weights, data, config),
+            scores=intent.scores,
+        )
 
     def _build_sma_intent(
         self,
@@ -890,6 +913,7 @@ class VectorizedPortfolioEngine:
         strategy_contexts: dict[str, _StrategyBlockContext],
         normalize_weights: bool,
         construction_config: PortfolioConstructionConfig,
+        config: BacktestConfig,
     ) -> np.ndarray:
         ownership = str(construction_config.allocation_ownership or ALLOCATION_OWNERSHIP_STRATEGY)
         ranking_mode = str(construction_config.ranking_mode or RANKING_MODE_NONE)
@@ -931,6 +955,7 @@ class VectorizedPortfolioEngine:
             raw_weights=weight_inputs,
             normalize_weights=normalize_weights,
             construction_config=construction_config,
+            config=config,
         )
 
     @staticmethod
@@ -1067,6 +1092,7 @@ class VectorizedPortfolioEngine:
         raw_weights: np.ndarray,
         normalize_weights: bool,
         construction_config: PortfolioConstructionConfig,
+        config: BacktestConfig,
     ) -> np.ndarray:
         weights = raw_weights.astype(float, copy=True)
         gross = float(np.abs(weights).sum())
@@ -1082,7 +1108,7 @@ class VectorizedPortfolioEngine:
             if construction_config.max_asset_weight is not None
             else None
         )
-        target_gross = float(self.max_gross_exposure)
+        target_gross = max(float(self.max_gross_exposure or 0.0), effective_max_gross_leverage(config))
         cash_reserve_weight = float(construction_config.cash_reserve_weight or 0.0)
         if cash_reserve_weight > 0.0:
             target_gross = min(target_gross, max(0.0, 1.0 - cash_reserve_weight))
@@ -1105,8 +1131,6 @@ class VectorizedPortfolioEngine:
             return np.zeros_like(weights, dtype=float)
         if target_gross > 0 and gross > target_gross:
             weights *= target_gross / gross
-        elif self.max_gross_exposure > 0 and gross > self.max_gross_exposure:
-            weights *= self.max_gross_exposure / gross
         return weights
 
     @classmethod
@@ -1176,10 +1200,21 @@ class VectorizedPortfolioEngine:
         return result
 
     @staticmethod
-    def _weights_to_qty(weights: np.ndarray, equity: float, prices: np.ndarray) -> np.ndarray:
+    def _weights_to_qty(
+        weights: np.ndarray,
+        equity: float,
+        prices: np.ndarray,
+        *,
+        config: BacktestConfig,
+    ) -> np.ndarray:
         qty = np.zeros_like(weights, dtype=float)
         valid = prices > 0
         qty[valid] = (weights[valid] * equity) / prices[valid]
+        if normalize_position_sizing_model(config.position_sizing_model) != POSITION_SIZING_NONE:
+            min_shares = max(0.0, float(config.min_position_shares or 0.0))
+            if min_shares > 0.0:
+                small_active = (np.abs(weights) > 1e-12) & (np.abs(qty) > 0.0) & (np.abs(qty) < min_shares)
+                qty[small_active] = np.sign(qty[small_active]) * min_shares
         return qty
 
     def _execute_order(
@@ -1221,7 +1256,16 @@ class VectorizedPortfolioEngine:
         fee_rate = buy_fee if qty > 0 else sell_fee
         buying_to_cover = qty > 0 and prev_qty < 0
         if qty > 0 and not buying_to_cover and adj_price * (1.0 + fee_rate) > 0:
-            max_affordable = max(float(cash_state["cash"]) / (adj_price * (1.0 + fee_rate)), 0.0)
+            if bool(config.margin_enabled):
+                equity_mark = max(float(cash_state["cash"]) + float(np.dot(positions, execution_prices)), 0.0)
+                max_gross = equity_mark * effective_max_gross_leverage(config)
+                current_gross = float(np.sum(np.abs(positions) * execution_prices))
+                max_affordable = max(
+                    (max_gross - current_gross) / (adj_price * (1.0 + fee_rate)),
+                    0.0,
+                )
+            else:
+                max_affordable = max(float(cash_state["cash"]) / (adj_price * (1.0 + fee_rate)), 0.0)
             if qty > max_affordable:
                 qty = max_affordable
                 if qty < 1e-12:
@@ -1231,6 +1275,19 @@ class VectorizedPortfolioEngine:
             qty = -min(abs(qty), max(prev_qty, 0.0))
             if abs(qty) < 1e-12:
                 return None
+
+        if side == "sell" and config.allow_short and qty < 0 and adj_price > 0:
+            prev_short_qty = abs(min(prev_qty, 0.0))
+            requested_short_qty = abs(min(prev_qty + qty, 0.0))
+            if requested_short_qty > prev_short_qty:
+                equity_mark = max(float(cash_state["cash"]) + float(np.dot(positions, execution_prices)), 0.0)
+                max_gross = equity_mark * effective_max_gross_leverage(config)
+                current_gross_without_asset = float(np.sum(np.abs(positions) * execution_prices)) - abs(prev_qty) * adj_price
+                allowed_short_qty = max(max_gross - current_gross_without_asset, 0.0) / adj_price
+                if requested_short_qty > allowed_short_qty:
+                    qty = -allowed_short_qty - prev_qty
+                    if abs(qty) < 1e-12:
+                        return None
 
         notional = qty * adj_price
         fee = abs(notional) * fee_rate

@@ -8,8 +8,11 @@ __pycache__/
 *.duckdb
 *.sqlite
 
+
 # Data directories
 data/
+fart/
+defeatbeta/
 
 # Outputs / artifacts
 heatmaps/

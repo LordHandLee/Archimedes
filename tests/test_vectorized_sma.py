@@ -55,6 +55,35 @@ class VectorizedSMATest(unittest.TestCase):
         )
         self.params = {"fast": 5, "slow": 20, "target": 1.0}
 
+    def test_reference_sma_requires_fresh_crossover_entry(self) -> None:
+        bars = pd.DataFrame(
+            {
+                "open": [1.0, 2.0, 3.0, 4.0, 5.0],
+                "high": [1.0, 2.0, 3.0, 4.0, 5.0],
+                "low": [1.0, 2.0, 3.0, 4.0, 5.0],
+                "close": [1.0, 2.0, 3.0, 4.0, 5.0],
+                "volume": [100.0] * 5,
+            },
+            index=pd.date_range("2026-04-30 12:00", periods=5, freq="15min", tz="UTC"),
+        )
+
+        class FakeBroker:
+            position_qty = 0.0
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def target_percent(self, target: float, mark_price: float) -> None:
+                self.calls.append((target, mark_price))
+
+        strategy = SMACrossStrategy(fast=2, slow=3, target=1.0)
+        strategy.initialize(bars)
+        broker = FakeBroker()
+        for timestamp, bar in bars.iterrows():
+            strategy.on_bar(timestamp, bar, broker)
+
+        self.assertEqual(broker.calls, [])
+
     def _resample_5m(self) -> pd.DataFrame:
         return self.bars.resample("5min", label="right", closed="right").agg(
             {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
@@ -456,7 +485,7 @@ class VectorizedSMATest(unittest.TestCase):
         self.assertEqual(len(study_benchmark.per_batch), 2)
         self.assertEqual(len(frame.attrs["batch_benchmarks"]), 2)
 
-    def test_vectorized_execute_param_grid_emits_chunk_progress(self) -> None:
+    def test_vectorized_execute_param_grid_emits_coarse_progress_only(self) -> None:
         orchestrator = ExecutionOrchestrator()
         progress_events: list[tuple[int, int]] = []
         results = orchestrator.execute_param_grid(
@@ -475,13 +504,9 @@ class VectorizedSMATest(unittest.TestCase):
             progress_cb=lambda done, total: progress_events.append((done, total)),
         )
         self.assertEqual(len(results), 5)
-        self.assertGreaterEqual(len(progress_events), 3)
-        self.assertEqual(progress_events[0], (0, 5))
-        self.assertIn((2, 5), progress_events)
-        self.assertIn((4, 5), progress_events)
-        self.assertEqual(progress_events[-1], (5, 5))
+        self.assertEqual(progress_events, [(5, 5)])
 
-    def test_independent_asset_grid_search_emits_intermediate_progress(self) -> None:
+    def test_independent_asset_grid_search_emits_asset_level_progress(self) -> None:
         bars_b = self.bars.copy()
         bars_b["open"] += 1.25
         bars_b["high"] += 1.25
@@ -509,9 +534,8 @@ class VectorizedSMATest(unittest.TestCase):
                 progress_cb=lambda done, total: progress_events.append((done, total)),
             )
         self.assertEqual(len(frame), 8)
-        self.assertGreaterEqual(len(progress_events), 4)
         self.assertEqual(progress_events[0], (0, 8))
-        self.assertTrue(any(0 < done < total for done, total in progress_events))
+        self.assertIn((4, 8), progress_events)
         self.assertEqual(progress_events[-1], (8, 8))
 
 

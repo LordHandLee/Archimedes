@@ -26,11 +26,13 @@ class LiveDeploymentCatalogTest(unittest.TestCase):
                 db_path="/home/ethan/algo_trading_engine/live.db",
                 log_db_path="/home/ethan/algo_trading_engine/engine_logs.db",
                 secret_ref="LIVE_WEBHOOK_SECRET",
+                secret_value="saved-secret",
             )
             targets = catalog.load_deployment_targets()
             self.assertEqual(len(targets), 1)
             self.assertEqual(targets[0].target_id, "algo_engine_live")
             self.assertEqual(targets[0].mode, "live")
+            self.assertEqual(targets[0].secret_value, "saved-secret")
 
             manual_id = catalog.save_manual_deployment_definition(
                 deployment_kind="portfolio_strategy_blocks",
@@ -126,6 +128,12 @@ class LiveDeploymentCatalogTest(unittest.TestCase):
             self.assertEqual(len(snapshots), 1)
             self.assertEqual(snapshots[0].deployment_id, parent_id)
             self.assertAlmostEqual(float(snapshots[0].realized_pnl or 0.0), 125.5, places=6)
+
+            deleted = catalog.delete_deployment(parent_id)
+            self.assertEqual(deleted, 2)
+            self.assertEqual(catalog.load_deployments(), [])
+            self.assertEqual(catalog.load_deployment_child_links(parent_id), [])
+            self.assertEqual(catalog.load_latest_deployment_metric_snapshots(), [])
 
 
 if __name__ == "__main__":

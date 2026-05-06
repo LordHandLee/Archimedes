@@ -16,7 +16,7 @@ def plot_param_heatmap(df: pd.DataFrame, value_col: str, row: str, col: str, tit
 
     Expected columns: [row, col, value_col].
     """
-    pivot = df.pivot(index=row, columns=col, values=value_col)
+    pivot = df.pivot_table(index=row, columns=col, values=value_col, aggfunc="mean")
     plt.figure(figsize=(8, 6))
     sns.heatmap(pivot, annot=True, fmt=".3f", cmap="viridis")
     plt.title(title)

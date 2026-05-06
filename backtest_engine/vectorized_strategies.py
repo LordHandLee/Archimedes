@@ -174,10 +174,15 @@ class SMACrossVectorizedAdapter(VectorizedStrategyAdapter):
             fast_arr = rolling_fast[fast]
             slow_arr = rolling_slow[slow]
             valid = ~np.isnan(fast_arr) & ~np.isnan(slow_arr)
-            bullish = (fast_arr > slow_arr) & valid
-            bearish = (fast_arr < slow_arr) & valid
-            enter_long_cols.append(bullish)
-            exit_long_cols.append(bearish)
+            prev_fast = np.roll(fast_arr, 1)
+            prev_slow = np.roll(slow_arr, 1)
+            prev_fast[0] = np.nan
+            prev_slow[0] = np.nan
+            prev_valid = ~np.isnan(prev_fast) & ~np.isnan(prev_slow)
+            crossed_above = (fast_arr > slow_arr) & (prev_fast <= prev_slow) & valid & prev_valid
+            crossed_below = (fast_arr < slow_arr) & (prev_fast >= prev_slow) & valid & prev_valid
+            enter_long_cols.append(crossed_above)
+            exit_long_cols.append(crossed_below)
             long_targets.append(target)
         enter_long = np.column_stack(enter_long_cols).astype(bool, copy=False)
         exit_long = np.column_stack(exit_long_cols).astype(bool, copy=False)

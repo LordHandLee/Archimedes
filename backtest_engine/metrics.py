@@ -16,17 +16,17 @@ class PerformanceMetrics:
     sharpe: float
     rolling_sharpe: float
 
-    def as_dict(self) -> Dict[str, float]:
+    def as_dict(self) -> Dict[str, float | None]:
         return {
-            "total_return": self.total_return,
-            "cagr": self.cagr,
-            "max_drawdown": self.max_drawdown,
-            "sharpe": self.sharpe,
-            "rolling_sharpe": self.rolling_sharpe,
+            "total_return": _finite_metric_or_none(self.total_return),
+            "cagr": _finite_metric_or_none(self.cagr),
+            "max_drawdown": _finite_metric_or_none(self.max_drawdown),
+            "sharpe": _finite_metric_or_none(self.sharpe),
+            "rolling_sharpe": _finite_metric_or_none(self.rolling_sharpe),
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.as_dict())
+        return json.dumps(self.as_dict(), allow_nan=False)
 
 
 def compute_metrics(
@@ -73,12 +73,16 @@ def compute_metrics(
     )
     rolling_sharpe = _rolling_sharpe_ratio(returns, risk_free_rate, periods_per_year, rolling_window)
 
+    rolling_sharpe_value = float(rolling_sharpe) if rolling_sharpe == rolling_sharpe else float("nan")
+    if not np.isfinite(rolling_sharpe_value):
+        rolling_sharpe_value = 0.0
+
     return PerformanceMetrics(
         total_return=float(total_return),
         cagr=float(cagr),
         max_drawdown=float(max_drawdown),
         sharpe=float(sharpe),
-        rolling_sharpe=float(rolling_sharpe) if rolling_sharpe == rolling_sharpe else float("nan"),
+        rolling_sharpe=rolling_sharpe_value,
     )
 
 
@@ -130,7 +134,7 @@ def sharpe_diagnostics(
         "annualization": annualization,
         "session_seconds_per_day": session_seconds_per_day,
         "basis": sharpe_basis,
-        "rolling_sharpe": float(rolling_sharpe) if rolling_sharpe == rolling_sharpe else None,
+        "rolling_sharpe": _finite_metric_or_none(rolling_sharpe),
     }
 
 
@@ -138,6 +142,14 @@ def _max_drawdown(equity: pd.Series) -> float:
     cumulative_max = equity.cummax()
     drawdown = (equity - cumulative_max) / cumulative_max
     return float(drawdown.min())
+
+
+def _finite_metric_or_none(value) -> float | None:
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    return numeric if np.isfinite(numeric) else None
 
 
 def _sharpe_ratio(
@@ -173,8 +185,16 @@ def _rolling_sharpe_ratio(
     excess = returns - rf_per_period
     roll_mean = excess.rolling(window).mean()
     roll_std = excess.rolling(window).std()
-    roll = (roll_mean / roll_std) * np.sqrt(periods_per_year)
-    return float(roll.iloc[-1]) if not roll.empty else float("nan")
+    if roll_mean.empty or roll_std.empty:
+        return float("nan")
+    final_mean = float(roll_mean.iloc[-1])
+    final_std = float(roll_std.iloc[-1])
+    if not np.isfinite(final_mean) or not np.isfinite(final_std):
+        return float("nan")
+    if final_std == 0.0:
+        return 0.0
+    value = (final_mean / final_std) * np.sqrt(periods_per_year)
+    return float(value) if np.isfinite(value) else 0.0
 
 
 def _seconds_per_period_from_index(index: pd.DatetimeIndex, timeframe: str | None) -> float | None:
@@ -206,8 +226,8 @@ def _periods_per_year_from_index(
 
 def _normalize_freq(tf: str) -> str:
     s = tf.strip().lower()
-    s = s.replace("minute", "min").replace("mins", "min")
-    s = s.replace("hour", "h")
+    s = s.replace("minutes", "min").replace("minute", "min").replace("mins", "min")
+    s = s.replace("hours", "h").replace("hour", "h").replace("hrs", "h")
     tokens = s.replace(" ", "")
     num = ""
     unit = ""

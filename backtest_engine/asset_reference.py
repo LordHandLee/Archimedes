@@ -186,7 +186,7 @@ def import_financedatabase_assets(
 
     catalog = ResultCatalog(catalog_path)
     specs = _resolve_financedatabase_specs(asset_classes)
-    imported_at = pd.Timestamp.utcnow().isoformat()
+    imported_at = pd.Timestamp.now(tz='UTC').isoformat()
     summary: dict[str, object] = {
         "provider": FINANCEDATABASE_PROVIDER,
         "imported_at": imported_at,

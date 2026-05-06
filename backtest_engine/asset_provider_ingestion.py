@@ -863,6 +863,24 @@ def _simfin_insert_record(
     )
 
 
+def _exception_summary(exc: Exception) -> str:
+    message = str(exc or "").strip()
+    return message or exc.__class__.__name__
+
+
+def _dataset_failure_summary(failures: Sequence[dict[str, object]], *, max_items: int = 4) -> str:
+    if not failures:
+        return ""
+    parts: list[str] = []
+    for item in list(failures)[: max(1, int(max_items))]:
+        display_name = str(item.get("display_name") or item.get("code") or "dataset").strip()
+        error = str(item.get("error") or "Unknown error").strip()
+        parts.append(f"{display_name}: {error}")
+    if len(failures) > max_items:
+        parts.append(f"+{len(failures) - max_items} more")
+    return "; ".join(parts)
+
+
 def sync_simfin_assets(
     *,
     catalog_path: str | Path,
@@ -894,6 +912,9 @@ def sync_simfin_assets(
         "record_count": 0,
         "asset_count": 0,
         "new_field_count": 0,
+        "failed_datasets": [],
+        "successful_datasets": [],
+        "warning_summary": "",
     }
     touched_assets: set[str] = set()
 
@@ -917,150 +938,189 @@ def sync_simfin_assets(
                         )
                     _upsert_dataset_catalog(conn, SIMFIN_PROVIDER, spec)
                     loader = getattr(sf, str(spec.loader_name or "").strip())
-                    frame = loader(market=market, variant=spec.variant, refresh_days=refresh_days)
-                    records = [
-                        row
-                        for row in _frame_to_records(frame)
-                        if ResultCatalog._normalize_asset_symbol(_row_value(row, "Ticker", "ticker"))
-                        in normalized_symbols
-                    ]
-                    summary["dataset_counts"][spec.code] = len(records)
-                    if not records:
+                    try:
+                        frame = loader(market=market, variant=spec.variant, refresh_days=refresh_days)
+                        records = [
+                            row
+                            for row in _frame_to_records(frame)
+                            if ResultCatalog._normalize_asset_symbol(_row_value(row, "Ticker", "ticker"))
+                            in normalized_symbols
+                        ]
+                        summary["dataset_counts"][spec.code] = len(records)
+                        if not records:
+                            summary["successful_datasets"] = list(summary.get("successful_datasets") or []) + [spec.code]
+                            if progress_callback is not None:
+                                progress_callback(
+                                    {
+                                        "provider": SIMFIN_PROVIDER,
+                                        "phase": "skip_dataset",
+                                        "label": f"SimFin {spec.display_name}: no matching records.",
+                                        "percent": int((spec_index / total_specs) * 100),
+                                    }
+                                )
+                            continue
+                        dataset_frame = pd.DataFrame(records)
+                        dataset_new_fields = _upsert_field_inventory(
+                            conn,
+                            SIMFIN_PROVIDER,
+                            spec.code,
+                            dataset_frame,
+                        )
+                        dataset_record_count = 0
+                        dataset_touched_assets: set[str] = set()
+                        total_records = max(1, len(records))
+                        for record_index, row in enumerate(records, start=1):
+                            _raise_if_stop_requested(stop_requested)
+                            symbol = ResultCatalog._normalize_asset_symbol(_row_value(row, "Ticker", "ticker"))
+                            company_name = _clean_text(_row_value(row, "Company Name", "Name", "company_name", "name"))
+                            currency = _clean_text(_row_value(row, "Currency", "currency"))
+                            asset_id = _upsert_asset_master_row(
+                                conn,
+                                symbol=symbol,
+                                display_symbol=symbol,
+                                name=company_name,
+                                asset_class="Equities",
+                                security_type="Equity",
+                                currency=currency,
+                            )
+                            dataset_touched_assets.add(asset_id)
+                            industry_id = _clean_int(_row_value(row, "IndustryId", "Industry ID", "industry_id"))
+                            industry_row = industry_map.get(int(industry_id)) if industry_id is not None else None
+                            if spec.code == "companies":
+                                _upsert_asset_identifier(
+                                    conn,
+                                    asset_id=asset_id,
+                                    provider=SIMFIN_PROVIDER,
+                                    provider_symbol=symbol,
+                                    isin=_clean_text(_row_value(row, "ISIN", "isin")),
+                                    composite_key=_clean_text(_row_value(row, "SimFinId", "SimFin ID", "simfinid")),
+                                )
+                                _upsert_asset_classification(
+                                    conn,
+                                    asset_id=asset_id,
+                                    sector=_clean_text(_row_value(industry_row or {}, "Sector", "sector")),
+                                    industry=_clean_text(
+                                        _row_value(
+                                            industry_row or {},
+                                            "Industry",
+                                            "industry",
+                                            "Industry Name",
+                                            "industry_name",
+                                        )
+                                    ),
+                                    country=_clean_text(_row_value(row, "Country", "country")),
+                                    exchange=_clean_text(_row_value(row, "Exchange", "exchange", "Market Name")),
+                                    tags={
+                                        "provider": SIMFIN_PROVIDER,
+                                        "market": market,
+                                        "industry_id": industry_id,
+                                    },
+                                )
+                                _upsert_asset_profile(
+                                    conn,
+                                    asset_id=asset_id,
+                                    website=_clean_text(_row_value(row, "Website", "website")),
+                                    market_cap=_clean_float(_row_value(row, "Market Cap", "market_cap")),
+                                    raw_profile_json=_json_dumps(row),
+                                    source=SIMFIN_PROVIDER,
+                                    as_of_date=_clean_text(_row_value(row, "Date", "AsOfDate", "as_of_date")),
+                                )
+                            record_key = _stable_key(
+                                SIMFIN_PROVIDER,
+                                spec.code,
+                                symbol,
+                                spec.variant or "",
+                                _clean_text(_row_value(row, "Date", "Report Date", "date", "report_date")),
+                                _clean_text(_row_value(row, "Fiscal Period", "fiscal_period")),
+                            )
+                            raw_payload_id = None
+                            if store_raw_payloads:
+                                raw_payload_id = _store_raw_payload(
+                                    conn,
+                                    provider=SIMFIN_PROVIDER,
+                                    dataset_code=spec.code,
+                                    asset_id=asset_id,
+                                    provider_symbol=symbol,
+                                    provider_record_key=record_key,
+                                    payload=row,
+                                    as_of_date=_clean_text(_row_value(row, "Date", "Report Date", "date", "report_date")),
+                                    fiscal_year=_clean_int(_row_value(row, "Fiscal Year", "fiscal_year")),
+                                    fiscal_period=_clean_text(_row_value(row, "Fiscal Period", "fiscal_period")),
+                                )
+                            _simfin_insert_record(
+                                conn,
+                                table_name=spec.table_name,
+                                record_key=record_key,
+                                asset_id=asset_id,
+                                symbol=symbol,
+                                market=market,
+                                variant=spec.variant,
+                                row=row,
+                                raw_payload_id=raw_payload_id,
+                            )
+                            dataset_record_count += 1
+                            if progress_callback is not None and (record_index == total_records or record_index % 100 == 0):
+                                percent = int((((spec_index - 1) + (record_index / total_records)) / total_specs) * 100)
+                                progress_callback(
+                                    {
+                                        "provider": SIMFIN_PROVIDER,
+                                        "phase": "write_rows",
+                                        "label": f"SimFin {spec.display_name}: {record_index:,} / {total_records:,}",
+                                        "percent": min(99, percent),
+                                    }
+                                )
+                        conn.commit()
+                        summary["successful_datasets"] = list(summary.get("successful_datasets") or []) + [spec.code]
+                        summary["new_field_count"] = int(summary["new_field_count"]) + int(dataset_new_fields)
+                        summary["record_count"] = int(summary["record_count"]) + int(dataset_record_count)
+                        touched_assets.update(dataset_touched_assets)
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        conn.rollback()
+                        failure = {
+                            "code": spec.code,
+                            "display_name": spec.display_name,
+                            "error": _exception_summary(exc),
+                        }
+                        summary["failed_datasets"] = list(summary.get("failed_datasets") or []) + [failure]
+                        summary["dataset_counts"][spec.code] = 0
                         if progress_callback is not None:
                             progress_callback(
                                 {
                                     "provider": SIMFIN_PROVIDER,
-                                    "phase": "skip_dataset",
-                                    "label": f"SimFin {spec.display_name}: no matching records.",
+                                    "phase": "dataset_error",
+                                    "label": (
+                                        f"SimFin {spec.display_name}: skipped after error "
+                                        f"({failure['error']})."
+                                    ),
                                     "percent": int((spec_index / total_specs) * 100),
                                 }
                             )
                         continue
-                    dataset_frame = pd.DataFrame(records)
-                    summary["new_field_count"] = int(summary["new_field_count"]) + _upsert_field_inventory(
-                        conn,
-                        SIMFIN_PROVIDER,
-                        spec.code,
-                        dataset_frame,
-                    )
-                    total_records = max(1, len(records))
-                    for record_index, row in enumerate(records, start=1):
-                        _raise_if_stop_requested(stop_requested)
-                        symbol = ResultCatalog._normalize_asset_symbol(_row_value(row, "Ticker", "ticker"))
-                        company_name = _clean_text(_row_value(row, "Company Name", "Name", "company_name", "name"))
-                        currency = _clean_text(_row_value(row, "Currency", "currency"))
-                        asset_id = _upsert_asset_master_row(
-                            conn,
-                            symbol=symbol,
-                            display_symbol=symbol,
-                            name=company_name,
-                            asset_class="Equities",
-                            security_type="Equity",
-                            currency=currency,
-                        )
-                        touched_assets.add(asset_id)
-                        industry_id = _clean_int(_row_value(row, "IndustryId", "Industry ID", "industry_id"))
-                        industry_row = industry_map.get(int(industry_id)) if industry_id is not None else None
-                        if spec.code == "companies":
-                            _upsert_asset_identifier(
-                                conn,
-                                asset_id=asset_id,
-                                provider=SIMFIN_PROVIDER,
-                                provider_symbol=symbol,
-                                isin=_clean_text(_row_value(row, "ISIN", "isin")),
-                                composite_key=_clean_text(_row_value(row, "SimFinId", "SimFin ID", "simfinid")),
-                            )
-                            _upsert_asset_classification(
-                                conn,
-                                asset_id=asset_id,
-                                sector=_clean_text(_row_value(industry_row or {}, "Sector", "sector")),
-                                industry=_clean_text(
-                                    _row_value(
-                                        industry_row or {},
-                                        "Industry",
-                                        "industry",
-                                        "Industry Name",
-                                        "industry_name",
-                                    )
-                                ),
-                                country=_clean_text(_row_value(row, "Country", "country")),
-                                exchange=_clean_text(_row_value(row, "Exchange", "exchange", "Market Name")),
-                                tags={
-                                    "provider": SIMFIN_PROVIDER,
-                                    "market": market,
-                                    "industry_id": industry_id,
-                                },
-                            )
-                            _upsert_asset_profile(
-                                conn,
-                                asset_id=asset_id,
-                                website=_clean_text(_row_value(row, "Website", "website")),
-                                market_cap=_clean_float(_row_value(row, "Market Cap", "market_cap")),
-                                raw_profile_json=_json_dumps(row),
-                                source=SIMFIN_PROVIDER,
-                                as_of_date=_clean_text(_row_value(row, "Date", "AsOfDate", "as_of_date")),
-                            )
-                        record_key = _stable_key(
-                            SIMFIN_PROVIDER,
-                            spec.code,
-                            symbol,
-                            spec.variant or "",
-                            _clean_text(_row_value(row, "Date", "Report Date", "date", "report_date")),
-                            _clean_text(_row_value(row, "Fiscal Period", "fiscal_period")),
-                        )
-                        raw_payload_id = None
-                        if store_raw_payloads:
-                            raw_payload_id = _store_raw_payload(
-                                conn,
-                                provider=SIMFIN_PROVIDER,
-                                dataset_code=spec.code,
-                                asset_id=asset_id,
-                                provider_symbol=symbol,
-                                provider_record_key=record_key,
-                                payload=row,
-                                as_of_date=_clean_text(_row_value(row, "Date", "Report Date", "date", "report_date")),
-                                fiscal_year=_clean_int(_row_value(row, "Fiscal Year", "fiscal_year")),
-                                fiscal_period=_clean_text(_row_value(row, "Fiscal Period", "fiscal_period")),
-                            )
-                        _simfin_insert_record(
-                            conn,
-                            table_name=spec.table_name,
-                            record_key=record_key,
-                            asset_id=asset_id,
-                            symbol=symbol,
-                            market=market,
-                            variant=spec.variant,
-                            row=row,
-                            raw_payload_id=raw_payload_id,
-                        )
-                        summary["record_count"] = int(summary["record_count"]) + 1
-                        if progress_callback is not None and (record_index == total_records or record_index % 100 == 0):
-                            percent = int((((spec_index - 1) + (record_index / total_records)) / total_specs) * 100)
-                            progress_callback(
-                                {
-                                    "provider": SIMFIN_PROVIDER,
-                                    "phase": "write_rows",
-                                    "label": f"SimFin {spec.display_name}: {record_index:,} / {total_records:,}",
-                                    "percent": min(99, percent),
-                                }
-                            )
-                    conn.commit()
         summary["asset_count"] = len(touched_assets)
+        failed_datasets = list(summary.get("failed_datasets") or [])
+        successful_datasets = list(summary.get("successful_datasets") or [])
+        warning_summary = _dataset_failure_summary(failed_datasets)
+        summary["warning_summary"] = warning_summary
+        if failed_datasets and not successful_datasets:
+            raise RuntimeError(f"SimFin sync failed before any dataset completed. {warning_summary}")
         if progress_callback is not None:
             progress_callback(
                 {
                     "provider": SIMFIN_PROVIDER,
                     "phase": "complete",
-                    "label": "SimFin sync complete.",
+                    "label": "SimFin sync complete with warnings." if failed_datasets else "SimFin sync complete.",
                     "percent": 100,
                 }
             )
         catalog.finish_provider_sync_run(
             provider_sync_run_id,
-            status="completed",
+            status="completed_with_errors" if failed_datasets else "completed",
             asset_count=int(summary["asset_count"]),
             record_count=int(summary["record_count"]),
             new_field_count=int(summary["new_field_count"]),
+            error_summary=warning_summary or None,
         )
         return summary
     except InterruptedError as exc:

@@ -136,6 +136,8 @@ def build_portfolio_trades_log_frame(portfolio_result) -> pd.DataFrame:
         realized_cum = float(getattr(trade, "realized_pnl", 0.0))
         position_before = float(position_by_asset.get(asset_label, 0.0))
         position_after = position_before + qty
+        if abs(position_after) < 1e-12:
+            position_after = 0.0
         position_by_asset[asset_label] = position_after
         prev_realized = float(prev_realized_by_asset.get(asset_label, 0.0))
         net_pnl = realized_cum - prev_realized

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -41,15 +43,70 @@ class DuckDBStore:
         safe = dataset_id.replace("/", "_").replace(" ", "_")
         return self.data_dir / f"{safe}.parquet"
 
-    def write_parquet(self, dataset_id: str, df: pd.DataFrame) -> Path:
-        missing = set(REQUIRED_COLUMNS) - set(df.reset_index().columns)
+    @staticmethod
+    def _quote_duckdb_path(path: Path) -> str:
+        return str(path).replace("'", "''")
+
+    @staticmethod
+    def _normalize_frame_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+        frame = df.copy()
+        if "timestamp" in frame.columns:
+            frame = frame.reset_index(drop=True)
+        else:
+            index_name = str(frame.index.name or "index")
+            frame = frame.reset_index()
+            if "timestamp" not in frame.columns:
+                if index_name in frame.columns:
+                    frame = frame.rename(columns={index_name: "timestamp"})
+                elif "index" in frame.columns:
+                    frame = frame.rename(columns={"index": "timestamp"})
+        missing = set(REQUIRED_COLUMNS) - set(frame.columns)
         if missing:
             raise ValueError(f"DataFrame missing required columns: {missing}")
+        frame = frame[REQUIRED_COLUMNS].copy()
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["timestamp"])
+        numeric_columns = ["open", "high", "low", "close", "volume"]
+        for column in numeric_columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["open", "high", "low", "close"])
+        frame["volume"] = frame["volume"].fillna(0.0)
+        return frame.sort_values("timestamp").reset_index(drop=True)
+
+    def write_parquet(self, dataset_id: str, df: pd.DataFrame) -> Path:
         path = self.dataset_path(dataset_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Use DuckDB to write parquet to avoid optional pandas engines (pyarrow/fastparquet) dependency.
-        rel = duckdb.from_df(df.reset_index())
-        rel.write_parquet(str(path))
+        frame = self._normalize_frame_for_parquet(df)
+        if frame.empty:
+            raise ValueError("Cannot write an empty OHLCV dataset.")
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=f".{path.stem}.",
+            suffix=".tmp.parquet",
+            dir=path.parent,
+            delete=False,
+        )
+        temp_path = Path(temp_file.name)
+        temp_file.close()
+        conn: duckdb.DuckDBPyConnection | None = None
+        try:
+            conn = duckdb.connect(":memory:")
+            conn.register("dataset_to_write", frame)
+            quoted_path = self._quote_duckdb_path(temp_path)
+            conn.execute(f"COPY dataset_to_write TO '{quoted_path}' (FORMAT PARQUET)")
+            conn.unregister("dataset_to_write")
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return path
 
     def load(

@@ -10,3 +10,4 @@ requests>=2.31
 ibapi>=9.81
 financedatabase>=2.3
 simfin>=1.0
+psutil>=5.0

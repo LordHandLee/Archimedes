@@ -76,6 +76,17 @@ _BAR_SIZE_MAP = {
     "1mo": "1 month",
 }
 
+_PRIMARY_EXCHANGE_OVERRIDES = {
+    "DIA": "ARCA",
+    "IWM": "ARCA",
+    "QQQ": "NASDAQ",
+    "SOXL": "ARCA",
+    "SOXS": "ARCA",
+    "SPY": "ARCA",
+    "SQQQ": "NASDAQ",
+    "TQQQ": "NASDAQ",
+}
+
 _RETRYABLE_HISTORICAL_ERROR_SNIPPETS = (
     "hmds server disconnect occurred",
     "attempting reconnection",
@@ -203,6 +214,13 @@ def _is_benign_historical_error(error_code: int, error_text: str) -> bool:
 def _is_retryable_historical_exception(exc: BaseException) -> bool:
     normalized = str(exc or "").lower()
     return any(snippet in normalized for snippet in _RETRYABLE_HISTORICAL_ERROR_SNIPPETS)
+
+
+def _is_terminal_no_data_exception(exc: BaseException) -> bool:
+    normalized = str(exc or "").lower()
+    return "hmds query returned no data" in normalized or (
+        "interactive brokers error 162" in normalized and "no data" in normalized
+    )
 
 
 def _retry_backoff_seconds(attempt: int) -> float:
@@ -349,6 +367,32 @@ def _build_contract(
     if primary_exchange:
         contract.primaryExchange = str(primary_exchange).strip().upper()
     return contract
+
+
+def _primary_exchange_candidates(ticker: str, primary_exchange: str | None) -> list[str | None]:
+    symbol = str(ticker or "").strip().upper()
+    configured = str(primary_exchange or "").strip().upper()
+    candidates: list[str | None] = []
+
+    def add(value: str | None) -> None:
+        cleaned = str(value or "").strip().upper()
+        candidate = cleaned or None
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if configured:
+        add(configured)
+    else:
+        add(_PRIMARY_EXCHANGE_OVERRIDES.get(symbol))
+        add(None)
+    for fallback in ("ARCA", "NASDAQ", "NYSE", "AMEX"):
+        add(fallback)
+    return candidates
+
+
+def _is_security_definition_exception(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "interactive brokers error 200" in text or "no security definition" in text
 
 
 @dataclass
@@ -552,94 +596,111 @@ def fetch_bars(
             return checkpoint_frame.loc[(checkpoint_frame.index >= requested_start_ts) & (checkpoint_frame.index <= end_ts)]
         raise RuntimeError("Requested range is already fully covered by the existing checkpoint.")
 
-    contract = _build_contract(
-        ticker,
-        sec_type=sec_type,
-        exchange=exchange,
-        currency=currency,
-        primary_exchange=primary_exchange,
-    )
-    app = _IBHistoricalApp()
-    thread = app.connect_and_start(host=host, port=port, client_id=client_id, timeout_seconds=timeout_seconds)
-    try:
-        if discover_head_timestamp:
-            try:
-                head_value = app.request_head_timestamp(
+    all_rows: list[dict] = []
+    primary_candidates = _primary_exchange_candidates(ticker, primary_exchange)
+    last_security_error: BaseException | None = None
+    for candidate_index, candidate_primary_exchange in enumerate(primary_candidates):
+        attempt_start_ts = start_ts
+        contract = _build_contract(
+            ticker,
+            sec_type=sec_type,
+            exchange=exchange,
+            currency=currency,
+            primary_exchange=candidate_primary_exchange,
+        )
+        app = _IBHistoricalApp()
+        thread = app.connect_and_start(host=host, port=port, client_id=client_id, timeout_seconds=timeout_seconds)
+        try:
+            if discover_head_timestamp:
+                try:
+                    head_value = app.request_head_timestamp(
+                        contract=contract,
+                        what_to_show=what_to_show,
+                        use_rth=use_rth,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    head_ts = _parse_ib_bar_time(head_value)
+                    if head_ts > attempt_start_ts:
+                        attempt_start_ts = head_ts
+                except Exception:
+                    # Keep the requested start if head-timestamp discovery fails; the main historical requests may still work.
+                    pass
+
+            windows = _chunk_windows(
+                start=attempt_start_ts,
+                end=end_ts,
+                chunk_offset=_parse_chunk_duration(chunk_duration, bar_size),
+            )
+            completed_requests = 0
+
+            def _request_window(window_start: pd.Timestamp, window_end: pd.Timestamp) -> _HistoricalResult:
+                duration = _duration_string_for_window(window_start, window_end)
+                return app.request_historical_window(
                     contract=contract,
+                    end=window_end,
+                    duration=duration,
+                    bar_size=bar_size,
                     what_to_show=what_to_show,
                     use_rth=use_rth,
                     timeout_seconds=timeout_seconds,
                 )
-                head_ts = _parse_ib_bar_time(head_value)
-                if head_ts > start_ts:
-                    start_ts = head_ts
-            except Exception:
-                # Keep the requested start if head-timestamp discovery fails; the main historical requests may still work.
-                pass
 
-        windows = _chunk_windows(
-            start=start_ts,
-            end=end_ts,
-            chunk_offset=_parse_chunk_duration(chunk_duration, bar_size),
-        )
-        all_rows: list[dict] = []
-        completed_requests = 0
-
-        def _request_window(window_start: pd.Timestamp, window_end: pd.Timestamp) -> _HistoricalResult:
-            duration = _duration_string_for_window(window_start, window_end)
-            return app.request_historical_window(
-                contract=contract,
-                end=window_end,
-                duration=duration,
-                bar_size=bar_size,
-                what_to_show=what_to_show,
-                use_rth=use_rth,
-                timeout_seconds=timeout_seconds,
-            )
-
-        for index, (window_start, window_end) in enumerate(windows, start=1):
-            window_results = _fetch_window_with_adaptive_retry(
-                _request_window,
-                window_start=window_start,
-                window_end=window_end,
-                bar_size=bar_size,
-            )
-            for result in window_results:
-                completed_requests += 1
-                result_rows: list[dict] = []
-                for row in result.rows:
-                    stamp = row["timestamp"]
-                    if stamp < window_start or stamp > window_end:
-                        continue
-                    if last_checkpoint_ts is not None and stamp <= last_checkpoint_ts:
-                        continue
-                    result_rows.append(row)
-                if checkpoint_path is not None:
-                    if result_rows:
-                        checkpoint_chunk = pd.DataFrame(result_rows)
-                        checkpoint_chunk["timestamp"] = pd.to_datetime(
-                            checkpoint_chunk["timestamp"], utc=True, errors="coerce"
-                        )
-                        checkpoint_chunk = checkpoint_chunk.dropna(subset=["timestamp"])
-                        checkpoint_chunk = checkpoint_chunk.drop_duplicates(subset=["timestamp"], keep="last")
-                        checkpoint_chunk = checkpoint_chunk.sort_values("timestamp").set_index("timestamp")
-                        _append_checkpoint_rows(checkpoint_path, checkpoint_chunk)
-                        last_checkpoint_ts = _ensure_utc_timestamp(checkpoint_chunk.index.max())
-                        checkpoint_row_count += int(len(checkpoint_chunk))
-                else:
-                    all_rows.extend(result_rows)
-                if progress_cb:
-                    progress_rows = len(all_rows)
+            for index, (window_start, window_end) in enumerate(windows, start=1):
+                window_results = _fetch_window_with_adaptive_retry(
+                    _request_window,
+                    window_start=window_start,
+                    window_end=window_end,
+                    bar_size=bar_size,
+                )
+                for result in window_results:
+                    completed_requests += 1
+                    result_rows: list[dict] = []
+                    for row in result.rows:
+                        stamp = row["timestamp"]
+                        if stamp < window_start or stamp > window_end:
+                            continue
+                        if last_checkpoint_ts is not None and stamp <= last_checkpoint_ts:
+                            continue
+                        result_rows.append(row)
                     if checkpoint_path is not None:
-                        progress_rows = checkpoint_row_count
-                    progress_cb(completed_requests, progress_rows)
-            if pace_seconds > 0 and index < len(windows):
-                time.sleep(pace_seconds)
-    finally:
-        try:
-            app.disconnect()
+                        if result_rows:
+                            checkpoint_chunk = pd.DataFrame(result_rows)
+                            checkpoint_chunk["timestamp"] = pd.to_datetime(
+                                checkpoint_chunk["timestamp"], utc=True, errors="coerce"
+                            )
+                            checkpoint_chunk = checkpoint_chunk.dropna(subset=["timestamp"])
+                            checkpoint_chunk = checkpoint_chunk.drop_duplicates(subset=["timestamp"], keep="last")
+                            checkpoint_chunk = checkpoint_chunk.sort_values("timestamp").set_index("timestamp")
+                            _append_checkpoint_rows(checkpoint_path, checkpoint_chunk)
+                            last_checkpoint_ts = _ensure_utc_timestamp(checkpoint_chunk.index.max())
+                            checkpoint_row_count += int(len(checkpoint_chunk))
+                    else:
+                        all_rows.extend(result_rows)
+                    if progress_cb:
+                        progress_rows = len(all_rows)
+                        if checkpoint_path is not None:
+                            progress_rows = checkpoint_row_count
+                        progress_cb(completed_requests, progress_rows)
+                if pace_seconds > 0 and index < len(windows):
+                    time.sleep(pace_seconds)
+            break
+        except Exception as exc:
+            if _is_security_definition_exception(exc) and candidate_index < len(primary_candidates) - 1:
+                last_security_error = exc
+                all_rows = []
+                continue
+            raise
         finally:
-            thread.join(timeout=1.0)
+            try:
+                app.disconnect()
+            finally:
+                thread.join(timeout=1.0)
+    else:
+        if last_security_error is not None:
+            raise RuntimeError(
+                f"Interactive Brokers could not resolve {str(ticker).strip().upper()} with primary exchange candidates "
+                f"{', '.join(str(item or 'blank') for item in primary_candidates)}."
+            ) from last_security_error
 
     if checkpoint_path is not None and checkpoint_path.exists():
         frame = _load_checkpoint_frame(checkpoint_path)
@@ -756,13 +817,35 @@ def main() -> None:
     except Exception as exc:
         details = traceback.format_exc()
         message = str(exc)
+        checkpoint_frame = pd.DataFrame()
+        checkpoint_rows = 0
         if args.out.exists():
             try:
-                checkpoint_rows = len(_load_checkpoint_frame(args.out))
+                checkpoint_frame = _load_checkpoint_frame(args.out)
+                checkpoint_rows = len(checkpoint_frame)
             except Exception:
                 checkpoint_rows = 0
             if checkpoint_rows > 0:
                 checkpoint_note = f"Partial progress was saved to {args.out} ({checkpoint_rows} rows)."
+                if _is_terminal_no_data_exception(exc):
+                    checkpoint_frame.reset_index().to_csv(args.out, index=False)
+                    if args.progress:
+                        print(
+                            json.dumps(
+                                {
+                                    "type": "done",
+                                    "ticker": args.ticker.upper(),
+                                    "rows": int(checkpoint_rows),
+                                    "out": str(args.out),
+                                    "partial": True,
+                                    "warning": checkpoint_note,
+                                }
+                            ),
+                            flush=True,
+                        )
+                    else:  # pragma: no cover
+                        print(f"Saved {checkpoint_rows} rows to {args.out} ({checkpoint_note})")
+                    return
                 message = f"{message} [{checkpoint_note}]"
                 details = f"{details.rstrip()}\n\n{checkpoint_note}\n"
         if args.progress:

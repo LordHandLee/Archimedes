@@ -40,6 +40,14 @@ def compute_logical_run_id(
         "sharpe_basis": config.sharpe_basis,
         "sharpe_annualization": config.sharpe_annualization,
         "sharpe_session_seconds_per_day": config.sharpe_session_seconds_per_day,
+        "margin_enabled": config.margin_enabled,
+        "max_gross_leverage": config.max_gross_leverage,
+        "position_sizing_model": config.position_sizing_model,
+        "annual_vol_window": config.annual_vol_window,
+        "annual_vol_min_periods": config.annual_vol_min_periods,
+        "annual_vol_floor": config.annual_vol_floor,
+        "max_volatility_multiplier": config.max_volatility_multiplier,
+        "min_position_shares": config.min_position_shares,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -83,6 +91,14 @@ def compute_portfolio_logical_run_id(
         "sharpe_basis": config.sharpe_basis,
         "sharpe_annualization": config.sharpe_annualization,
         "sharpe_session_seconds_per_day": config.sharpe_session_seconds_per_day,
+        "margin_enabled": config.margin_enabled,
+        "max_gross_leverage": config.max_gross_leverage,
+        "position_sizing_model": config.position_sizing_model,
+        "annual_vol_window": config.annual_vol_window,
+        "annual_vol_min_periods": config.annual_vol_min_periods,
+        "annual_vol_floor": config.annual_vol_floor,
+        "max_volatility_multiplier": config.max_volatility_multiplier,
+        "min_position_shares": config.min_position_shares,
         "normalize_weights": normalize_weights,
         "max_gross_exposure": max_gross_exposure,
     }

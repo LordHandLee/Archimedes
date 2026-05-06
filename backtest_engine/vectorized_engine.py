@@ -13,6 +13,7 @@ from .engine import BacktestConfig, BacktestResult
 from .execution import BatchExecutionBenchmark, ExecutionMode, ExecutionRequest, ExecutionResult
 from .metrics import compute_metrics
 from .run_ids import compute_engine_run_id, compute_logical_run_id
+from .sizing import POSITION_SIZING_NONE, effective_max_gross_leverage, normalize_position_sizing_model, position_sizing_multiplier
 from .strategy import Strategy
 from .vectorized_strategies import VectorizedPendingOrderUpdate, VectorizedSupport, get_vectorized_adapter
 
@@ -126,6 +127,20 @@ class VectorizedEngine:
             raise RuntimeError(support.reason or "Vectorized execution is not supported for this workload.")
 
         sliced_data = self._slice_data(self._normalize_data(data), config)
+        sizing_multipliers = (
+            position_sizing_multiplier(sliced_data, config)
+            .reindex(sliced_data.index)
+            .fillna(1.0)
+            .to_numpy(dtype=float)
+        )
+        hoisted_arrays = (
+            sliced_data["open"].to_numpy(dtype=float),
+            sliced_data["high"].to_numpy(dtype=float),
+            sliced_data["low"].to_numpy(dtype=float),
+            sliced_data["close"].to_numpy(dtype=float),
+            sliced_data.index
+        )
+
         adapter = get_vectorized_adapter(strategy_cls)
         assert adapter is not None
 
@@ -207,6 +222,8 @@ class VectorizedEngine:
                 )
                 simulations = self._simulate_batch(
                     data=sliced_data,
+                    hoisted_arrays=hoisted_arrays,
+                    sizing_multipliers=sizing_multipliers,
                     adapter=adapter,
                     order_plan=order_plan,
                     param_grid=chunk_params,
@@ -294,16 +311,14 @@ class VectorizedEngine:
         self,
         *,
         data: pd.DataFrame,
+        hoisted_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex],
+        sizing_multipliers: np.ndarray,
         adapter,
         order_plan,
         param_grid: Sequence[Dict],
         config: BacktestConfig,
     ) -> List[BacktestResult]:
-        opens = data["open"].to_numpy(dtype=float)
-        highs = data["high"].to_numpy(dtype=float)
-        lows = data["low"].to_numpy(dtype=float)
-        closes = data["close"].to_numpy(dtype=float)
-        index = data.index
+        opens, highs, lows, closes, index = hoisted_arrays
         n_bars = len(index)
         n_params = len(param_grid)
 
@@ -372,6 +387,12 @@ class VectorizedEngine:
                     equity_mark=equity_close,
                     position=position,
                     mark_price=close_px,
+                    target_multiplier=float(sizing_multipliers[bar_idx]),
+                    min_position_shares=(
+                        float(config.min_position_shares)
+                        if normalize_position_sizing_model(config.position_sizing_model) != POSITION_SIZING_NONE
+                        else 0.0
+                    ),
                 )
                 self._update_pending_orders(
                     order_plan=order_plan,
@@ -407,6 +428,12 @@ class VectorizedEngine:
                 equity_mark=equity_signal,
                 position=position,
                 mark_price=close_px,
+                target_multiplier=float(sizing_multipliers[bar_idx]),
+                min_position_shares=(
+                    float(config.min_position_shares)
+                    if normalize_position_sizing_model(config.position_sizing_model) != POSITION_SIZING_NONE
+                    else 0.0
+                ),
             )
             self._update_pending_orders(
                 order_plan=order_plan,
@@ -623,6 +650,8 @@ class VectorizedEngine:
         equity_mark: np.ndarray,
         position: np.ndarray,
         mark_price: float,
+        target_multiplier: float = 1.0,
+        min_position_shares: float = 0.0,
     ) -> np.ndarray:
         if mark_price <= 0:
             return np.zeros_like(position, dtype=float)
@@ -640,12 +669,26 @@ class VectorizedEngine:
 
         enter_long_mask = order_plan.enter_long[bar_idx, :] & (position <= pos_eps) & (np.abs(pending_qty) < pos_eps)
         if np.any(enter_long_mask):
-            desired_long_qty = (order_plan.long_targets[enter_long_mask] * equity_mark[enter_long_mask]) / mark_price
+            desired_long_qty = (order_plan.long_targets[enter_long_mask] * float(target_multiplier) * equity_mark[enter_long_mask]) / mark_price
+            min_shares = max(0.0, float(min_position_shares))
+            if min_shares > 0.0:
+                desired_long_qty = np.where(
+                    (desired_long_qty > 0.0) & (desired_long_qty < min_shares),
+                    min_shares,
+                    desired_long_qty,
+                )
             pending_qty[enter_long_mask] = desired_long_qty - position[enter_long_mask]
 
         enter_short_mask = order_plan.enter_short[bar_idx, :] & (position >= -pos_eps) & (np.abs(pending_qty) < pos_eps)
         if np.any(enter_short_mask):
-            desired_short_qty = (-order_plan.short_targets[enter_short_mask] * equity_mark[enter_short_mask]) / mark_price
+            desired_short_qty = (-order_plan.short_targets[enter_short_mask] * float(target_multiplier) * equity_mark[enter_short_mask]) / mark_price
+            min_shares = max(0.0, float(min_position_shares))
+            if min_shares > 0.0:
+                desired_short_qty = np.where(
+                    (desired_short_qty < 0.0) & (np.abs(desired_short_qty) < min_shares),
+                    -min_shares,
+                    desired_short_qty,
+                )
             pending_qty[enter_short_mask] = desired_short_qty - position[enter_short_mask]
 
         pending_qty[np.abs(pending_qty) < order_eps] = 0.0
@@ -1022,11 +1065,30 @@ class VectorizedEngine:
         fee_rate = buy_fee if qty > 0 else sell_fee
         buying_to_cover = qty > 0 and prev_qty < 0
         if qty > 0 and not buying_to_cover and (adj_price * (1.0 + fee_rate)) > 0:
-            max_affordable_qty = max(float(cash[param_idx]) / (adj_price * (1.0 + fee_rate)), 0.0)
+            if bool(config.margin_enabled):
+                equity_mark = max(float(cash[param_idx]) + prev_qty * adj_price, 0.0)
+                max_gross = equity_mark * effective_max_gross_leverage(config)
+                current_gross = abs(prev_qty) * adj_price
+                max_affordable_qty = max((max_gross - current_gross) / (adj_price * (1.0 + fee_rate)), 0.0)
+            else:
+                max_affordable_qty = max(float(cash[param_idx]) / (adj_price * (1.0 + fee_rate)), 0.0)
             if qty > max_affordable_qty:
                 qty = max_affordable_qty
                 if qty < 1e-12:
                     return None
+
+        if side == "sell" and config.allow_short and qty < 0 and adj_price > 0:
+            prev_short_qty = abs(min(prev_qty, 0.0))
+            requested_short_qty = abs(min(prev_qty + qty, 0.0))
+            if requested_short_qty > prev_short_qty:
+                equity_mark = max(float(cash[param_idx]) + prev_qty * adj_price, 0.0)
+                max_gross = equity_mark * effective_max_gross_leverage(config)
+                current_long_notional = max(prev_qty, 0.0) * adj_price
+                allowed_short_qty = max(max_gross - current_long_notional, 0.0) / adj_price
+                if requested_short_qty > allowed_short_qty:
+                    qty = -allowed_short_qty - prev_qty
+                    if abs(qty) < 1e-12:
+                        return None
 
         notional = qty * adj_price
         fee = abs(notional) * fee_rate
@@ -1105,9 +1167,18 @@ class VectorizedEngine:
         configured = getattr(config, "vectorized_param_batch_size", None)
         if configured is not None:
             return max(1, min(int(configured), total))
-        # Keep the active signal/order matrices to a manageable size for larger studies.
-        target_cells = 250_000
-        inferred = max(1, target_cells // max(int(n_bars), 1))
+            
+        bytes_per_param = max(int(n_bars * 8), 1)
+        
+        try:
+            import psutil
+            available_bytes = psutil.virtual_memory().available
+        except ImportError:
+            available_bytes = 1024 * 1024 * 1024  # 1GB fallback
+            
+        target_memory = available_bytes * 0.60 # changed from 20 percent to 60 percent
+        
+        inferred = max(1, int(target_memory // bytes_per_param))
         return max(1, min(total, inferred))
 
     def _estimate_session_seconds_per_day(self, data: pd.DataFrame) -> float | None:

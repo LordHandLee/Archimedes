@@ -205,6 +205,7 @@ class DeploymentTargetRecord:
     db_path: str | None
     log_db_path: str | None
     secret_ref: str | None
+    secret_value: str | None
     is_active: bool
     created_at: str | None
     updated_at: str | None
@@ -526,6 +527,9 @@ class ResultCatalog:
                 )
                 """
             )
+            self._ensure_column(conn, "trades", "dataset_id", "TEXT")
+            self._ensure_column(conn, "trades", "source_dataset_id", "TEXT")
+            self._ensure_column(conn, "trades", "strategy_block_id", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS batches (
@@ -807,6 +811,25 @@ class ResultCatalog:
                     record_count INTEGER,
                     new_field_count INTEGER,
                     error_summary TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS asset_provider_sync_events (
+                    event_id TEXT PRIMARY KEY,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    asset_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT,
+                    details TEXT,
+                    record_count INTEGER,
+                    asset_count INTEGER,
+                    new_field_count INTEGER,
+                    provider_sync_run_id TEXT
                 )
                 """
             )
@@ -1139,6 +1162,9 @@ class ResultCatalog:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_provider_sync_runs_provider_started ON provider_sync_runs(provider, started_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_asset_provider_sync_events_asset ON asset_provider_sync_events(asset_id, provider, updated_at DESC)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_simfin_company_snapshots_asset ON simfin_company_snapshots(asset_id, updated_at DESC)"
@@ -1505,10 +1531,12 @@ class ResultCatalog:
                     db_path TEXT,
                     log_db_path TEXT,
                     secret_ref TEXT,
+                    secret_value TEXT,
                     is_active INTEGER DEFAULT 1
                 )
                 """
             )
+            self._ensure_column(conn, "deployment_targets", "secret_value", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS manual_deployment_definitions (
@@ -1842,14 +1870,17 @@ class ResultCatalog:
                         float(getattr(t, "fee", 0.0)),
                         float(getattr(t, "realized_pnl", 0.0)),
                         float(getattr(t, "equity_after", 0.0)),
+                        str(getattr(t, "dataset_id", "") or "") or None,
+                        str(getattr(t, "source_dataset_id", "") or "") or None,
+                        str(getattr(t, "strategy_block_id", "") or "") or None,
                     )
                 )
             if rows:
                 conn.executemany(
                     """
                     INSERT INTO trades
-                    (run_id, seq, timestamp, side, qty, price, fee, realized_pnl, equity_after)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_id, seq, timestamp, side, qty, price, fee, realized_pnl, equity_after, dataset_id, source_dataset_id, strategy_block_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
@@ -1858,7 +1889,7 @@ class ResultCatalog:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 """
-                SELECT seq,timestamp,side,qty,price,fee,realized_pnl,equity_after
+                SELECT seq,timestamp,side,qty,price,fee,realized_pnl,equity_after,dataset_id,source_dataset_id,strategy_block_id
                 FROM trades WHERE run_id=? ORDER BY seq ASC
                 """,
                 (run_id,),
@@ -1873,6 +1904,9 @@ class ResultCatalog:
                 "fee": r[5],
                 "realized_pnl": r[6],
                 "equity_after": r[7],
+                "dataset_id": r[8],
+                "source_dataset_id": r[9],
+                "strategy_block_id": r[10],
             }
             for r in rows
         ]
@@ -2228,6 +2262,110 @@ class ResultCatalog:
                     str(provider_sync_run_id).strip(),
                 ),
             )
+
+    def save_asset_provider_sync_event(
+        self,
+        *,
+        provider: str,
+        status: str,
+        symbol: str | None = None,
+        asset_id: str | None = None,
+        message: str | None = None,
+        details: str | None = None,
+        record_count: int | None = None,
+        asset_count: int | None = None,
+        new_field_count: int | None = None,
+        provider_sync_run_id: str | None = None,
+        event_id: str | None = None,
+    ) -> str:
+        normalized_provider = str(provider or "").strip().lower()
+        normalized_status = str(status or "").strip().lower() or "completed"
+        normalized_symbol = self._normalize_asset_symbol(symbol)
+        resolved_asset_id = str(asset_id or "").strip()
+        if not resolved_asset_id and normalized_symbol:
+            resolved_asset_id = self._asset_id_from_symbol(normalized_symbol)
+        if not resolved_asset_id:
+            raise ValueError("asset_id or symbol is required.")
+        if not normalized_symbol:
+            normalized_symbol = normalized_symbol or resolved_asset_id.replace("asset_", "", 1).upper()
+        resolved_event_id = str(event_id or "").strip() or f"provider_sync_event_{uuid.uuid4().hex}"
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO asset_provider_sync_events (
+                    event_id, asset_id, symbol, provider, status, message, details,
+                    record_count, asset_count, new_field_count, provider_sync_run_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    updated_at=CURRENT_TIMESTAMP,
+                    status=excluded.status,
+                    message=excluded.message,
+                    details=excluded.details,
+                    record_count=excluded.record_count,
+                    asset_count=excluded.asset_count,
+                    new_field_count=excluded.new_field_count,
+                    provider_sync_run_id=excluded.provider_sync_run_id
+                """,
+                (
+                    resolved_event_id,
+                    resolved_asset_id,
+                    normalized_symbol,
+                    normalized_provider,
+                    normalized_status,
+                    str(message or "").strip() or None,
+                    str(details or "").strip() or None,
+                    None if record_count is None else int(record_count),
+                    None if asset_count is None else int(asset_count),
+                    None if new_field_count is None else int(new_field_count),
+                    str(provider_sync_run_id or "").strip() or None,
+                ),
+            )
+        return resolved_event_id
+
+    def load_asset_provider_sync_events(self, asset_id: str, *, limit: int = 10) -> list[dict[str, object]]:
+        if not str(asset_id or "").strip() or not self.db_path.exists():
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    event_id,
+                    provider,
+                    status,
+                    symbol,
+                    message,
+                    details,
+                    record_count,
+                    asset_count,
+                    new_field_count,
+                    provider_sync_run_id,
+                    created_at,
+                    updated_at
+                FROM asset_provider_sync_events
+                WHERE asset_id=?
+                ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC
+                LIMIT ?
+                """,
+                (str(asset_id).strip(), max(1, int(limit))),
+            ).fetchall()
+        return [
+            {
+                "event_id": str(row[0] or ""),
+                "provider": str(row[1] or ""),
+                "status": str(row[2] or ""),
+                "symbol": str(row[3] or ""),
+                "message": str(row[4] or ""),
+                "details": str(row[5] or ""),
+                "record_count": None if row[6] is None else int(row[6]),
+                "asset_count": None if row[7] is None else int(row[7]),
+                "new_field_count": None if row[8] is None else int(row[8]),
+                "provider_sync_run_id": str(row[9] or ""),
+                "created_at": row[10],
+                "updated_at": row[11],
+            }
+            for row in rows
+        ]
 
     # -- asset information --------------------------------------------------
     @staticmethod
@@ -4264,6 +4402,7 @@ class ResultCatalog:
         db_path: str = "",
         log_db_path: str = "",
         secret_ref: str = "",
+        secret_value: str = "",
         is_active: bool = True,
     ) -> str:
         with sqlite3.connect(self.db_path) as conn:
@@ -4273,9 +4412,9 @@ class ResultCatalog:
                 (
                     target_id, name, mode, broker_scope, transport_mode, base_url, webhook_path,
                     status_path, dashboard_path, logs_path, project_root, db_path, log_db_path,
-                    secret_ref, is_active
+                    secret_ref, secret_value, is_active
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(target_id) DO UPDATE SET
                     name=excluded.name,
                     mode=excluded.mode,
@@ -4290,6 +4429,7 @@ class ResultCatalog:
                     db_path=excluded.db_path,
                     log_db_path=excluded.log_db_path,
                     secret_ref=excluded.secret_ref,
+                    secret_value=excluded.secret_value,
                     is_active=excluded.is_active,
                     updated_at=CURRENT_TIMESTAMP
                 """,
@@ -4308,6 +4448,7 @@ class ResultCatalog:
                     str(db_path or ""),
                     str(log_db_path or ""),
                     str(secret_ref or ""),
+                    str(secret_value or ""),
                     1 if is_active else 0,
                 ),
             )
@@ -4320,7 +4461,7 @@ class ResultCatalog:
                 SELECT
                     target_id, name, mode, broker_scope, transport_mode, base_url, webhook_path,
                     status_path, dashboard_path, logs_path, project_root, db_path, log_db_path,
-                    secret_ref, is_active, created_at, updated_at
+                    secret_ref, secret_value, is_active, created_at, updated_at
                 FROM deployment_targets
                 ORDER BY is_active DESC, name ASC, target_id ASC
                 """
@@ -4341,9 +4482,10 @@ class ResultCatalog:
                 db_path=row[11],
                 log_db_path=row[12],
                 secret_ref=row[13],
-                is_active=bool(row[14]),
-                created_at=row[15],
-                updated_at=row[16],
+                secret_value=row[14],
+                is_active=bool(row[15]),
+                created_at=row[16],
+                updated_at=row[17],
             )
             for row in rows
         ]
@@ -4573,6 +4715,7 @@ class ResultCatalog:
         *,
         status: str,
         status_reason: str = "",
+        last_signal_at: str = "",
         armed_at: str = "",
         started_at: str = "",
         stopped_at: str = "",
@@ -4588,6 +4731,7 @@ class ResultCatalog:
                 SET
                     status=?,
                     status_reason=?,
+                    last_signal_at=CASE WHEN ? <> '' THEN ? ELSE last_signal_at END,
                     armed_at=CASE WHEN ? <> '' THEN ? ELSE armed_at END,
                     started_at=CASE WHEN ? <> '' THEN ? ELSE started_at END,
                     stopped_at=CASE WHEN ? <> '' THEN ? ELSE stopped_at END,
@@ -4599,6 +4743,8 @@ class ResultCatalog:
                 (
                     str(status or ""),
                     str(status_reason or ""),
+                    str(last_signal_at or ""),
+                    str(last_signal_at or ""),
                     str(armed_at or ""),
                     str(armed_at or ""),
                     str(started_at or ""),
@@ -4612,6 +4758,35 @@ class ResultCatalog:
                     str(deployment_id),
                 ),
             )
+
+    def delete_deployment(self, deployment_id: str) -> int:
+        """Delete a deployment, its child deployments, child links, and metric snapshots."""
+        root_id = str(deployment_id or "").strip()
+        if not root_id:
+            return 0
+        with sqlite3.connect(self.db_path) as conn:
+            ids: set[str] = {root_id}
+            pending = [root_id]
+            while pending:
+                parent_id = pending.pop()
+                rows = conn.execute(
+                    "SELECT deployment_id FROM deployments WHERE parent_deployment_id=?",
+                    (parent_id,),
+                ).fetchall()
+                for (child_id,) in rows:
+                    child_text = str(child_id or "")
+                    if child_text and child_text not in ids:
+                        ids.add(child_text)
+                        pending.append(child_text)
+            placeholders = ",".join("?" for _ in ids)
+            params = tuple(ids)
+            conn.execute(f"DELETE FROM deployment_metric_snapshots WHERE deployment_id IN ({placeholders})", params)
+            conn.execute(
+                f"DELETE FROM deployment_child_links WHERE parent_deployment_id IN ({placeholders}) OR child_deployment_id IN ({placeholders})",
+                params + params,
+            )
+            cursor = conn.execute(f"DELETE FROM deployments WHERE deployment_id IN ({placeholders})", params)
+            return int(cursor.rowcount or 0)
 
     def load_deployments(self) -> list[DeploymentRecord]:
         with sqlite3.connect(self.db_path) as conn:

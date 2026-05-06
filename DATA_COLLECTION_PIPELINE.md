@@ -52,6 +52,7 @@ The interactive download queue in the dashboard currently does a few useful thin
 - it supports a resume state file per ticker under `data/download_state/`
 - it records durable acquisition runs and per-symbol attempts in SQLite
 - it auto-ingests successful downloads into the local DuckDB/Parquet store
+- multi-window Massive repair downloads merge each downloaded window into the same raw CSV, then ingest once at the end; the UI should not bounce between `running` and `ingesting` after every small window
 - it can inherit source preference from a saved universe
 - it can show acquisition history through the acquisition catalog UI
 - it now has a `Force Refresh` override so a user can re-download even when the local dataset looks fresh

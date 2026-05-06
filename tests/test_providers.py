@@ -3,10 +3,13 @@ from __future__ import annotations
 import unittest
 
 from backtest_engine.providers import (
+    COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER,
     DEFAULT_ACQUISITION_PROVIDER,
     available_acquisition_providers,
     build_provider_fetch_command,
+    expand_acquisition_source,
     get_acquisition_provider,
+    is_composite_acquisition_provider,
     provider_display_name,
     provider_fetch_tuning,
     resolve_acquisition_source,
@@ -18,6 +21,7 @@ class AcquisitionProviderTests(unittest.TestCase):
         providers = {spec.provider_id for spec in available_acquisition_providers()}
         self.assertIn(DEFAULT_ACQUISITION_PROVIDER, providers)
         self.assertIn("interactive_brokers", providers)
+        self.assertIn(COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER, providers)
         self.assertIn("stooq", providers)
         spec = get_acquisition_provider(DEFAULT_ACQUISITION_PROVIDER)
         self.assertEqual(spec.provider_id, "massive")
@@ -30,7 +34,25 @@ class AcquisitionProviderTests(unittest.TestCase):
     def test_resolve_source_prefers_explicit_over_universe_preference(self) -> None:
         self.assertEqual(resolve_acquisition_source("massive", ""), "massive")
         self.assertEqual(resolve_acquisition_source("", "massive"), "massive")
+        self.assertEqual(
+            resolve_acquisition_source(COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER, "massive"),
+            COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER,
+        )
         self.assertEqual(resolve_acquisition_source("", ""), DEFAULT_ACQUISITION_PROVIDER)
+
+    def test_composite_source_expands_to_real_fetch_providers(self) -> None:
+        self.assertTrue(is_composite_acquisition_provider(COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER))
+        self.assertEqual(
+            expand_acquisition_source(COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER),
+            ("interactive_brokers", "massive"),
+        )
+        with self.assertRaises(ValueError):
+            build_provider_fetch_command(
+                COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER,
+                python_executable="/usr/bin/python3",
+                ticker="spy",
+                out_path="data/SPY_combined.csv",
+            )
 
     def test_build_provider_fetch_command_uses_registered_fetch_script(self) -> None:
         cmd = build_provider_fetch_command(
@@ -48,7 +70,7 @@ class AcquisitionProviderTests(unittest.TestCase):
         self.assertIn("--progress", cmd)
         self.assertIn("--resume", cmd)
         self.assertIn("--pace", cmd)
-        self.assertIn("12.5", cmd)
+        self.assertIn("15.0", cmd)
 
         stooq_cmd = build_provider_fetch_command(
             "stooq",
@@ -72,6 +94,7 @@ class AcquisitionProviderTests(unittest.TestCase):
         self.assertIn("3.0", ib_cmd)
         self.assertIn("--chunk-duration", ib_cmd)
         self.assertIn("1w", ib_cmd)
+        self.assertIn("--discover-head-timestamp", ib_cmd)
 
     def test_interactive_brokers_minute_fetch_tuning_prefers_weekly_chunks(self) -> None:
         tuning = provider_fetch_tuning("interactive_brokers", resolution="1 min")
@@ -91,10 +114,15 @@ class AcquisitionProviderTests(unittest.TestCase):
         first_chunk_duration = cmd[cmd.index("--chunk-duration") + 1]
         self.assertEqual(first_chunk_duration, "2w")
         self.assertEqual(cmd.count("--chunk-duration"), 1)
+        self.assertIn("--discover-head-timestamp", cmd)
 
     def test_provider_display_name_handles_unknown_values(self) -> None:
         self.assertEqual(provider_display_name("massive"), "Massive")
         self.assertEqual(provider_display_name("interactive_brokers"), "Interactive Brokers")
+        self.assertEqual(
+            provider_display_name(COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER),
+            "Massive and Interactive Brokers",
+        )
         self.assertEqual(provider_display_name("custom_feed"), "Custom Feed")
 
 

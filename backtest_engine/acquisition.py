@@ -35,11 +35,15 @@ def compute_and_store_quality_snapshot(
     resolved_resolution = str(resolution or "").strip()
     if not resolved_resolution:
         return None
+    owns_store = store is None
     duck = store or DuckDBStore()
     try:
         quality_snapshot = duck.inspect_dataset_quality(str(dataset_id), resolved_resolution)
     except Exception:
         return None
+    finally:
+        if owns_store:
+            duck.close()
     quality_snapshot["quality_analyzed_at"] = pd.Timestamp.now("UTC").isoformat()
     if catalog is not None:
         catalog.update_acquisition_dataset_quality(str(dataset_id), quality_snapshot)
@@ -54,29 +58,34 @@ def backfill_missing_quality_snapshots(
     limit: int | None = None,
 ) -> int:
     resolved_catalog = catalog or ResultCatalog()
+    owns_store = store is None
     duck = store or DuckDBStore()
-    normalized_dataset_ids = {str(item).strip() for item in list(dataset_ids or []) if str(item).strip()}
-    updated = 0
-    for record in resolved_catalog.load_acquisition_datasets():
-        if normalized_dataset_ids and str(record.dataset_id) not in normalized_dataset_ids:
-            continue
-        if record.quality_analyzed_at:
-            continue
-        if not record.ingested or not str(record.resolution or "").strip():
-            continue
-        if not duck.dataset_path(str(record.dataset_id)).exists():
-            continue
-        quality_snapshot = compute_and_store_quality_snapshot(
-            str(record.dataset_id),
-            resolution=str(record.resolution or ""),
-            catalog=resolved_catalog,
-            store=duck,
-        )
-        if quality_snapshot is not None:
-            updated += 1
-        if limit is not None and updated >= int(limit):
-            break
-    return updated
+    try:
+        normalized_dataset_ids = {str(item).strip() for item in list(dataset_ids or []) if str(item).strip()}
+        updated = 0
+        for record in resolved_catalog.load_acquisition_datasets():
+            if normalized_dataset_ids and str(record.dataset_id) not in normalized_dataset_ids:
+                continue
+            if record.quality_analyzed_at:
+                continue
+            if not record.ingested or not str(record.resolution or "").strip():
+                continue
+            if not duck.dataset_path(str(record.dataset_id)).exists():
+                continue
+            quality_snapshot = compute_and_store_quality_snapshot(
+                str(record.dataset_id),
+                resolution=str(record.resolution or ""),
+                catalog=resolved_catalog,
+                store=duck,
+            )
+            if quality_snapshot is not None:
+                updated += 1
+            if limit is not None and updated >= int(limit):
+                break
+        return updated
+    finally:
+        if owns_store:
+            duck.close()
 
 
 def _window_bound_timestamp(value: str | None, *, is_end: bool) -> pd.Timestamp | None:
@@ -183,30 +192,35 @@ def ingest_csv_to_store(
         raise ValueError("Dataset id is required for ingestion.")
 
     loaded = load_csv_prices(path)
+    owns_store = store is None
     duck = store or DuckDBStore()
-    final_frame = loaded.data
-    if merge_existing:
-        existing_path = duck.dataset_path(resolved_dataset_id)
-        if existing_path.exists():
-            existing = duck.load(resolved_dataset_id)
-            final_frame = pd.concat([existing, loaded.data], axis=0)
-            final_frame = final_frame[~final_frame.index.duplicated(keep="last")]
-            final_frame = final_frame.sort_index()
-    parquet_path = duck.write_parquet(resolved_dataset_id, final_frame.reset_index())
-    quality_snapshot = compute_and_store_quality_snapshot(
-        resolved_dataset_id,
-        resolution=resolution,
-        store=duck,
-    )
-    return IngestedDatasetArtifact(
-        dataset_id=resolved_dataset_id,
-        csv_path=str(path),
-        parquet_path=str(parquet_path),
-        start=final_frame.index.min().isoformat(),
-        end=final_frame.index.max().isoformat(),
-        bar_count=int(len(final_frame)),
-        quality_snapshot=quality_snapshot,
-    )
+    try:
+        final_frame = loaded.data
+        if merge_existing:
+            existing_path = duck.dataset_path(resolved_dataset_id)
+            if existing_path.exists():
+                existing = duck.load(resolved_dataset_id)
+                final_frame = pd.concat([existing, loaded.data], axis=0)
+                final_frame = final_frame[~final_frame.index.duplicated(keep="last")]
+                final_frame = final_frame.sort_index()
+        parquet_path = duck.write_parquet(resolved_dataset_id, final_frame)
+        quality_snapshot = compute_and_store_quality_snapshot(
+            resolved_dataset_id,
+            resolution=resolution,
+            store=duck,
+        )
+        return IngestedDatasetArtifact(
+            dataset_id=resolved_dataset_id,
+            csv_path=str(path),
+            parquet_path=str(parquet_path),
+            start=final_frame.index.min().isoformat(),
+            end=final_frame.index.max().isoformat(),
+            bar_count=int(len(final_frame)),
+            quality_snapshot=quality_snapshot,
+        )
+    finally:
+        if owns_store:
+            duck.close()
 
 
 def gap_fill_dataset_from_secondary(
@@ -218,39 +232,44 @@ def gap_fill_dataset_from_secondary(
     end: str | None = None,
     resolution: str | None = None,
 ) -> IngestedDatasetArtifact:
+    owns_store = store is None
     duck = store or DuckDBStore()
-    target = duck.load(target_dataset_id)
-    if start or end:
-        start_ts = _window_bound_timestamp(start, is_end=False)
-        end_ts = _window_bound_timestamp(end, is_end=True)
-        if start_ts is not None and end_ts is not None:
-            secondary = duck.load_range(secondary_dataset_id, start_ts, end_ts)
+    try:
+        target = duck.load(target_dataset_id)
+        if start or end:
+            start_ts = _window_bound_timestamp(start, is_end=False)
+            end_ts = _window_bound_timestamp(end, is_end=True)
+            if start_ts is not None and end_ts is not None:
+                secondary = duck.load_range(secondary_dataset_id, start_ts, end_ts)
+            else:
+                secondary = duck.load(secondary_dataset_id)
+                if start_ts is not None:
+                    secondary = secondary.loc[secondary.index >= start_ts]
+                if end_ts is not None:
+                    secondary = secondary.loc[secondary.index <= end_ts]
         else:
             secondary = duck.load(secondary_dataset_id)
-            if start_ts is not None:
-                secondary = secondary.loc[secondary.index >= start_ts]
-            if end_ts is not None:
-                secondary = secondary.loc[secondary.index <= end_ts]
-    else:
-        secondary = duck.load(secondary_dataset_id)
-    if secondary.empty:
-        raise ValueError("Secondary dataset did not provide any rows for the requested gap-fill window.")
-    missing_only = secondary.loc[~secondary.index.isin(target.index)]
-    final_frame = pd.concat([target, missing_only], axis=0)
-    final_frame = final_frame[~final_frame.index.duplicated(keep="first")]
-    final_frame = final_frame.sort_index()
-    parquet_path = duck.write_parquet(target_dataset_id, final_frame.reset_index())
-    quality_snapshot = compute_and_store_quality_snapshot(
-        target_dataset_id,
-        resolution=resolution,
-        store=duck,
-    )
-    return IngestedDatasetArtifact(
-        dataset_id=str(target_dataset_id),
-        csv_path=str(duck.dataset_path(secondary_dataset_id)),
-        parquet_path=str(parquet_path),
-        start=final_frame.index.min().isoformat(),
-        end=final_frame.index.max().isoformat(),
-        bar_count=int(len(final_frame)),
-        quality_snapshot=quality_snapshot,
-    )
+        if secondary.empty:
+            raise ValueError("Secondary dataset did not provide any rows for the requested gap-fill window.")
+        missing_only = secondary.loc[~secondary.index.isin(target.index)]
+        final_frame = pd.concat([target, missing_only], axis=0)
+        final_frame = final_frame[~final_frame.index.duplicated(keep="first")]
+        final_frame = final_frame.sort_index()
+        parquet_path = duck.write_parquet(target_dataset_id, final_frame)
+        quality_snapshot = compute_and_store_quality_snapshot(
+            target_dataset_id,
+            resolution=resolution,
+            store=duck,
+        )
+        return IngestedDatasetArtifact(
+            dataset_id=str(target_dataset_id),
+            csv_path=str(duck.dataset_path(secondary_dataset_id)),
+            parquet_path=str(parquet_path),
+            start=final_frame.index.min().isoformat(),
+            end=final_frame.index.max().isoformat(),
+            bar_count=int(len(final_frame)),
+            quality_snapshot=quality_snapshot,
+        )
+    finally:
+        if owns_store:
+            duck.close()

@@ -106,11 +106,30 @@ Confirmed capabilities:
 
 - long-lived single-instance viewer process
 - local IPC for repeated open requests
+- buffered length-prefixed IPC for large live-update payloads, with legacy newline fallback
 - snapshot viewing
 - seeded live sessions
 - incremental live updates for bars, overlays, panes, equity, and trade markers
+- native-parent embedded chart windows for dashboard tabs
+- live-session series replacement for interactive indicator selection
+- live-session bar replacement and seed reload for ticker/timeframe/lookback changes
+- close/release commands for removing hosted chart sessions
+- embedded resize IPC for hosted chart surfaces
+- date/time x-axis labels on the lowest visible pane, including price-only market charts
+- robust timestamp display for epoch seconds, milliseconds, microseconds, or nanoseconds
+- horizontal chart pan plus vertical price-range recentering by drag
+- lower-pane crosshair value tags for indicator and equity panes
+- equity-pane scaling based on plotted equity/benchmark series, with `drawdown` excluded from the shared equity y-axis
 
 These are described in [README.md](/home/ethan/Magellan/charting_engine/README.md#L7) and implemented from [main.cpp](/home/ethan/Magellan/charting_engine/src/app/main.cpp#L61).
+
+## Snapshot Producer Requirements From Viewer Testing
+
+Recent viewer testing against real snapshots showed two producer-side requirements.
+
+First, every `ts_utc_ns` column should be written as UTC Unix epoch nanoseconds. Some generated snapshots currently contain microsecond values in `price_bars.feather`, `overlays.feather`, `panes.feather`, and `equity.feather`, while `trades.feather` contains nanoseconds. Magellan now infers units defensively for display, but this project should normalize all snapshot timestamp columns to nanoseconds.
+
+Second, the equity pane can only draw benchmark or buy-and-hold lines if this project writes those series. Current snapshots provide `equity` and `drawdown`. Magellan draws `equity` and skips `drawdown` on the shared equity y-axis so the account-equity curve scales correctly. To display a green buy-and-hold line, write an aligned `buy_hold_equity` or `benchmark_equity` column to `equity.feather` and style it in `manifest.json`.
 
 ## Viewer Process Model
 
@@ -249,6 +268,12 @@ Magellan currently supports these commands:
 - `open_snapshot`
 - `open_live`
 - `live_update`
+- `replace_series`
+- `replace_bars`
+- `reload_live_seed`
+- `resize_embedded`
+- `close_session`
+- `release_session`
 
 Defined in:
 
@@ -424,6 +449,233 @@ Action:
 - open or attach to a live session
 - overlay live fills, positions, and equity
 
+### `Charts`
+
+Action:
+
+- select a ticker from the Python UI watchlist
+- seed a market live session from local historical bars plus separately stored live bars
+- stream Interactive Brokers real-time bar updates into Magellan
+- show user-selected indicator series supplied by this project
+- support chart timeframes derived from the stored 1-minute live feed, including 1m, 5m, 15m, 1h, 4h, and 1d
+- auto-subscribe the Python watchlist to Interactive Brokers live bars and show price plus regular-session percent change
+
+The first Python-side implementation keeps the live data in `data/live_market.sqlite`, not in the historical DuckDB/Parquet store. Historical bars can seed a chart, but IB real-time bars are persisted separately so bad live ticks or provider outages cannot contaminate research datasets.
+
+Interactive Brokers should be the first live provider for this tab. The live adapter should use `reqRealTimeBars` with `useRTH=false`, aggregate the 5-second IB bars into upserted 1-minute bars, and store each completed/current minute in the live store. Massive and Alpaca should be added later behind the same live-store/provider boundary.
+
+When the user clicks a watchlist ticker with stale or missing live data, the UI should request a fresh live update first, then open or refresh the Magellan live session. If the local historical dataset is stale, the UI should start the live stream immediately and also request an Interactive Brokers historical gap fill into the separate live-market store. If live refresh or gap sync fails, the UI may still open a historical seed chart while clearly surfacing the live-data error.
+
+## Embedded Chart Contract
+
+Magellan now supports a native-parent embedded mode for the Python dashboard `Charts` tab.
+
+The Python Qt UI should create a native host widget/window and pass its platform window id to Magellan:
+
+```bash
+magellan_chart_viewer \
+  --embed-parent <native_window_id> \
+  --embed-width <width_px> \
+  --embed-height <height_px> \
+  --live-session <session_id> \
+  --snapshot /path/to/seed_snapshot
+```
+
+Static snapshots can also be embedded:
+
+```bash
+magellan_chart_viewer \
+  --embed-parent <native_window_id> \
+  --embed-width <width_px> \
+  --embed-height <height_px> \
+  --snapshot /path/to/snapshot_dir
+```
+
+The equivalent IPC fields are:
+
+```json
+{
+  "type": "open_live",
+  "session_id": "charts:AAPL:1m",
+  "snapshot_path": "/path/to/seed_snapshot",
+  "embed_parent_id": "12345678",
+  "embed_width": 1180,
+  "embed_height": 680
+}
+```
+
+Ownership rules:
+
+- Python owns the native host widget/window and decides when the tab exists.
+- Magellan owns the child chart window and its renderer.
+- Closing the Magellan chart releases the chart data for that surface.
+- If the Python host widget is destroyed, this project should close/reopen the Magellan session or terminate the owned viewer process as part of dashboard cleanup.
+
+Resize and focus behavior:
+
+- Python should pass the current host size when opening the embedded surface.
+- When the host widget resizes, Python should send `resize_embedded` for live sessions.
+- Focus uses normal native child-window focus; Magellan requests activation after attaching.
+
+Resize IPC example:
+
+```json
+{
+  "type": "resize_embedded",
+  "session_id": "charts:AAPL:1m",
+  "width": 1180,
+  "height": 680
+}
+```
+
+Failure handling:
+
+- If native-parent attachment fails, Magellan logs the failure and falls back to a top-level chart window instead of dropping the chart request.
+- The Python UI should still show an integration warning if it expected an embedded surface but sees no child chart.
+
+Surface model:
+
+- A live `session_id` maps to one Magellan chart surface.
+- Reusing the same `session_id` updates that surface in place.
+- Opening multiple strategy/ticker charts at once should use distinct session ids.
+- Switching one embedded chart in place should reuse the same session id and send `replace_bars`, `replace_series`, or `reload_live_seed`.
+- If a tab/strategy chart is removed, send `close_session` or `release_session` for that `session_id`.
+
+Seed reload example:
+
+```json
+{
+  "type": "reload_live_seed",
+  "session_id": "charts:AAPL:1m",
+  "snapshot_path": "/path/to/new_seed_snapshot",
+  "title": "AAPL 5m",
+  "status_text": "Reloaded 5m live seed."
+}
+```
+
+Close example:
+
+```json
+{
+  "type": "close_session",
+  "session_id": "charts:AAPL:1m"
+}
+```
+
+Implemented Magellan lifecycle additions:
+
+- `replace_bars` and `reload_live_seed` let the Python `Charts` tab change ticker, timeframe, or lookback inside one embedded surface without opening another child window.
+- `close_session`/`release_session` lets Python explicitly tear down a previous embedded live surface when it must open a new session id.
+- `open_live` still behaves as attach/create. Reusing a session id with a new seed should use `reload_live_seed` rather than overloading attach semantics.
+
+Platform note:
+
+- Magellan uses Qt's `QWindow::fromWinId` native-parent path.
+- On Linux, X11 should be the first validation target. Wayland/compositor behavior can vary and should be tested on the deployment machine.
+
+## Indicator Selection Contract
+
+Magellan now supports interactive indicator replacement for an existing live session.
+
+Use `live_update` for incremental points and new bars. Use `replace_series` when the user changes selected indicators and this project wants the chart to remove old indicators, clear lower panes, or replace a full group in place.
+
+Replacement IPC example:
+
+```json
+{
+  "type": "replace_series",
+  "session_id": "charts:AAPL:1m",
+  "replace_overlays": true,
+  "replace_panes": true,
+  "replace_equity": false,
+  "overlay_series": [
+    {
+      "name": "SMA 20",
+      "color": "#f5c542",
+      "points": [
+        {"timestamp_utc_ns": "1713551400000000000", "bar_index": 0, "value": 181.22}
+      ]
+    }
+  ],
+  "pane_series": []
+}
+```
+
+Rules:
+
+- `replace_overlays: true` replaces the full price-overlay series set with `overlay_series`.
+- `replace_panes: true` replaces the full lower-indicator series set with `pane_series`.
+- `replace_equity: true` replaces the full equity/benchmark series set with `equity_series`.
+- Clearing a group means sending the replace flag with an empty list.
+- Removing one selected indicator means recomputing the group and sending the full replacement list without that series.
+- Series style currently supports `name` and `color`; line width/style metadata can be added later if the UI needs it.
+
+## Bar And Seed Replacement Contract
+
+Use `replace_bars` when only the visible bar set changes and this project wants to keep the existing live session/window.
+
+```json
+{
+  "type": "replace_bars",
+  "session_id": "charts:AAPL:1m",
+  "replace_trade_markers": true,
+  "bars": [
+    {
+      "timestamp_utc_ns": "1713551400000000000",
+      "bar_index": 0,
+      "open": 181.10,
+      "high": 181.50,
+      "low": 180.90,
+      "close": 181.22,
+      "volume": 1200
+    }
+  ],
+  "trade_markers": []
+}
+```
+
+Rules:
+
+- `replace_bars` replaces the full in-memory price bar array for that session.
+- `replace_trade_markers: true` replaces trade markers with `trade_markers`; sending an empty list clears markers.
+- Existing overlays, lower-pane series, and equity series remain until this project sends `replace_series`.
+- For ticker, timeframe, or seed-lookback changes where a complete seed snapshot exists, prefer `reload_live_seed` because it replaces bars, overlays, panes, equity, and markers together.
+
+Python-side higher-timeframe live update rule:
+
+- For all live market timeframes, including aggregated chart timeframes (`5m`, `15m`, `1h`, `4h`, `1d`) and lookbacks longer than `5D`, this project sends `live_update` with the newest displayed bar plus incremental indicator points.
+- The Python dashboard keeps a per-session cursor for the last bar timestamp and Magellan bar index. If a live update belongs to the same aggregated bucket, it reuses the same `bar_index` so Magellan upserts the in-progress bar. If the bucket advances, the dashboard sends the next `bar_index`.
+- The live `bar_index` cursor is session-local and contiguous. It must not jump to the current backing-store row number after historical gap sync or rolling lookback changes, because sparse jumps create disconnected indicator/equity segments in Magellan.
+- `replace_bars` and `reload_live_seed` are reserved for explicit ticker, timeframe, lookback, or seed reload changes. They should not be sent for ordinary live ticks because Magellan intentionally refits the chart view after a full bar replacement.
+- Magellan should preserve `live_update` upsert semantics by `bar_index`; that is what prevents duplicate higher-timeframe bars while avoiding the viewport recentering caused by full replacements.
+- The Python dashboard labels aggregated live bars by bar start time, matching the 1-minute source timestamps. It should not use right-edge labels for `5m`/`15m`/`1h` bars because that makes live charts appear one bucket ahead.
+- Historical gap sync should use minute-level freshness checks, not the selected display timeframe. A 15-minute chart can still be missing 1-minute source bars, and those gaps need to be backfilled before resampling.
+- IPC live-update timestamps should be sent as decimal strings, not JSON numbers. Nanosecond epoch values exceed JavaScript/Qt JSON's exact integer range, and sending them as strings preserves x-axis/crosshair date labels for newly appended bars.
+- Strategy indicator colors are owned by this project. Live Monitor uses the same snapshot/update style map for full seeds and incremental points; `Z-Score` is purple (`#a28bff`) and should not be recolored by Magellan during live updates.
+
+IPC transport rule:
+
+- Magellan's own sender now writes length-prefixed frames, so large JSON payloads are not split by `readAll()`.
+- The Python client should either send the same `MAGELLAN_IPC_V1 <byte_count>\n<payload>` frame format or send compact one-line JSON terminated by `\n`.
+- Avoid pretty-printed multi-line legacy JSON; use framed IPC for large or formatted payloads.
+- During dashboard development, the Python client defaults to compact one-line JSON. This prevents an already-running older Magellan process from treating `MAGELLAN_IPC_V1 ...` as a snapshot path and opening bogus blank windows. Set `MAGELLAN_IPC_FRAMED=1` only after confirming the running Magellan viewer binary has been rebuilt and restarted with framed IPC support.
+
+## Live Market Time Axis
+
+Magellan now renders x-axis date/time labels and the crosshair time tag on the lowest visible pane. If a market live session has no lower-pane indicators and no equity series, the price pane shows the time axis directly. If indicators exist but equity does not, the indicator pane becomes the bottom time-axis pane.
+
+If live charts still show empty "Indicator Pane" or "Equity Pane" regions when `paneSeriesCount == 0` and `equitySeriesCount == 0`, the dashboard is almost certainly connected to an older Magellan process. Fully terminate the existing `MagellanChartViewer` process and relaunch the dashboard so the rebuilt viewer binary owns the IPC server.
+
+## IBKR Session Idle Handling
+
+Interactive Brokers `reqRealTimeBars` can go quiet for US equities after the extended session closes, roughly after 8:00 PM America/New_York until premarket activity resumes. The dashboard should treat that as an idle/stale stream state, keep the last chart seed visible, mark quotes stale, and avoid doing SQLite writes outside guarded worker error handling. A stopped or idle IBKR stream must not crash the Qt process.
+
+Live Monitor deployment charts should run the same historical-gap repair as the Charts tab. On chart open, start the real-time stream immediately, request the missing 1-minute IBKR historical window into the separate live-market SQLite store, and reload the existing Magellan live session after the gap sync completes. Gap checks should ignore overnight/weekend closures outside the US equity extended-hours window (`04:00-20:00 America/New_York`) so the dashboard does not repeatedly chase non-trading minutes.
+
+Live Monitor must normalize any deployment dataset id or provider label into the tradable ticker before sending requests to Interactive Brokers. For example, `TQQQ_interactive_brokers_10y_1m` is a local dataset id, while `TQQQ` is the IB contract symbol. Sending the dataset id to IB produces error 200, "No security definition has been found for the request."
+
+The live-market SQLite store uses WAL mode, busy timeouts, transient-lock retry, and batched historical-sync writes. A temporary SQLite writer lock should surface as a busy/retry status at most; it must not stop the Live Monitor chart stream.
+
 ## Python-Side Integration Layer
 
 This repo should add a small Magellan client/launcher layer rather than scattering subprocess and IPC logic across the UI.
@@ -447,8 +699,15 @@ Recommended functions:
 
 - `ensure_viewer_running()`
 - `open_snapshot(snapshot_path)`
+- `open_embedded_snapshot(snapshot_path, parent_window_id, width, height)`
 - `open_live_session(session_id, snapshot_path=None, title=None, subtitle=None, status_text=None)`
+- `open_embedded_live_session(session_id, parent_window_id, width, height, snapshot_path=None, title=None, subtitle=None, status_text=None)`
 - `send_live_update(session_id, bars=None, overlay_series=None, pane_series=None, equity_series=None, trade_markers=None)`
+- `replace_series(session_id, overlay_series=None, pane_series=None, equity_series=None, replace_overlays=False, replace_panes=False, replace_equity=False)`
+- `replace_bars(session_id, bars, trade_markers=None, replace_trade_markers=False, title=None, subtitle=None, status_text=None)`
+- `reload_live_seed(session_id, snapshot_path, title=None, subtitle=None, status_text=None)`
+- `resize_embedded(session_id, width, height)`
+- `close_session(session_id)`
 
 ## Configuration
 
@@ -487,14 +746,18 @@ Recommended defaults:
 1. Add a Python-side Magellan launcher/client wrapper.
 2. Add background prelaunch on UI startup.
 3. Add static snapshot open from backtest and runs views.
-4. Add a market live-session path for ticker charts with historical seed plus live updates.
-5. Add paper-session live updates.
-6. Add live-deployment session updates.
-7. Add richer status metadata and reconnect behavior later.
+4. Add embedded live-session open for the `Charts` tab using a native host widget id.
+5. Add embedded resize handling from the host widget resize event.
+6. Add `replace_series` calls when indicator checkboxes/selections change.
+7. Add `replace_bars` or `reload_live_seed` for ticker/timeframe/lookback changes.
+8. Add `close_session` when embedded tabs or strategy monitors are removed.
+9. Add a market live-session path for ticker charts with historical seed plus live updates.
+10. Add paper-session live updates.
+11. Add live-deployment session updates.
+12. Add richer status metadata and reconnect behavior later.
 
 ## Non-Goals for the First Integration Pass
 
-- embedding Magellan directly inside the Python UI
 - making Magellan responsible for strategy logic
 - making Magellan fetch market data directly
 - coupling Magellan to the backtest engine internals
@@ -508,5 +771,9 @@ The right integration model is:
 - the desktop UI prelaunches Magellan when it starts
 - completed runs open through snapshot paths
 - market, paper, and live monitoring use seeded live sessions plus incremental IPC updates
+- the `Charts` tab can host Magellan through native-parent embedded windows
+- indicator changes use `replace_series` to update a live chart in place
+- ticker/timeframe/lookback changes use `replace_bars` or `reload_live_seed` to reuse an embedded surface
+- dashboard cleanup uses `close_session`/`release_session`
 
 This keeps the integration fast, clean, and aligned with how Magellan is already built.

@@ -396,6 +396,14 @@ class ExecutionOrchestrator:
                 "prevent_scale_in": request.config.prevent_scale_in,
                 "one_order_per_signal": request.config.one_order_per_signal,
                 "risk_free_rate": request.config.risk_free_rate,
+                "margin_enabled": request.config.margin_enabled,
+                "max_gross_leverage": request.config.max_gross_leverage,
+                "position_sizing_model": request.config.position_sizing_model,
+                "annual_vol_window": request.config.annual_vol_window,
+                "annual_vol_min_periods": request.config.annual_vol_min_periods,
+                "annual_vol_floor": request.config.annual_vol_floor,
+                "max_volatility_multiplier": request.config.max_volatility_multiplier,
+                "min_position_shares": request.config.min_position_shares,
             },
         }
         logical_run_id = request.logical_run_id or compute_portfolio_logical_run_id(
@@ -545,9 +553,11 @@ class ExecutionOrchestrator:
                 requested_mode=requested_mode,
                 resolved_mode=ExecutionMode.VECTORIZED,
                 fallback_reason=resolution.fallback_reason,
-                progress_cb=progress_cb,
+                progress_cb=None,
             )
             self._last_batch_benchmark = self._get_vectorized_engine().last_batch_benchmark
+            if progress_cb:
+                progress_cb(len(results), len(param_grid))
             return results
         results: List[ExecutionResult] = []
         workload = WorkloadType.from_value(workload_type)

@@ -441,7 +441,7 @@ The UI should separate workflows into clear tabs while reusing the same underlyi
 
 Recommended top-level tabs:
 
-- `Market`
+- `Charts`
 - `Universe Builder`
 - `Backtest`
 - `Optimization`
@@ -455,8 +455,10 @@ Recommended top-level tabs:
 Design rules:
 
 - Walk-forward optimization and Monte Carlo should be separate tabs.
-- The `Market` tab should let the user browse or search ticker symbols and open them in Magellan.
-- The `Market` tab should combine historical data with live updates and allow user-selected indicators on the chart.
+- The `Charts` tab should let the user browse, search, or click watchlist ticker symbols and open them in Magellan.
+- The `Charts` tab should combine historical data with separately stored live updates and allow user-selected indicators on the chart.
+- The `Charts` tab should derive higher chart timeframes from the separately stored 1-minute live bars and keep live bars out of canonical historical datasets.
+- The `Charts` watchlist should auto-subscribe to Interactive Brokers live bars for up to 100 symbols, showing last price and regular-session percent change with gain/loss coloring.
 - The `Universe Builder` tab should let the user create and manage named universes of assets.
 - A universe should be usable from download, scheduling, backtest, and portfolio flows without forcing the user to rebuild the same asset list repeatedly.
 - Single-asset backtests should remain easy to launch from the `Backtest` tab.
@@ -516,13 +518,13 @@ Portfolio rule:
 4. Update canonical dataset coverage, freshness, and failure metadata.
 5. Reuse the resulting datasets or universes in backtest and portfolio workflows.
 
-### Market Analysis
+### Charts Analysis
 
 1. Search for or click a ticker symbol.
 2. Open the ticker in Magellan.
-3. Load historical data for the selected timeframe.
-4. Continue updating the chart with live market data.
-5. Add or remove indicators from the chart workspace as needed.
+3. Load historical data for the selected timeframe and fill stale chart gaps into the separate live-market store when needed.
+4. Continue updating the chart with live market data stored outside the historical dataset store.
+5. Change timeframe, lookback, or indicators from the chart workspace and push the change to Magellan immediately when the viewer supports the required in-place command.
 
 ### Paper Testing
 

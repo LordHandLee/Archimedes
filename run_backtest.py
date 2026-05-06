@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -33,7 +34,7 @@ def main() -> None:
 
     catalog = ResultCatalog("backtests.sqlite")
     base_config = BacktestConfig(
-        timeframe="5T",
+        timeframe="5min",
         starting_cash=100_000,
         fee_rate=0.0002,
         fee_schedule={"buy": 0.0003, "sell": 0.0005},

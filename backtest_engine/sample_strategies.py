@@ -163,10 +163,21 @@ class SMACrossStrategy(Strategy):
         row = self.data.loc[timestamp]
         if pd.isna(row["fast"]) or pd.isna(row["slow"]):
             return
+        loc = self.data.index.get_loc(timestamp)
+        if isinstance(loc, slice) or isinstance(loc, np.ndarray):
+            loc = int(np.asarray(loc).nonzero()[0][-1]) if not isinstance(loc, slice) else int(loc.stop - 1)
+        if int(loc) <= 0:
+            return
+        prev = self.data.iloc[int(loc) - 1]
+        if pd.isna(prev["fast"]) or pd.isna(prev["slow"]):
+            return
 
-        if row["fast"] > row["slow"] and broker.position_qty <= 0:
+        crossed_above = row["fast"] > row["slow"] and prev["fast"] <= prev["slow"]
+        crossed_below = row["fast"] < row["slow"] and prev["fast"] >= prev["slow"]
+
+        if crossed_above and broker.position_qty <= 0:
             broker.target_percent(self.target, bar["close"])
-        elif row["fast"] < row["slow"] and broker.position_qty > 0:
+        elif crossed_below and broker.position_qty > 0:
             broker.target_percent(0.0, bar["close"])
 
 

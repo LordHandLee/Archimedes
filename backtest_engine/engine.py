@@ -8,6 +8,7 @@ from .broker import Broker, Trade
 from .catalog import ResultCatalog
 from .metrics import PerformanceMetrics, compute_metrics, sharpe_diagnostics
 from .run_ids import compute_logical_run_id
+from .sizing import position_sizing_multiplier
 from .strategy import Strategy
 
 
@@ -40,6 +41,14 @@ class BacktestConfig:
     sharpe_basis: str = "daily"
     risk_free_rate: float = 0.0
     vectorized_param_batch_size: int | None = None
+    margin_enabled: bool = False
+    max_gross_leverage: float = 1.0
+    position_sizing_model: str = "none"
+    annual_vol_window: int = 252
+    annual_vol_min_periods: int = 20
+    annual_vol_floor: float = 0.05
+    max_volatility_multiplier: float = 2.0
+    min_position_shares: float = 1.0
 
 
 @dataclass
@@ -170,6 +179,11 @@ class BacktestEngine:
             fill_ratio=self.config.fill_ratio,
             allow_short=self.config.allow_short,
             prevent_scale_in=self.config.prevent_scale_in,
+            margin_enabled=self.config.margin_enabled,
+            max_gross_leverage=self.config.max_gross_leverage,
+            position_sizing_model=self.config.position_sizing_model,
+            min_position_shares=self.config.min_position_shares,
+            sizing_multiplier_by_ts=position_sizing_multiplier(data, self.config),
         )
 
         if self.config.base_execution and self.base_data is not None:
@@ -191,6 +205,7 @@ class BacktestEngine:
                             {"open": price, "high": price, "low": price, "close": price, "volume": bar.get("volume", 0)},
                             name=timestamp,
                         )
+                        broker.current_timestamp = timestamp
                         strategy.on_bar(timestamp, step_bar, broker)
                         if self.config.one_order_per_signal:
                             self._prune_pending_orders(broker, broker.position_qty)
@@ -198,6 +213,7 @@ class BacktestEngine:
                         self._flush_with_recalc(strategy, broker, ts_step, step_bar)
                         broker.record_equity(ts_step, price)
                 else:
+                    broker.current_timestamp = timestamp
                     strategy.on_bar(timestamp, bar, broker)
                     if self.config.one_order_per_signal:
                         self._prune_pending_orders(broker, broker.position_qty)
@@ -336,11 +352,10 @@ class BacktestEngine:
 
     @staticmethod
     def _normalize_freq(tf: str) -> str:
-        """Convert user-friendly timeframe strings like '5 minutes' to pandas offsets like '5T'."""
+        """Convert user-friendly timeframe strings like '5 minutes' to pandas offsets like '5min'."""
         s = tf.strip().lower()
-        s = s.replace("minute", "min").replace("mins", "min")
-        s = s.replace("hour", "h")
-        # extract leading integer
+        s = s.replace("minutes", "min").replace("minute", "min").replace("mins", "min")
+        s = s.replace("hours", "h").replace("hour", "h").replace("hrs", "h")
         tokens = s.replace(" ", "")
         num = ""
         unit = ""
@@ -383,6 +398,7 @@ class BacktestEngine:
             return all_fills
         passes = 0
         while fills:
+            broker.current_timestamp = timestamp
             strategy.on_after_fill(timestamp, bar, broker)
             if passes >= max(int(self.config.max_recalc_passes), 0):
                 break
@@ -431,6 +447,7 @@ class BacktestEngine:
             while next_sig and next_sig[0] < ts:
                 sig_ts, sig_bar = next_sig
                 # print(sig_ts, ts, sig_ts == ts)
+                broker.current_timestamp = sig_ts
                 strategy.on_bar(sig_ts, sig_bar, broker)
                 if self.config.one_order_per_signal:
                     self._prune_pending_orders(broker, broker.position_qty)

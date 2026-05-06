@@ -32,7 +32,10 @@ def load_csv_prices(path: Path | str, timezone: str = "UTC") -> LoadedData:
 
     if "Local time" in df.columns:
         ts = pd.to_datetime(df["Local time"], dayfirst=True, errors="coerce")
-        ts = ts.dt.tz_localize("America/New_York")
+        if ts.dt.tz is None:
+            ts = ts.dt.tz_localize("America/New_York")
+        else:
+            ts = ts.dt.tz_convert("America/New_York")
     elif "timestamp" in df.columns:
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     else:

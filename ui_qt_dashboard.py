@@ -18,19 +18,29 @@ os.environ["OPENBLAS_NUM_THREADS"] = str(_CPU_THREADS)
 os.environ["OMP_NUM_THREADS"] = str(_CPU_THREADS)
 os.environ["VECLIB_MAXIMUM_THREADS"] = str(_CPU_THREADS)
 os.environ["NUMEXPR_MAX_THREADS"] = str(_CPU_THREADS)
+_MPL_CONFIG_DIR = os.path.abspath(os.path.join("data", ".matplotlib"))
+try:
+    os.makedirs(_MPL_CONFIG_DIR, exist_ok=True)
+except Exception:
+    pass
+os.environ.setdefault("MPLCONFIGDIR", _MPL_CONFIG_DIR)
 
 import json
 import time
+import urllib.error
 import urllib.request
+import queue
 import signal
 import re
 import sqlite3
+import threading
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
 
+import duckdb
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
@@ -44,6 +54,7 @@ from backtest_engine import (
     ALLOCATION_OWNERSHIP_PORTFOLIO,
     ALLOCATION_OWNERSHIP_STRATEGY,
     DEFAULT_ACQUISITION_PROVIDER,
+    COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER,
     BatchExecutionBenchmark,
     BacktestConfig,
     BacktestEngine,
@@ -99,10 +110,12 @@ from backtest_engine import (
     compute_and_store_quality_snapshot,
     compute_freshness_state,
     decide_acquisition_policy,
+    expand_acquisition_source,
     extract_walk_forward_trade_returns,
     gap_fill_dataset_from_secondary,
     ingest_csv_to_store,
     get_acquisition_provider,
+    is_composite_acquisition_provider,
     ibapi_install_command,
     interactive_brokers_api_status,
     interactive_brokers_head_timestamp_status,
@@ -137,6 +150,11 @@ from backtest_engine import (
 from backtest_engine.chart_snapshot import ChartSnapshotExporter
 from backtest_engine.magellan import MagellanClient, MagellanError
 from backtest_engine.optimization import compute_robust_score
+from backtest_engine.sizing import (
+    POSITION_SIZING_ANNUAL_VOLATILITY,
+    _annual_vol_rolling_lengths,
+    normalize_position_sizing_model,
+)
 from backtest_engine.acquisition import (
     clear_download_artifact_state,
     write_download_artifact_state,
@@ -161,6 +179,29 @@ from backtest_engine.asset_provider_ingestion import (
     simfin_install_hint,
     sync_defeatbeta_assets,
     sync_simfin_assets,
+)
+from backtest_engine.live_market import (
+    CHART_TIMEFRAME_OPTIONS,
+    DEFAULT_LIVE_MARKET_DB_PATH,
+    DEFAULT_LIVE_PROVIDER,
+    DEFAULT_STALE_QUOTE_SECONDS,
+    LIVE_BAR_TIMEFRAME,
+    MAX_WATCHLIST_STREAM_SYMBOLS,
+    InteractiveBrokersRealtimeBarApp,
+    InteractiveBrokersRealtimeConfig,
+    LiveMarketBar,
+    LiveMarketDataStore,
+    chart_timeframe_delta,
+    chart_timeframe_label,
+    chart_timeframe_to_pandas_rule,
+    compute_chart_indicators,
+    incremental_series_payload,
+    latest_point_series_payload,
+    normalize_chart_timeframe,
+    resample_ohlcv,
+    series_replacement_payload,
+    sqlite_error_is_locked,
+    wait_for_realtime_bar_samples,
 )
 from backtest_engine.reporting import plot_param_heatmap
 from backtest_engine.sample_strategies import compute_zscore_mean_reversion_features
@@ -188,11 +229,107 @@ EXPECTED_2Y_1M_EQUITY_ROWS = int(2 * 252 * 16 * 60)
 SCHEDULER_SCRIPT = Path("scripts") / "scheduler_service.py"
 DOWNLOAD_LOG_DIR = Path("data") / "download_logs"
 ACTIVE_DOWNLOAD_SESSION_PATH = Path("data") / "active_download_session.json"
+LIVE_MONITOR_MIN_SEED_BARS = 2
+MAGELLAN_LIVE_UPDATE_TIMEOUT_MS = 100
+LIVE_MONITOR_PREVIEW_UPDATE_MIN_INTERVAL_SECONDS = 5.0
+CHARTS_PREVIEW_REDRAW_MIN_INTERVAL_SECONDS = 5.0
+IB_CLIENT_OFFSET_LIVE_MONITOR = 4000
+IB_CLIENT_OFFSET_LIVE_MONITOR_SYNC = 5000
+IB_CLIENT_OFFSET_LIVE_DEPLOYMENT = 6000
 STUDY_MODE_INDEPENDENT = "independent"
 STUDY_MODE_PORTFOLIO = "portfolio"
+HORIZON_MODE_DYNAMIC = "dynamic"
+HORIZON_MODE_DATE_RANGE = "date_range"
 PORTFOLIO_ALLOC_EQUAL = "equal"
 PORTFOLIO_ALLOC_RELATIVE = "relative"
 PORTFOLIO_ALLOC_FIXED = "fixed"
+DEFEATBETA_DATA_DIR = Path("defeatbeta")
+DEFEATBETA_API_DIR = DEFEATBETA_DATA_DIR / "defeatbeta-api-main"
+MASTER_ASSET_INFORMATION_DB_PATH = Path("data") / "master_asset_information.sqlite"
+MASTER_ASSET_INFORMATION_CACHE_VERSION = 1
+ASSET_INFORMATION_DEFAULT_PAGE_SIZE = 250
+ASSET_INFORMATION_STARTUP_LIMIT = 50000
+ASSET_INFORMATION_ALPHA_ALL = ""
+ASSET_INFORMATION_ALPHA_NUMERIC = "0-9"
+ASSET_CLASS_OVERRIDES = {
+    "AGQ": ("ETFs", "ETF"),
+}
+
+
+def _parse_horizon_timedelta(value: object) -> pd.Timedelta:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Horizon is empty.")
+    normalized = re.sub(r"\s+", "", text.lower())
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([a-z]+)", normalized)
+    if match:
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit in {"y", "yr", "yrs", "year", "years"}:
+            return pd.Timedelta(days=amount * 365)
+        if unit in {"mo", "mon", "mons", "month", "months"}:
+            return pd.Timedelta(days=amount * 30.4375)
+        if unit in {"w", "wk", "wks", "week", "weeks"}:
+            return pd.Timedelta(weeks=amount)
+        if unit in {"d", "day", "days"}:
+            return pd.Timedelta(days=amount)
+        if unit in {"h", "hr", "hrs", "hour", "hours"}:
+            return pd.Timedelta(hours=amount)
+        if unit in {"m", "min", "mins", "minute", "minutes"}:
+            return pd.Timedelta(minutes=amount)
+        if unit in {"s", "sec", "secs", "second", "seconds"}:
+            return pd.Timedelta(seconds=amount)
+        raise ValueError(f"Unsupported horizon unit: {unit}")
+    raise ValueError(f"Unsupported horizon value: {text}")
+
+
+def _format_coverage_date(value: object) -> str:
+    try:
+        stamp = pd.to_datetime(value, utc=True, errors="coerce")
+    except Exception:
+        stamp = pd.NaT
+    if pd.isna(stamp):
+        return ""
+    return stamp.strftime("%Y-%m-%d")
+
+
+def _backtest_sizing_kwargs(settings: dict | None) -> dict:
+    settings = settings or {}
+
+    def _float(name: str, default: float) -> float:
+        try:
+            return float(settings.get(name, default))
+        except Exception:
+            return default
+
+    def _int(name: str, default: int) -> int:
+        try:
+            return int(float(settings.get(name, default)))
+        except Exception:
+            return default
+
+    return {
+        "margin_enabled": bool(settings.get("margin_enabled", False)),
+        "max_gross_leverage": max(1.0, _float("max_gross_leverage", 1.0)),
+        "position_sizing_model": str(settings.get("position_sizing_model", "none") or "none"),
+        "annual_vol_window": max(2, _int("annual_vol_window", 252)),
+        "annual_vol_min_periods": max(2, _int("annual_vol_min_periods", 20)),
+        "annual_vol_floor": max(1e-9, _float("annual_vol_floor", 0.05)),
+        "max_volatility_multiplier": max(0.0, _float("max_volatility_multiplier", 2.0)),
+        "min_position_shares": max(0.0, _float("min_position_shares", 1.0)),
+    }
+
+
+DEPLOYMENT_EXECUTION_CONFIG_KEYS = {
+    "margin_enabled",
+    "max_gross_leverage",
+    "position_sizing_model",
+    "annual_vol_window",
+    "annual_vol_min_periods",
+    "annual_vol_floor",
+    "max_volatility_multiplier",
+    "min_position_shares",
+}
 
 
 def _safe_inspect_dataset_quality(dataset_id: str, resolution: str) -> dict:
@@ -435,6 +572,24 @@ def load_stylesheet() -> str:
     }}
     QPushButton:hover {{
         border-color: {PALETTE['blue']};
+    }}
+    QToolButton {{
+        background: rgba(0,0,0,.22);
+        color: {PALETTE['text']};
+        border: 1px solid rgba(231, 238, 252, 0.55);
+        border-radius: 6px;
+        padding: 4px 8px;
+        min-height: 20px;
+    }}
+    QToolButton:hover {{
+        border-color: {PALETTE['blue']};
+        background: rgba(77,163,255,.12);
+    }}
+    QToolButton:checked {{
+        background: {PALETTE['blue']};
+        color: {PALETTE['bg']};
+        border-color: {PALETTE['blue']};
+        font-weight: 700;
     }}
     QTableView, QTableWidget {{
         background-color: {PALETTE['panel2']};
@@ -693,19 +848,13 @@ class CatalogReader:
             )
         return result
 
-    def load_batches(self) -> List[BatchRow]:
-        if not self.db_path.exists():
-            return []
-        with sqlite3.connect(self.db_path) as conn:
-            batch_rows = conn.execute(
-                """
-                SELECT batch_id,strategy,dataset_id,params,timeframes,horizons,run_total,status,started_at,finished_at
-                FROM batches ORDER BY created_at DESC
-                """
-            ).fetchall()
-        runs = self.load_runs()
+    def _build_batches_from_rows(
+        self,
+        batch_rows: Sequence[tuple],
+        runs: Sequence[RunRow],
+    ) -> List[BatchRow]:
         runs_by_batch: Dict[str, List[RunRow]] = {}
-        for r in runs:
+        for r in list(runs):
             runs_by_batch.setdefault(r.batch_id or "ad-hoc", []).append(r)
         batches: List[BatchRow] = []
         for b in batch_rows:
@@ -751,6 +900,19 @@ class CatalogReader:
                 )
             )
         return batches
+
+    def load_batches(self, runs: Sequence[RunRow] | None = None) -> List[BatchRow]:
+        if not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            batch_rows = conn.execute(
+                """
+                SELECT batch_id,strategy,dataset_id,params,timeframes,horizons,run_total,status,started_at,finished_at
+                FROM batches ORDER BY created_at DESC
+                """
+            ).fetchall()
+        resolved_runs = list(runs) if runs is not None else self.load_runs()
+        return self._build_batches_from_rows(batch_rows, resolved_runs)
 
     def load_batch_benchmarks(self, batch_id: str) -> tuple[BatchExecutionBenchmark, ...]:
         if not batch_id:
@@ -1094,6 +1256,7 @@ class CatalogReader:
                     "db_path",
                     "log_db_path",
                     "secret_ref",
+                    "secret_value",
                     "is_active",
                     "created_at",
                     "updated_at",
@@ -1116,6 +1279,7 @@ class CatalogReader:
                     "db_path": row.db_path,
                     "log_db_path": row.log_db_path,
                     "secret_ref": row.secret_ref,
+                    "secret_value": row.secret_value,
                     "is_active": row.is_active,
                     "created_at": row.created_at,
                     "updated_at": row.updated_at,
@@ -1326,6 +1490,9 @@ class CatalogReader:
     def save_deployment(self, **kwargs) -> str:
         return ResultCatalog(self.db_path).save_deployment(**kwargs)
 
+    def delete_deployment(self, deployment_id: str) -> int:
+        return ResultCatalog(self.db_path).delete_deployment(deployment_id)
+
     def save_deployment_child_link(self, **kwargs) -> None:
         ResultCatalog(self.db_path).save_deployment_child_link(**kwargs)
 
@@ -1445,43 +1612,100 @@ class CatalogReader:
     def bootstrap_asset_catalog(self) -> int:
         return self._result_catalog.bootstrap_assets_from_acquisition_datasets()
 
-    def load_asset_catalog(self, *, bootstrap_from_acquisition: bool = True) -> pd.DataFrame:
+    @staticmethod
+    def _asset_catalog_columns() -> list[str]:
+        return [
+            "asset_id",
+            "symbol",
+            "display_symbol",
+            "name",
+            "asset_class",
+            "security_type",
+            "exchange",
+            "country",
+            "currency",
+            "sector",
+            "industry",
+            "dataset_status",
+            "dataset_count",
+            "successful_dataset_count",
+            "latest_dataset_id",
+            "latest_source",
+            "latest_download_at",
+            "latest_success_at",
+            "latest_failure_at",
+            "latest_failure_reason",
+            "coverage_start",
+            "coverage_end",
+            "freshness_status",
+            "first_seen_at",
+            "last_seen_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    @staticmethod
+    def _asset_catalog_select_sql(where_clause: str = "") -> str:
+        where_sql = f"\n                    WHERE {where_clause}" if str(where_clause or "").strip() else ""
+        return f"""
+                    SELECT
+                        m.asset_id,
+                        m.symbol,
+                        m.display_symbol,
+                        m.name,
+                        m.asset_class,
+                        m.security_type,
+                        COALESCE(c.exchange, m.exchange) AS exchange,
+                        COALESCE(c.country, m.country) AS country,
+                        m.currency,
+                        c.sector,
+                        c.industry,
+                        s.dataset_status,
+                        COALESCE(s.dataset_count, 0) AS dataset_count,
+                        COALESCE(s.successful_dataset_count, 0) AS successful_dataset_count,
+                        s.latest_dataset_id,
+                        s.latest_source,
+                        s.latest_download_at,
+                        s.latest_success_at,
+                        s.latest_failure_at,
+                        s.latest_failure_reason,
+                        s.coverage_start,
+                        s.coverage_end,
+                        s.freshness_status,
+                        m.first_seen_at,
+                        m.last_seen_at,
+                        m.created_at,
+                        COALESCE(s.updated_at, m.updated_at) AS updated_at
+                    FROM asset_master m
+                    LEFT JOIN asset_classifications c ON c.asset_id = m.asset_id
+                    LEFT JOIN asset_status s ON s.asset_id = m.asset_id{where_sql}
+                    ORDER BY LOWER(COALESCE(m.symbol, '')) ASC, LOWER(COALESCE(m.name, '')) ASC
+                """
+
+    def load_asset_catalog(
+        self,
+        *,
+        bootstrap_from_acquisition: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> pd.DataFrame:
         rc = self._result_catalog
         if bootstrap_from_acquisition:
             rc.bootstrap_assets_from_acquisition_datasets()
+        if limit is not None:
+            if not self.db_path.exists():
+                return pd.DataFrame(columns=self._asset_catalog_columns())
+            bounded_limit = max(1, int(limit))
+            bounded_offset = max(0, int(offset))
+            with sqlite3.connect(self.db_path) as conn:
+                return pd.read_sql_query(
+                    self._asset_catalog_select_sql() + "\n                    LIMIT ? OFFSET ?",
+                    conn,
+                    params=(bounded_limit, bounded_offset),
+                )
         rows = rc.load_asset_catalog()
         if not rows:
-            return pd.DataFrame(
-                columns=[
-                    "asset_id",
-                    "symbol",
-                    "display_symbol",
-                    "name",
-                    "asset_class",
-                    "security_type",
-                    "exchange",
-                    "country",
-                    "currency",
-                    "sector",
-                    "industry",
-                    "dataset_status",
-                    "dataset_count",
-                    "successful_dataset_count",
-                    "latest_dataset_id",
-                    "latest_source",
-                    "latest_download_at",
-                    "latest_success_at",
-                    "latest_failure_at",
-                    "latest_failure_reason",
-                    "coverage_start",
-                    "coverage_end",
-                    "freshness_status",
-                    "first_seen_at",
-                    "last_seen_at",
-                    "created_at",
-                    "updated_at",
-                ]
-            )
+            return pd.DataFrame(columns=self._asset_catalog_columns())
         return pd.DataFrame(
             [
                 {
@@ -1517,6 +1741,48 @@ class CatalogReader:
             ]
         )
 
+    def load_asset_catalog_for_symbols(self, symbols: Sequence[str]) -> pd.DataFrame:
+        cleaned = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in list(symbols or [])
+                if str(symbol).strip()
+            )
+        )
+        if not cleaned or not self.db_path.exists():
+            return pd.DataFrame(columns=self._asset_catalog_columns())
+        frames: list[pd.DataFrame] = []
+        with sqlite3.connect(self.db_path) as conn:
+            for start in range(0, len(cleaned), 800):
+                chunk = cleaned[start : start + 800]
+                placeholders = ", ".join("?" for _ in chunk)
+                frames.append(
+                    pd.read_sql_query(
+                        self._asset_catalog_select_sql(f"m.symbol IN ({placeholders})"),
+                        conn,
+                        params=tuple(chunk),
+                    )
+                )
+        if not frames:
+            return pd.DataFrame(columns=self._asset_catalog_columns())
+        return pd.concat(frames, ignore_index=True, sort=False).drop_duplicates("asset_id", keep="first")
+
+    def load_asset_catalog_by_alpha(self, alpha_filter: str) -> pd.DataFrame:
+        selected = str(alpha_filter or "").strip().upper()
+        if not selected or not self.db_path.exists():
+            return pd.DataFrame(columns=self._asset_catalog_columns())
+        first_char = "SUBSTR(UPPER(TRIM(COALESCE(NULLIF(m.display_symbol, ''), NULLIF(m.symbol, ''), NULLIF(m.name, ''), ''))), 1, 1)"
+        if selected == ASSET_INFORMATION_ALPHA_NUMERIC:
+            where_clause = f"{first_char} GLOB '[0-9]'"
+            params: tuple[object, ...] = ()
+        elif re.fullmatch(r"[A-Z]", selected):
+            where_clause = f"{first_char} = ?"
+            params = (selected,)
+        else:
+            return pd.DataFrame(columns=self._asset_catalog_columns())
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query(self._asset_catalog_select_sql(where_clause), conn, params=params)
+
     def load_asset_identifiers(self, asset_id: str) -> dict[str, str]:
         return self._result_catalog.load_asset_identifiers(asset_id)
 
@@ -1547,6 +1813,12 @@ class CatalogReader:
     def load_asset_provider_payload_summary(self, asset_id: str) -> list[dict[str, object]]:
         return self._result_catalog.load_asset_provider_payload_summary(asset_id)
 
+    def load_asset_provider_sync_events(self, asset_id: str, *, limit: int = 10) -> list[dict[str, object]]:
+        return self._result_catalog.load_asset_provider_sync_events(asset_id, limit=limit)
+
+    def save_asset_provider_sync_event(self, **kwargs) -> str:
+        return self._result_catalog.save_asset_provider_sync_event(**kwargs)
+
     def load_asset_screener_enrichment(self) -> pd.DataFrame:
         if not self.db_path.exists():
             return pd.DataFrame(
@@ -1573,32 +1845,6 @@ class CatalogReader:
         with sqlite3.connect(self.db_path) as conn:
             return pd.read_sql_query(
                 """
-                WITH provider_counts AS (
-                    SELECT
-                        asset_id,
-                        COUNT(*) AS provider_payload_count,
-                        SUM(CASE WHEN LOWER(provider)='simfin' THEN 1 ELSE 0 END) AS simfin_payload_count,
-                        SUM(CASE WHEN LOWER(provider)='defeatbeta' THEN 1 ELSE 0 END) AS defeatbeta_payload_count,
-                        MAX(COALESCE(fetched_at, created_at)) AS provider_last_sync_at
-                    FROM provider_raw_payloads
-                    GROUP BY asset_id
-                ),
-                earnings_counts AS (
-                    SELECT
-                        asset_id,
-                        COUNT(*) AS defeatbeta_earnings_count,
-                        MAX(report_date) AS latest_earnings_date
-                    FROM defeatbeta_earnings_calendars
-                    GROUP BY asset_id
-                ),
-                news_counts AS (
-                    SELECT
-                        asset_id,
-                        COUNT(*) AS defeatbeta_news_count,
-                        MAX(report_date) AS latest_news_date
-                    FROM defeatbeta_news_articles
-                    GROUP BY asset_id
-                )
                 SELECT
                     p.asset_id,
                     p.market_cap,
@@ -1609,18 +1855,15 @@ class CatalogReader:
                     p.employee_count,
                     p.source AS profile_source,
                     p.as_of_date AS profile_as_of_date,
-                    COALESCE(pc.provider_payload_count, 0) AS provider_payload_count,
-                    COALESCE(pc.simfin_payload_count, 0) AS simfin_payload_count,
-                    COALESCE(pc.defeatbeta_payload_count, 0) AS defeatbeta_payload_count,
-                    COALESCE(ec.defeatbeta_earnings_count, 0) AS defeatbeta_earnings_count,
-                    COALESCE(nc.defeatbeta_news_count, 0) AS defeatbeta_news_count,
-                    pc.provider_last_sync_at,
-                    ec.latest_earnings_date,
-                    nc.latest_news_date
+                    0 AS provider_payload_count,
+                    0 AS simfin_payload_count,
+                    0 AS defeatbeta_payload_count,
+                    0 AS defeatbeta_earnings_count,
+                    0 AS defeatbeta_news_count,
+                    NULL AS provider_last_sync_at,
+                    NULL AS latest_earnings_date,
+                    NULL AS latest_news_date
                 FROM asset_profiles p
-                LEFT JOIN provider_counts pc ON pc.asset_id = p.asset_id
-                LEFT JOIN earnings_counts ec ON ec.asset_id = p.asset_id
-                LEFT JOIN news_counts nc ON nc.asset_id = p.asset_id
                 ORDER BY p.asset_id ASC
                 """,
                 conn,
@@ -1976,6 +2219,841 @@ class CatalogReader:
         ResultCatalog(self.db_path)
 
 
+class DefeatBetaLocalReader:
+    """Read-only access to the local defeatbeta parquet dataset.
+
+    The dashboard deliberately keeps these records outside backtests.sqlite. This reader mirrors the
+    defeatbeta API's DuckDB-backed access pattern while pointing DuckDB at the local parquet files.
+    """
+
+    ENRICHMENT_COLUMNS = [
+        "symbol",
+        "market_cap",
+        "shares_outstanding",
+        "beta",
+        "description",
+        "website",
+        "employee_count",
+        "profile_source",
+        "profile_as_of_date",
+        "provider_payload_count",
+        "defeatbeta_payload_count",
+        "defeatbeta_earnings_count",
+        "defeatbeta_news_count",
+        "latest_earnings_date",
+        "latest_news_date",
+        "sector_defeatbeta",
+        "industry_defeatbeta",
+        "country_defeatbeta",
+    ]
+
+    def __init__(self, data_dir: Path | str = DEFEATBETA_DATA_DIR) -> None:
+        self.data_dir = Path(data_dir)
+
+    def available(self) -> bool:
+        return (self.data_dir / "stock_profile.parquet").exists()
+
+    def _file(self, table_name: str) -> Path:
+        return self.data_dir / f"{table_name}.parquet"
+
+    def _table(self, table_name: str) -> str | None:
+        path = self._file(table_name)
+        if not path.exists():
+            return None
+        sql_path = str(path).replace("'", "''")
+        return f"read_parquet('{sql_path}')"
+
+    @staticmethod
+    def _symbols(symbols: Sequence[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                [
+                    str(symbol).strip().upper()
+                    for symbol in list(symbols or [])
+                    if str(symbol).strip()
+                ]
+            )
+        )
+
+    @staticmethod
+    def _safe_query(con: duckdb.DuckDBPyConnection, sql: str) -> pd.DataFrame:
+        try:
+            return con.execute(sql).df()
+        except Exception:
+            return pd.DataFrame()
+
+    def _open_with_symbols(self, symbols: Sequence[str]) -> tuple[duckdb.DuckDBPyConnection, list[str]]:
+        cleaned = self._symbols(symbols)
+        con = duckdb.connect(":memory:")
+        con.register("requested_symbols", pd.DataFrame({"symbol": pd.Series(cleaned, dtype=object)}))
+        return con, cleaned
+
+    @staticmethod
+    def _merge_part(base: pd.DataFrame, part: pd.DataFrame) -> pd.DataFrame:
+        if part.empty or "symbol" not in part.columns:
+            return base
+        part = part.copy()
+        part["symbol"] = part["symbol"].fillna("").astype(str).str.upper()
+        return base.merge(part, on="symbol", how="left")
+
+    def load_enrichment(self, symbols: Sequence[str], *, include_event_counts: bool = True) -> pd.DataFrame:
+        cleaned = self._symbols(symbols)
+        if not cleaned or not self.available():
+            return pd.DataFrame(columns=self.ENRICHMENT_COLUMNS)
+
+        con, cleaned = self._open_with_symbols(cleaned)
+        try:
+            base = pd.DataFrame({"symbol": cleaned})
+
+            profile_table = self._table("stock_profile")
+            if profile_table:
+                profile = self._safe_query(
+                    con,
+                    f"""
+                    SELECT
+                        UPPER(p.symbol) AS symbol,
+                        p.sector AS sector_defeatbeta,
+                        p.industry AS industry_defeatbeta,
+                        p.country AS country_defeatbeta,
+                        p.long_business_summary AS description,
+                        p.web_site AS website,
+                        p.full_time_employees AS employee_count,
+                        p.report_date AS profile_as_of_date,
+                        1 AS defeatbeta_profile_available
+                    FROM {profile_table} p
+                    INNER JOIN requested_symbols r ON UPPER(p.symbol) = r.symbol
+                    """,
+                )
+                base = self._merge_part(base, profile)
+
+            price_table = self._table("stock_prices")
+            shares_table = self._table("stock_shares_outstanding")
+            if price_table and shares_table:
+                market = self._safe_query(
+                    con,
+                    f"""
+                    WITH latest_price AS (
+                        SELECT
+                            UPPER(p.symbol) AS symbol,
+                            CAST(p.report_date AS DATE) AS price_report_date,
+                            CAST(p.close AS DOUBLE) AS close_price,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY UPPER(p.symbol)
+                                ORDER BY CAST(p.report_date AS DATE) DESC
+                            ) AS rn
+                        FROM {price_table} p
+                        INNER JOIN requested_symbols r ON UPPER(p.symbol) = r.symbol
+                        WHERE p.close IS NOT NULL
+                    ),
+                    price_one AS (
+                        SELECT symbol, price_report_date, close_price
+                        FROM latest_price
+                        WHERE rn = 1
+                    ),
+                    share_candidates AS (
+                        SELECT
+                            UPPER(s.symbol) AS symbol,
+                            CAST(s.report_date AS DATE) AS shares_report_date,
+                            CAST(s.shares_outstanding AS DOUBLE) AS shares_outstanding,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY UPPER(s.symbol)
+                                ORDER BY
+                                    CASE
+                                        WHEN CAST(s.report_date AS DATE) <= p.price_report_date THEN 0
+                                        ELSE 1
+                                    END ASC,
+                                    ABS(DATE_DIFF('day', CAST(s.report_date AS DATE), p.price_report_date)) ASC,
+                                    CAST(s.report_date AS DATE) DESC
+                            ) AS rn
+                        FROM {shares_table} s
+                        INNER JOIN price_one p ON UPPER(s.symbol) = p.symbol
+                        WHERE s.shares_outstanding IS NOT NULL
+                    ),
+                    shares_one AS (
+                        SELECT symbol, shares_report_date, shares_outstanding
+                        FROM share_candidates
+                        WHERE rn = 1
+                    )
+                    SELECT
+                        p.symbol,
+                        p.price_report_date,
+                        p.close_price,
+                        s.shares_report_date,
+                        s.shares_outstanding,
+                        p.close_price * s.shares_outstanding AS market_cap
+                    FROM price_one p
+                    LEFT JOIN shares_one s ON s.symbol = p.symbol
+                    """,
+                )
+                base = self._merge_part(base, market)
+
+                beta = self._safe_query(
+                    con,
+                    f"""
+                    WITH max_date AS (
+                        SELECT MAX(CAST(report_date AS DATE)) AS end_date
+                        FROM {price_table}
+                        WHERE UPPER(symbol) = 'SPY'
+                    ),
+                    symbols_with_benchmark AS (
+                        SELECT symbol FROM requested_symbols
+                        UNION ALL
+                        SELECT 'SPY' AS symbol
+                    ),
+                    prices AS (
+                        SELECT
+                            UPPER(p.symbol) AS symbol,
+                            CAST(p.report_date AS DATE) AS report_date,
+                            CAST(p.close AS DOUBLE) AS close
+                        FROM {price_table} p
+                        INNER JOIN symbols_with_benchmark s ON UPPER(p.symbol) = s.symbol
+                        WHERE p.close IS NOT NULL
+                          AND CAST(p.report_date AS DATE) >= (SELECT end_date - INTERVAL 5 YEAR FROM max_date)
+                    ),
+                    monthly_prices AS (
+                        SELECT
+                            symbol,
+                            DATE_TRUNC('month', report_date) AS month,
+                            ARG_MAX(close, report_date) AS close
+                        FROM prices
+                        GROUP BY symbol, month
+                    ),
+                    monthly_returns AS (
+                        SELECT
+                            symbol,
+                            month,
+                            close / NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY month), 0.0) - 1.0 AS ret
+                        FROM monthly_prices
+                    ),
+                    benchmark AS (
+                        SELECT month, ret AS benchmark_ret
+                        FROM monthly_returns
+                        WHERE symbol = 'SPY' AND ret IS NOT NULL
+                    )
+                    SELECT
+                        r.symbol,
+                        COVAR_SAMP(r.ret, b.benchmark_ret) / NULLIF(VAR_SAMP(b.benchmark_ret), 0.0) AS beta
+                    FROM monthly_returns r
+                    INNER JOIN benchmark b ON b.month = r.month
+                    WHERE r.symbol <> 'SPY' AND r.ret IS NOT NULL
+                    GROUP BY r.symbol
+                    """,
+                )
+                base = self._merge_part(base, beta)
+
+            statement_table = self._table("stock_statement")
+            if statement_table:
+                statement_counts = self._safe_query(
+                    con,
+                    f"""
+                    SELECT UPPER(s.symbol) AS symbol, COUNT(*) AS defeatbeta_statement_count
+                    FROM {statement_table} s
+                    INNER JOIN requested_symbols r ON UPPER(s.symbol) = r.symbol
+                    GROUP BY UPPER(s.symbol)
+                    """,
+                )
+                base = self._merge_part(base, statement_counts)
+
+            earnings_table = self._table("stock_earning_calendar")
+            if include_event_counts and earnings_table:
+                earnings = self._safe_query(
+                    con,
+                    f"""
+                    SELECT
+                        UPPER(e.symbol) AS symbol,
+                        COUNT(*) AS defeatbeta_earnings_count,
+                        MAX(e.report_date) AS latest_earnings_date
+                    FROM {earnings_table} e
+                    INNER JOIN requested_symbols r ON UPPER(e.symbol) = r.symbol
+                    GROUP BY UPPER(e.symbol)
+                    """,
+                )
+                base = self._merge_part(base, earnings)
+
+            news_table = self._table("stock_news")
+            if include_event_counts and news_table:
+                news = self._safe_query(
+                    con,
+                    f"""
+                    SELECT
+                        r.symbol,
+                        COUNT(*) AS defeatbeta_news_count,
+                        MAX(n.report_date) AS latest_news_date
+                    FROM {news_table} n
+                    INNER JOIN requested_symbols r
+                        ON UPPER(COALESCE(n.related_symbols, '')) = r.symbol
+                        OR CONTAINS(
+                            ',' || REPLACE(UPPER(COALESCE(n.related_symbols, '')), ' ', '') || ',',
+                            ',' || r.symbol || ','
+                        )
+                    GROUP BY r.symbol
+                    """,
+                )
+                base = self._merge_part(base, news)
+
+            for column in (
+                "market_cap",
+                "shares_outstanding",
+                "beta",
+                "employee_count",
+                "defeatbeta_profile_available",
+                "defeatbeta_statement_count",
+                "defeatbeta_earnings_count",
+                "defeatbeta_news_count",
+            ):
+                if column not in base.columns:
+                    base[column] = np.nan
+            for column in ("description", "website", "profile_as_of_date", "sector_defeatbeta", "industry_defeatbeta", "country_defeatbeta"):
+                if column not in base.columns:
+                    base[column] = ""
+
+            availability_columns = [
+                "defeatbeta_profile_available",
+                "market_cap",
+                "beta",
+                "defeatbeta_statement_count",
+                "defeatbeta_earnings_count",
+                "defeatbeta_news_count",
+            ]
+            available_flags = []
+            for column in availability_columns:
+                values = pd.to_numeric(base[column], errors="coerce")
+                available_flags.append(values.notna() & values.ne(0))
+            payload_count = sum(available_flags) if available_flags else pd.Series(0, index=base.index)
+            base["defeatbeta_payload_count"] = payload_count.astype(int)
+            base["provider_payload_count"] = base["defeatbeta_payload_count"]
+            base["profile_source"] = np.where(base["defeatbeta_payload_count"].gt(0), "defeatbeta", "")
+            for count_column in ("defeatbeta_earnings_count", "defeatbeta_news_count"):
+                base[count_column] = pd.to_numeric(base[count_column], errors="coerce").fillna(0).astype(int)
+
+            for column in self.ENRICHMENT_COLUMNS:
+                if column not in base.columns:
+                    base[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta"} else ""
+            return base[self.ENRICHMENT_COLUMNS].copy()
+        finally:
+            con.close()
+
+    def load_symbol_detail(self, symbol: str) -> dict[str, pd.DataFrame]:
+        cleaned = self._symbols([symbol])
+        if not cleaned or not self.available():
+            return {}
+        con, _cleaned = self._open_with_symbols(cleaned)
+        try:
+            detail: dict[str, pd.DataFrame] = {"metrics": self.load_enrichment(cleaned)}
+
+            profile_table = self._table("stock_profile")
+            if profile_table:
+                detail["profile"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT p.*
+                    FROM {profile_table} p
+                    INNER JOIN requested_symbols r ON UPPER(p.symbol) = r.symbol
+                    LIMIT 1
+                    """,
+                )
+
+            eps_table = self._table("stock_tailing_eps")
+            if eps_table:
+                detail["eps"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT e.symbol, e.report_date, e.tailing_eps, e.eps, e.update_time
+                    FROM {eps_table} e
+                    INNER JOIN requested_symbols r ON UPPER(e.symbol) = r.symbol
+                    ORDER BY e.report_date DESC
+                    LIMIT 12
+                    """,
+                )
+
+            statement_table = self._table("stock_statement")
+            if statement_table:
+                detail["statements"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT s.symbol, s.finance_type, s.period_type, s.report_date, s.item_name, s.item_value
+                    FROM {statement_table} s
+                    INNER JOIN requested_symbols r ON UPPER(s.symbol) = r.symbol
+                    ORDER BY
+                        CASE WHEN s.report_date = 'TTM' THEN 0 ELSE 1 END,
+                        s.period_type,
+                        s.finance_type,
+                        s.report_date DESC,
+                        s.item_name
+                    LIMIT 160
+                    """,
+                )
+
+            news_table = self._table("stock_news")
+            if news_table:
+                detail["news"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT n.related_symbols, n.title, n.publisher, n.report_date, n.type, n.link
+                    FROM {news_table} n
+                    INNER JOIN requested_symbols r
+                        ON UPPER(COALESCE(n.related_symbols, '')) = r.symbol
+                        OR CONTAINS(
+                            ',' || REPLACE(UPPER(COALESCE(n.related_symbols, '')), ' ', '') || ',',
+                            ',' || r.symbol || ','
+                        )
+                    ORDER BY n.report_date DESC
+                    LIMIT 25
+                    """,
+                )
+
+            officers_table = self._table("stock_officers")
+            if officers_table:
+                detail["officers"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT o.symbol, o.name, o.title, o.age, o.born, o.pay, o.exercised, o.unexercised
+                    FROM {officers_table} o
+                    INNER JOIN requested_symbols r ON UPPER(o.symbol) = r.symbol
+                    ORDER BY COALESCE(pay, 0) DESC NULLS LAST, name
+                    LIMIT 30
+                    """,
+                )
+
+            earnings_table = self._table("stock_earning_calendar")
+            if earnings_table:
+                detail["earnings"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT e.symbol, e.report_date, e.time, e.name, e.fiscal_quarter_ending
+                    FROM {earnings_table} e
+                    INNER JOIN requested_symbols r ON UPPER(e.symbol) = r.symbol
+                    ORDER BY e.report_date DESC
+                    LIMIT 20
+                    """,
+                )
+
+            filings_table = self._table("stock_sec_filing")
+            if filings_table:
+                detail["filings"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT f.symbol, f.form_type, f.form_type_description, f.filing_date, f.report_date, f.filing_url
+                    FROM {filings_table} f
+                    INNER JOIN requested_symbols r ON UPPER(f.symbol) = r.symbol
+                    ORDER BY f.filing_date DESC
+                    LIMIT 25
+                    """,
+                )
+
+            revenue_table = self._table("stock_revenue_breakdown")
+            if revenue_table:
+                detail["revenue_breakdown"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT rb.symbol, rb.breakdown_type, rb.report_date, rb.item_name, rb.item_value
+                    FROM {revenue_table} rb
+                    INNER JOIN requested_symbols r ON UPPER(rb.symbol) = r.symbol
+                    ORDER BY rb.report_date DESC
+                    LIMIT 30
+                    """,
+                )
+
+            transcripts_table = self._table("stock_earning_call_transcripts")
+            if transcripts_table:
+                detail["transcripts"] = self._safe_query(
+                    con,
+                    f"""
+                    SELECT t.symbol, t.fiscal_year, t.fiscal_quarter, t.report_date, t.transcripts_id
+                    FROM {transcripts_table} t
+                    INNER JOIN requested_symbols r ON UPPER(t.symbol) = r.symbol
+                    ORDER BY t.report_date DESC
+                    LIMIT 8
+                    """,
+                )
+
+            return detail
+        finally:
+            con.close()
+
+
+class MasterAssetInformationCache:
+    """Materialized fundamentals used by interactive screeners.
+
+    Raw provider data stays outside backtests.sqlite. This cache is a compact, rebuildable
+    database optimized for UI filtering and sorting.
+    """
+
+    ENRICHMENT_COLUMNS = [
+        "symbol",
+        "market_cap",
+        "shares_outstanding",
+        "beta",
+        "description",
+        "website",
+        "employee_count",
+        "profile_source",
+        "profile_as_of_date",
+        "provider_payload_count",
+        "defeatbeta_payload_count",
+        "defeatbeta_earnings_count",
+        "defeatbeta_news_count",
+        "latest_earnings_date",
+        "latest_news_date",
+        "sector_defeatbeta",
+        "industry_defeatbeta",
+        "country_defeatbeta",
+    ]
+
+    def __init__(
+        self,
+        db_path: Path | str = MASTER_ASSET_INFORMATION_DB_PATH,
+        *,
+        defeatbeta_data_dir: Path | str = DEFEATBETA_DATA_DIR,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.defeatbeta_data_dir = Path(defeatbeta_data_dir)
+
+    def available(self) -> bool:
+        if not self.db_path.exists():
+            return False
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='defeatbeta_fundamentals'"
+                ).fetchone()
+                if row is None:
+                    return False
+                count = conn.execute("SELECT COUNT(*) FROM defeatbeta_fundamentals").fetchone()[0]
+                return int(count or 0) > 0
+        except Exception:
+            return False
+
+    def row_count(self) -> int:
+        if not self.db_path.exists():
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                return int(conn.execute("SELECT COUNT(*) FROM defeatbeta_fundamentals").fetchone()[0] or 0)
+        except Exception:
+            return 0
+
+    def metadata(self) -> dict[str, object]:
+        if not self.db_path.exists():
+            return {}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute("SELECT key, value FROM metadata").fetchall()
+            return {str(key): value for key, value in rows}
+        except Exception:
+            return {}
+
+    def _source_mtime(self) -> float:
+        mtimes: list[float] = []
+        for name in (
+            "stock_profile.parquet",
+            "stock_prices.parquet",
+            "stock_shares_outstanding.parquet",
+            "stock_statement.parquet",
+            "stock_earning_calendar.parquet",
+            "stock_news.parquet",
+        ):
+            path = self.defeatbeta_data_dir / name
+            if path.exists():
+                try:
+                    mtimes.append(float(path.stat().st_mtime))
+                except Exception:
+                    pass
+        return max(mtimes) if mtimes else 0.0
+
+    def is_stale(self) -> bool:
+        if not self.available():
+            return True
+        metadata = self.metadata()
+        try:
+            version = int(metadata.get("version") or 0)
+        except Exception:
+            version = 0
+        if version != MASTER_ASSET_INFORMATION_CACHE_VERSION:
+            return True
+        try:
+            cached_source_mtime = float(metadata.get("source_mtime") or 0.0)
+        except Exception:
+            cached_source_mtime = 0.0
+        return self._source_mtime() > cached_source_mtime + 1.0
+
+    def load(self, symbols: Sequence[str] | None = None) -> pd.DataFrame:
+        if not self.available():
+            return pd.DataFrame(columns=self.ENRICHMENT_COLUMNS)
+        symbol_list = DefeatBetaLocalReader._symbols(symbols or [])
+        query = """
+            SELECT
+                symbol,
+                market_cap,
+                shares_outstanding,
+                beta,
+                description,
+                website,
+                employee_count,
+                profile_source,
+                profile_as_of_date,
+                provider_payload_count,
+                defeatbeta_payload_count,
+                defeatbeta_earnings_count,
+                defeatbeta_news_count,
+                latest_earnings_date,
+                latest_news_date,
+                sector AS sector_defeatbeta,
+                industry AS industry_defeatbeta,
+                country AS country_defeatbeta
+            FROM defeatbeta_fundamentals
+        """
+        params: list[object] = []
+        filter_after_load = False
+        if symbol_list and len(symbol_list) > 900:
+            filter_after_load = True
+        elif symbol_list:
+            placeholders = ",".join(["?"] * len(symbol_list))
+            query += f" WHERE symbol IN ({placeholders})"
+            params.extend(symbol_list)
+        query += " ORDER BY symbol ASC"
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                frame = pd.read_sql_query(query, conn, params=params)
+        except Exception:
+            return pd.DataFrame(columns=self.ENRICHMENT_COLUMNS)
+        if filter_after_load:
+            symbol_set = set(symbol_list)
+            frame = frame.loc[frame["symbol"].fillna("").astype(str).str.upper().isin(symbol_set)].copy()
+        for column in self.ENRICHMENT_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta"} else ""
+        return frame[self.ENRICHMENT_COLUMNS].copy()
+
+    def build_from_defeatbeta(self) -> pd.DataFrame:
+        reader = DefeatBetaLocalReader(self.defeatbeta_data_dir)
+        if not reader.available():
+            raise FileNotFoundError(f"defeatbeta parquet store was not found at {self.defeatbeta_data_dir}.")
+        profile_table = reader._table("stock_profile")
+        price_table = reader._table("stock_prices")
+        shares_table = reader._table("stock_shares_outstanding")
+        statement_table = reader._table("stock_statement")
+        earnings_table = reader._table("stock_earning_calendar")
+        news_table = reader._table("stock_news")
+        if not profile_table or not price_table or not shares_table:
+            raise FileNotFoundError("defeatbeta profile, price, and shares parquet files are required for the screener cache.")
+
+        statement_sql = (
+            f"""
+            , statements AS (
+                SELECT UPPER(symbol) AS symbol, COUNT(*) AS defeatbeta_statement_count
+                FROM {statement_table}
+                GROUP BY UPPER(symbol)
+            )
+            """
+            if statement_table
+            else ", statements AS (SELECT NULL::VARCHAR AS symbol, 0 AS defeatbeta_statement_count WHERE FALSE)"
+        )
+        earnings_sql = (
+            f"""
+            , earnings AS (
+                SELECT
+                    UPPER(symbol) AS symbol,
+                    COUNT(*) AS defeatbeta_earnings_count,
+                    MAX(report_date) AS latest_earnings_date
+                FROM {earnings_table}
+                GROUP BY UPPER(symbol)
+            )
+            """
+            if earnings_table
+            else ", earnings AS (SELECT NULL::VARCHAR AS symbol, 0 AS defeatbeta_earnings_count, NULL::VARCHAR AS latest_earnings_date WHERE FALSE)"
+        )
+        news_sql = (
+            f"""
+            , news AS (
+                SELECT
+                    UPPER(related_symbols) AS symbol,
+                    COUNT(*) AS defeatbeta_news_count,
+                    MAX(report_date) AS latest_news_date
+                FROM {news_table}
+                WHERE related_symbols IS NOT NULL
+                  AND related_symbols NOT LIKE '%,%'
+                GROUP BY UPPER(related_symbols)
+            )
+            """
+            if news_table
+            else ", news AS (SELECT NULL::VARCHAR AS symbol, 0 AS defeatbeta_news_count, NULL::VARCHAR AS latest_news_date WHERE FALSE)"
+        )
+        query = f"""
+            WITH profile AS (
+                SELECT
+                    UPPER(symbol) AS symbol,
+                    sector,
+                    industry,
+                    country,
+                    long_business_summary AS description,
+                    web_site AS website,
+                    full_time_employees AS employee_count,
+                    report_date AS profile_as_of_date
+                FROM {profile_table}
+            ),
+            latest_price AS (
+                SELECT
+                    UPPER(symbol) AS symbol,
+                    CAST(report_date AS DATE) AS price_report_date,
+                    CAST(close AS DOUBLE) AS close_price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(symbol)
+                        ORDER BY CAST(report_date AS DATE) DESC
+                    ) AS rn
+                FROM {price_table}
+                WHERE close IS NOT NULL
+                  AND UPPER(symbol) IN (SELECT symbol FROM profile)
+            ),
+            price_one AS (
+                SELECT symbol, price_report_date, close_price
+                FROM latest_price
+                WHERE rn = 1
+            ),
+            share_candidates AS (
+                SELECT
+                    UPPER(s.symbol) AS symbol,
+                    CAST(s.report_date AS DATE) AS shares_report_date,
+                    CAST(s.shares_outstanding AS DOUBLE) AS shares_outstanding,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(s.symbol)
+                        ORDER BY
+                            CASE
+                                WHEN CAST(s.report_date AS DATE) <= p.price_report_date THEN 0
+                                ELSE 1
+                            END ASC,
+                            ABS(DATE_DIFF('day', CAST(s.report_date AS DATE), p.price_report_date)) ASC,
+                            CAST(s.report_date AS DATE) DESC
+                    ) AS rn
+                FROM {shares_table} s
+                INNER JOIN price_one p ON UPPER(s.symbol) = p.symbol
+                WHERE s.shares_outstanding IS NOT NULL
+            ),
+            shares_one AS (
+                SELECT symbol, shares_report_date, shares_outstanding
+                FROM share_candidates
+                WHERE rn = 1
+            ),
+            max_date AS (
+                SELECT MAX(CAST(report_date AS DATE)) AS end_date
+                FROM {price_table}
+                WHERE UPPER(symbol) = 'SPY'
+            ),
+            beta_symbols AS (
+                SELECT symbol FROM profile
+                UNION ALL
+                SELECT 'SPY' AS symbol
+            ),
+            beta_prices AS (
+                SELECT
+                    UPPER(p.symbol) AS symbol,
+                    CAST(p.report_date AS DATE) AS report_date,
+                    CAST(p.close AS DOUBLE) AS close
+                FROM {price_table} p
+                INNER JOIN beta_symbols s ON UPPER(p.symbol) = s.symbol
+                WHERE p.close IS NOT NULL
+                  AND CAST(p.report_date AS DATE) >= (SELECT end_date - INTERVAL 5 YEAR FROM max_date)
+            ),
+            monthly_prices AS (
+                SELECT
+                    symbol,
+                    DATE_TRUNC('month', report_date) AS month,
+                    ARG_MAX(close, report_date) AS close
+                FROM beta_prices
+                GROUP BY symbol, month
+            ),
+            monthly_returns AS (
+                SELECT
+                    symbol,
+                    month,
+                    close / NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY month), 0.0) - 1.0 AS ret
+                FROM monthly_prices
+            ),
+            benchmark AS (
+                SELECT month, ret AS benchmark_ret
+                FROM monthly_returns
+                WHERE symbol = 'SPY' AND ret IS NOT NULL
+            ),
+            beta AS (
+                SELECT
+                    r.symbol,
+                    COVAR_SAMP(r.ret, b.benchmark_ret) / NULLIF(VAR_SAMP(b.benchmark_ret), 0.0) AS beta
+                FROM monthly_returns r
+                INNER JOIN benchmark b ON b.month = r.month
+                WHERE r.symbol <> 'SPY' AND r.ret IS NOT NULL
+                GROUP BY r.symbol
+            )
+            {statement_sql}
+            {earnings_sql}
+            {news_sql}
+            SELECT
+                p.symbol,
+                p.sector,
+                p.industry,
+                p.country,
+                p.description,
+                p.website,
+                p.employee_count,
+                p.profile_as_of_date,
+                pr.price_report_date,
+                pr.close_price,
+                s.shares_report_date,
+                s.shares_outstanding,
+                pr.close_price * s.shares_outstanding AS market_cap,
+                b.beta,
+                COALESCE(st.defeatbeta_statement_count, 0) AS defeatbeta_statement_count,
+                COALESCE(e.defeatbeta_earnings_count, 0) AS defeatbeta_earnings_count,
+                e.latest_earnings_date,
+                COALESCE(n.defeatbeta_news_count, 0) AS defeatbeta_news_count,
+                n.latest_news_date
+            FROM profile p
+            LEFT JOIN price_one pr ON pr.symbol = p.symbol
+            LEFT JOIN shares_one s ON s.symbol = p.symbol
+            LEFT JOIN beta b ON b.symbol = p.symbol
+            LEFT JOIN statements st ON st.symbol = p.symbol
+            LEFT JOIN earnings e ON e.symbol = p.symbol
+            LEFT JOIN news n ON n.symbol = p.symbol
+        """
+        con = duckdb.connect(":memory:")
+        try:
+            frame = con.execute(query).df()
+        finally:
+            con.close()
+
+        if frame.empty:
+            raise RuntimeError("defeatbeta cache build returned no rows.")
+        availability = []
+        for column in ("market_cap", "beta", "defeatbeta_statement_count", "defeatbeta_earnings_count", "defeatbeta_news_count"):
+            values = pd.to_numeric(frame.get(column), errors="coerce")
+            availability.append(values.notna() & values.ne(0))
+        frame["defeatbeta_payload_count"] = sum(availability).astype(int)
+        frame["provider_payload_count"] = frame["defeatbeta_payload_count"]
+        frame["profile_source"] = "defeatbeta"
+        frame["refreshed_at"] = pd.Timestamp.now(tz='UTC').strftime("%Y-%m-%d %H:%M:%S UTC")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            frame.to_sql("defeatbeta_fundamentals", conn, if_exists="replace", index=False)
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_defeatbeta_fundamentals_symbol ON defeatbeta_fundamentals(symbol)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_defeatbeta_fundamentals_sector ON defeatbeta_fundamentals(sector)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_defeatbeta_fundamentals_market_cap ON defeatbeta_fundamentals(market_cap)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_defeatbeta_fundamentals_beta ON defeatbeta_fundamentals(beta)")
+            conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+            metadata = {
+                "version": str(MASTER_ASSET_INFORMATION_CACHE_VERSION),
+                "provider": "defeatbeta",
+                "row_count": str(len(frame)),
+                "source_mtime": str(self._source_mtime()),
+                "refreshed_at": frame["refreshed_at"].iloc[0],
+            }
+            conn.executemany(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                list(metadata.items()),
+            )
+            conn.commit()
+        return self.load()
+
+
 # --- Qt Models --------------------------------------------------------------
 def _parse_catalog_timestamp(value: str | None) -> pd.Timestamp | None:
     if not value:
@@ -2131,9 +3209,13 @@ class RunsTableModel(QtCore.QAbstractTableModel):
                 if not metrics:
                     return "—"
                 roll = metrics.get("rolling_sharpe")
-                if roll is None or (isinstance(roll, float) and roll != roll):
+                try:
+                    roll_value = float(roll)
+                except Exception:
                     return "—"
-                return f"{roll:.3f}"
+                if not np.isfinite(roll_value):
+                    return "—"
+                return f"{roll_value:.3f}"
             if col == 17:
                 return "—" if not metrics else f"{metrics.get('max_drawdown', 0):.4f}"
             if col == 18:
@@ -2284,9 +3366,20 @@ _DATASET_PICKER_PROVIDER_PREFIXES = {
     "POLYGON",
     "STOOQ",
 }
+_DATASET_ID_SOURCE_MARKERS = (
+    "massive_interactive_brokers",
+    "interactive_brokers",
+    "interactivebrokers",
+    "massive",
+    "polygon",
+    "stooq",
+    "alpaca",
+    "ib",
+)
 _DATASET_PICKER_STATUS_META = {
     "ready": {"label": "Ready", "color": PALETTE["green"], "alpha": 0.26},
     "stale": {"label": "Stale", "color": PALETTE["amber"], "alpha": 0.22},
+    "gappy": {"label": "Gappy", "color": PALETTE["amber"], "alpha": 0.24},
     "raw": {"label": "Raw Only", "color": PALETTE["amber"], "alpha": 0.18},
     "error": {"label": "Error", "color": PALETTE["red"], "alpha": 0.24},
     "missing": {"label": "Missing", "color": PALETTE["red"], "alpha": 0.18},
@@ -2354,21 +3447,37 @@ def _normalize_picker_ticker(symbol: object) -> str:
     return str(symbol or "").strip().upper()
 
 
-def _infer_picker_ticker(dataset_id: object, symbol: object = None) -> str:
+def _market_symbol_from_dataset_id(dataset_id: object, symbol: object = None) -> str:
     normalized_symbol = _normalize_picker_ticker(symbol)
     if normalized_symbol:
         return normalized_symbol
     dataset_text = str(dataset_id or "").strip()
     if not dataset_text:
         return ""
+    if dataset_text.lower().endswith((".csv", ".parquet", ".feather")):
+        dataset_text = Path(dataset_text).stem
+    colon_parts = [part.strip() for part in dataset_text.split(":") if part.strip()]
+    if len(colon_parts) >= 2:
+        return colon_parts[1].upper()
+
+    normalized_text = dataset_text.replace("-", "_").replace(" ", "_")
+    lowered = normalized_text.lower()
+    for source_marker in _DATASET_ID_SOURCE_MARKERS:
+        marker = f"_{source_marker}_"
+        marker_idx = lowered.find(marker)
+        if marker_idx > 0:
+            candidate = dataset_text[:marker_idx].strip("_- ")
+            if candidate:
+                return candidate.upper()
+
     tokens = [token for token in re.split(r"[_\s]+", dataset_text) if token]
-    if not tokens:
-        return dataset_text.upper()
-    candidate_idx = 0
-    if tokens[0].upper() in _DATASET_PICKER_PROVIDER_PREFIXES and len(tokens) > 1:
-        candidate_idx = 1
-    candidate = str(tokens[candidate_idx]).strip().split(".")[0]
-    return candidate.upper() if candidate else dataset_text.upper()
+    if tokens and tokens[0].upper() in _DATASET_PICKER_PROVIDER_PREFIXES and len(tokens) > 1:
+        return str(tokens[1]).strip().split(".")[0].upper()
+    return dataset_text.upper()
+
+
+def _infer_picker_ticker(dataset_id: object, symbol: object = None) -> str:
+    return _market_symbol_from_dataset_id(dataset_id, symbol)
 
 
 def _fmt_picker_ts(value: object) -> str:
@@ -2412,7 +3521,10 @@ def _dataset_variant_status(record: dict) -> dict:
         str(record.get("last_download_success_at") or "").strip()
     )
     if ingested:
-        status_code = "ready" if freshness == "fresh" and quality_state != "gappy" else "stale"
+        if quality_state == "gappy":
+            status_code = "gappy"
+        else:
+            status_code = "ready" if freshness == "fresh" else "stale"
     elif has_download_artifact or last_status in {"downloaded", "success", "gap_filled"}:
         status_code = "raw"
     elif last_status in _DATASET_PICKER_ERROR_STATUSES or last_error:
@@ -2463,6 +3575,8 @@ def _dataset_variant_status(record: dict) -> dict:
 def _aggregate_ticker_status(variants: Sequence[dict]) -> dict:
     if any(item.get("status_code") == "ready" for item in variants):
         status_code = "ready"
+    elif any(item.get("status_code") == "gappy" for item in variants):
+        status_code = "gappy"
     elif any(item.get("status_code") == "stale" for item in variants):
         status_code = "stale"
     elif any(item.get("status_code") == "raw" for item in variants):
@@ -2474,7 +3588,7 @@ def _aggregate_ticker_status(variants: Sequence[dict]) -> dict:
     status_meta = _picker_status_meta(status_code)
     counts = {
         code: len([item for item in variants if item.get("status_code") == code])
-        for code in ("ready", "stale", "raw", "error", "missing")
+        for code in ("ready", "gappy", "stale", "raw", "error", "missing")
     }
     return {
         "status_code": status_code,
@@ -2526,7 +3640,7 @@ def _dataset_picker_groups(
         tooltip_lines = [
             f"{ticker}: {aggregate['status_label']}",
             f"Variants: {len(group_variants)}",
-            f"Ready: {aggregate['counts']['ready']} | Stale: {aggregate['counts']['stale']} | Raw Only: {aggregate['counts']['raw']} | Error: {aggregate['counts']['error']}",
+            f"Ready: {aggregate['counts']['ready']} | Gappy: {aggregate['counts']['gappy']} | Stale: {aggregate['counts']['stale']} | Raw Only: {aggregate['counts']['raw']} | Error: {aggregate['counts']['error']}",
         ]
         for variant in group_variants[:6]:
             tooltip_lines.append(
@@ -2600,6 +3714,11 @@ def _format_dataset_scope_label(
     catalog_path: Path | str | None = None,
     frame: pd.DataFrame | None = None,
 ) -> str:
+    if frame is None and catalog_path is None:
+        compact = [str(item).strip() for item in list(dataset_ids or []) if str(item).strip()]
+        if not compact:
+            return ""
+        return ", ".join(compact[:3]) if len(compact) <= 3 else f"{len(compact)} datasets selected"
     groups = _dataset_picker_groups(dataset_ids, catalog_path=catalog_path, frame=frame)
     if not groups:
         compact = [str(item).strip() for item in list(dataset_ids or []) if str(item).strip()]
@@ -2739,6 +3858,10 @@ class DownloadFinalizeWorker(QtCore.QThread):
         result["artifact"] = None
         result["error"] = None
         try:
+            if self.isInterruptionRequested():
+                result["error"] = "Finalization stopped before it started."
+                self.result_signal.emit(result)
+                return
             if mode == "ingest_csv":
                 result["artifact"] = ingest_csv_to_store(
                     self.job["out_path"],
@@ -2750,6 +3873,9 @@ class DownloadFinalizeWorker(QtCore.QThread):
                 artifact = None
                 windows = list(self.job.get("windows") or [])
                 for window_start, window_end in windows:
+                    if self.isInterruptionRequested():
+                        result["error"] = "Finalization stopped during gap fill."
+                        break
                     artifact = gap_fill_dataset_from_secondary(
                         str(self.job.get("target_dataset_id") or ""),
                         str(self.job.get("secondary_dataset_id") or ""),
@@ -2757,7 +3883,8 @@ class DownloadFinalizeWorker(QtCore.QThread):
                         end=window_end,
                         resolution=self.job.get("resolution"),
                     )
-                result["artifact"] = artifact
+                if not result["error"]:
+                    result["artifact"] = artifact
             else:
                 result["error"] = f"Unknown finalize mode: {mode or '—'}"
         except Exception as exc:
@@ -2877,6 +4004,610 @@ class AssetProviderSyncWorker(QtCore.QThread):
         self.finished_signal.emit(payload)
 
 
+class FundamentalsCacheBuildWorker(QtCore.QThread):
+    finished_signal = QtCore.pyqtSignal(object)
+    error_signal = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        cache_path: Path | str = MASTER_ASSET_INFORMATION_DB_PATH,
+        defeatbeta_data_dir: Path | str = DEFEATBETA_DATA_DIR,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.cache_path = Path(cache_path)
+        self.defeatbeta_data_dir = Path(defeatbeta_data_dir)
+
+    def run(self) -> None:
+        try:
+            cache = MasterAssetInformationCache(
+                self.cache_path,
+                defeatbeta_data_dir=self.defeatbeta_data_dir,
+            )
+            frame = cache.build_from_defeatbeta()
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+            return
+        self.finished_signal.emit({"row_count": len(frame), "cache_path": str(self.cache_path)})
+
+
+class MagellanEmbedHost(QtWidgets.QFrame):
+    resized = QtCore.pyqtSignal(int, int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DontCreateNativeAncestors, False)
+        self.setMinimumHeight(520)
+        self.setObjectName("Panel")
+        self.setStyleSheet(
+            f"""
+            QFrame#Panel {{
+                background: {PALETTE['panel2']};
+                border: 1px solid rgba(231, 238, 252, 0.45);
+            }}
+            """
+        )
+
+    def native_parent_id(self) -> str:
+        return str(int(self.winId()))
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        size = event.size()
+        if size.width() > 0 and size.height() > 0:
+            self.resized.emit(int(size.width()), int(size.height()))
+
+
+class ChartLiveStreamWorker(QtCore.QThread):
+    bar_signal = QtCore.pyqtSignal(object)
+    preview_bar_signal = QtCore.pyqtSignal(object)
+    status_signal = QtCore.pyqtSignal(str)
+    error_signal = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        store_path: Path | str,
+        config: InteractiveBrokersRealtimeConfig,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.symbol = _market_symbol_from_dataset_id(symbol)
+        self.store_path = Path(store_path)
+        self.config = config
+        self._app: InteractiveBrokersRealtimeBarApp | None = None
+        self._last_bar_monotonic: float | None = None
+
+    def stop(self) -> None:
+        self.requestInterruption()
+        if self._app is not None:
+            self._app.stop()
+
+    def run(self) -> None:
+        if not self.symbol:
+            self.error_signal.emit("A ticker symbol is required for live chart streaming.")
+            return
+        try:
+            store = LiveMarketDataStore(self.store_path)
+        except sqlite3.Error as exc:
+            self.error_signal.emit(f"Live market store unavailable: {exc}")
+            return
+
+        def _on_bar(bar) -> None:
+            self._last_bar_monotonic = time.monotonic()
+            try:
+                store.upsert_bar(bar)
+            except sqlite3.Error as exc:
+                if sqlite_error_is_locked(exc):
+                    self.status_signal.emit(f"Live market store busy while writing {self.symbol}; retrying on the next bar.")
+                    return
+                self.error_signal.emit(f"Live market store unavailable: {exc}")
+                self.requestInterruption()
+                return
+            record = bar.as_record()
+            record["is_partial"] = False
+            self.bar_signal.emit(record)
+
+        def _on_partial_bar(bar) -> None:
+            record = bar.as_record()
+            record["is_partial"] = True
+            self.preview_bar_signal.emit(record)
+
+        try:
+            connected_at = time.monotonic()
+            no_bar_warning_sent = False
+            stale_bar_warning_sent = False
+            self._app = InteractiveBrokersRealtimeBarApp(
+                symbols=[self.symbol],
+                config=self.config,
+                bar_callback=_on_bar,
+                partial_callback=_on_partial_bar,
+                status_callback=self.status_signal.emit,
+                error_callback=self.error_signal.emit,
+            )
+            self._app.connect_and_start()
+            while not self.isInterruptionRequested():
+                if self._app is not None:
+                    self._app.flush_stale_partials()
+                elapsed = time.monotonic() - connected_at
+                last_bar_at = self._last_bar_monotonic
+                if last_bar_at is None and not no_bar_warning_sent and elapsed >= max(30.0, float(self.config.timeout_seconds) * 2.0):
+                    self.status_signal.emit(
+                        f"Connected to Interactive Brokers for {self.symbol}, but no real-time bars have arrived yet. "
+                        "Check IB Gateway/TWS market data permissions, data farm status, and client-id conflicts."
+                    )
+                    no_bar_warning_sent = True
+                elif (
+                    last_bar_at is not None
+                    and not stale_bar_warning_sent
+                    and time.monotonic() - last_bar_at >= float(DEFAULT_STALE_QUOTE_SECONDS)
+                ):
+                    self.status_signal.emit(
+                        f"{self.symbol} Interactive Brokers stream is connected, but the last bar is stale. "
+                        "This can happen after the extended session closes, when IBKR data farms are idle, or when Gateway needs a reconnect."
+                    )
+                    stale_bar_warning_sent = True
+                self.msleep(100)
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+        finally:
+            if self._app is not None:
+                self._app.stop()
+                self._app = None
+
+
+class LiveDeploymentRunnerWorker(QtCore.QThread):
+    status_signal = QtCore.pyqtSignal(str)
+    error_signal = QtCore.pyqtSignal(str)
+    refresh_signal = QtCore.pyqtSignal()
+    sync_signal = QtCore.pyqtSignal()
+    context_error_signal = QtCore.pyqtSignal(str)
+    signal_marker_signal = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        *,
+        store_path: Path | str,
+        catalog_db_path: Path | str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.store_path = Path(store_path)
+        self.catalog_db_path = Path(catalog_db_path)
+        self._queue: queue.Queue[dict] = queue.Queue()
+        self._lock = threading.RLock()
+        self._contexts: dict[str, dict] = {}
+        self._symbol_index: dict[str, set[str]] = {}
+
+    def add_contexts(self, contexts: Sequence[dict]) -> None:
+        with self._lock:
+            for raw_context in list(contexts or []):
+                context = dict(raw_context)
+                context_id = str(context.get("context_id") or "")
+                symbol = _market_symbol_from_dataset_id(context.get("symbol"))
+                if not context_id or not symbol:
+                    continue
+                context["symbol"] = symbol
+                self._contexts[context_id] = context
+                self._symbol_index.setdefault(symbol, set()).add(context_id)
+
+    def remove_context(self, context_id: str) -> None:
+        with self._lock:
+            self._remove_context_locked(str(context_id or ""))
+
+    def remove_deployment(self, deployment_id: str) -> None:
+        root_id = str(deployment_id or "")
+        if not root_id:
+            return
+        with self._lock:
+            for context_id, context in list(self._contexts.items()):
+                if root_id in {
+                    str(context.get("deployment_id") or ""),
+                    str(context.get("parent_deployment_id") or ""),
+                    str(context.get("portfolio_id") or ""),
+                }:
+                    self._remove_context_locked(context_id)
+
+    def clear_contexts(self) -> None:
+        with self._lock:
+            self._contexts.clear()
+            self._symbol_index.clear()
+
+    def enqueue_bar(self, record: dict) -> None:
+        if not isinstance(record, dict):
+            return
+        self._queue.put(dict(record))
+
+    def stop(self) -> None:
+        self.requestInterruption()
+        self._queue.put({})
+
+    def run(self) -> None:
+        while not self.isInterruptionRequested():
+            try:
+                record = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if self.isInterruptionRequested():
+                break
+            if not isinstance(record, dict) or not record:
+                continue
+            self._process_record(record)
+
+    def _remove_context_locked(self, context_id: str) -> None:
+        context = self._contexts.pop(context_id, None)
+        if not isinstance(context, dict):
+            return
+        symbol = str(context.get("symbol") or "")
+        indexed = self._symbol_index.get(symbol)
+        if indexed is not None:
+            indexed.discard(context_id)
+            if not indexed:
+                self._symbol_index.pop(symbol, None)
+
+    def _contexts_for_symbol(self, symbol: str) -> list[dict]:
+        with self._lock:
+            context_ids = list(self._symbol_index.get(symbol, set()))
+            return [
+                dict(self._contexts[context_id])
+                for context_id in context_ids
+                if context_id in self._contexts
+            ]
+
+    def _store_context(self, context: dict) -> None:
+        context_id = str(context.get("context_id") or "")
+        if not context_id:
+            return
+        with self._lock:
+            if context_id in self._contexts:
+                self._contexts[context_id] = dict(context)
+
+    def _refresh_context_account_snapshot(self, context: dict) -> None:
+        root_deployment_id = str(context.get("parent_deployment_id") or context.get("deployment_id") or "")
+        if root_deployment_id:
+            try:
+                with sqlite3.connect(self.catalog_db_path) as conn:
+                    row = conn.execute(
+                        """
+                        SELECT health_json
+                        FROM deployment_metric_snapshots
+                        WHERE deployment_id=?
+                        ORDER BY snapshot_ts DESC
+                        LIMIT 1
+                        """,
+                        (root_deployment_id,),
+                    ).fetchone()
+            except Exception:
+                row = None
+            if row and row[0]:
+                try:
+                    health = json.loads(str(row[0]))
+                except Exception:
+                    health = {}
+                account = dict(health.get("account") or {})
+                if account:
+                    context["account_snapshot"] = account
+
+    def _load_context_bars(self, context: dict, *, record: dict | None = None) -> pd.DataFrame:
+        symbol = _market_symbol_from_dataset_id(context.get("symbol"))
+        timeframe = normalize_chart_timeframe(str(context.get("timeframe") or LIVE_BAR_TIMEFRAME))
+        lookback_days = DashboardWindow._live_deployment_history_lookback_days(context)
+        end_ts = pd.Timestamp.now(tz="UTC")
+        start_ts = end_ts - pd.Timedelta(days=lookback_days)
+        bars = DashboardWindow._normalize_live_monitor_cached_bars(context.get("cached_bars"))
+        if bars.empty:
+            frames: list[pd.DataFrame] = []
+            dataset_id = str(context.get("dataset_id") or "").strip()
+            if dataset_id:
+                try:
+                    historical = DuckDBStore().resample(
+                        dataset_id,
+                        DashboardWindow._duckdb_interval_for_chart_timeframe(timeframe),
+                    )
+                    if historical is not None and not historical.empty:
+                        historical = historical.loc[(historical.index >= start_ts) & (historical.index <= end_ts)]
+                        frames.append(historical)
+                except Exception:
+                    pass
+            try:
+                live = LiveMarketDataStore(self.store_path).load_recent_bars(
+                    symbol,
+                    provider=DEFAULT_LIVE_PROVIDER,
+                    limit=500000,
+                )
+            except sqlite3.Error as exc:
+                raise RuntimeError(f"Live market store unavailable: {exc}") from exc
+            if live is not None and not live.empty:
+                live = live.loc[(live.index >= start_ts) & (live.index <= end_ts)]
+                live = resample_ohlcv(live, timeframe)
+                if not live.empty:
+                    frames.append(live)
+            if frames:
+                bars = pd.concat(frames).sort_index()
+                bars = DashboardWindow._normalize_live_monitor_cached_bars(bars)
+        if record is not None:
+            bars, _updated_ts = DashboardWindow._live_deployment_cached_bars_with_record(
+                bars,
+                record,
+                timeframe=timeframe,
+                symbol=symbol,
+            )
+        if not bars.empty:
+            cutoff = start_ts - chart_timeframe_delta(timeframe)
+            bars = bars.loc[(bars.index >= cutoff) & (bars.index <= end_ts + chart_timeframe_delta(timeframe))]
+        context["cached_bars"] = bars
+        return bars
+
+    def _process_record(self, record: dict) -> None:
+        symbol = _market_symbol_from_dataset_id(record.get("symbol"))
+        if not symbol:
+            return
+        evaluation_ts = DashboardWindow._live_record_evaluation_timestamp(record)
+        if evaluation_ts is None:
+            return
+        contexts = self._contexts_for_symbol(symbol)
+        if not contexts:
+            return
+        for context in contexts:
+            self._process_context_bar(context, record, evaluation_ts, symbol)
+
+    def _process_context_bar(self, context: dict, record: dict, record_ts: pd.Timestamp, symbol: str) -> None:
+        timeframe = normalize_chart_timeframe(str(context.get("timeframe") or LIVE_BAR_TIMEFRAME))
+        try:
+            bars = self._load_context_bars(context, record=record)
+            source_bar_index = DashboardWindow._live_deployment_completed_bar_index(bars, record_ts, timeframe)
+            if source_bar_index is None:
+                return
+            bar_ts = pd.Timestamp(bars.index[int(source_bar_index)])
+            bar_ts = bar_ts.tz_convert("UTC") if bar_ts.tzinfo else bar_ts.tz_localize("UTC")
+            bar_ts_ns = int(bar_ts.value)
+            if bar_ts_ns <= int(context.get("last_processed_bar_ts_ns") or 0):
+                return
+            strategy_cls = DashboardWindow._live_deployment_strategy_class(str(context.get("strategy_name") or ""))
+            if strategy_cls is None:
+                raise ValueError(f"Unsupported live strategy {context.get('strategy_name') or 'unknown'}")
+            strategy_bars = bars.iloc[: int(source_bar_index) + 1].copy()
+            strategy = strategy_cls(**dict(context.get("params") or {}))
+            strategy.initialize(strategy_bars)
+            broker = DashboardWindow._LiveDeploymentSignalBroker(
+                position_qty=float(context.get("position_qty") or 0.0),
+                avg_price=float(context.get("avg_price") or 0.0),
+            )
+            bar_row = strategy_bars.iloc[-1]
+            strategy.on_bar(bar_ts, bar_row, broker)
+            if broker.unsupported_orders:
+                raise ValueError(
+                    "Live runner only supports strategies that express desired state with target_percent; "
+                    f"unsupported broker calls: {', '.join(sorted(set(broker.unsupported_orders)))}"
+                )
+            if not broker.target_percent_calls:
+                context["last_processed_bar_ts_ns"] = bar_ts_ns
+                self._store_context(context)
+                return
+            target_call = broker.target_percent_calls[-1]
+            target = float(target_call.get("target") or 0.0)
+            plan = DashboardWindow._live_deployment_signal_plan(float(context.get("position_qty") or 0.0), target)
+            context["last_processed_bar_ts_ns"] = bar_ts_ns
+            if not plan:
+                self._store_context(context)
+                return
+            price = float(bar_row.get("close") or target_call.get("mark_price") or 0.0)
+            if not np.isfinite(price) or price <= 0.0:
+                raise ValueError(f"Invalid live signal price for {symbol}: {price}")
+            self._refresh_context_account_snapshot(context)
+            signal_ts = bar_ts.isoformat()
+            catalog = ResultCatalog(self.catalog_db_path)
+            for action, side, position_after in plan:
+                payload = DashboardWindow._deployment_signal_payload(
+                    context,
+                    action=action,
+                    side=side,
+                    target_percent=target,
+                    bar_ts=bar_ts,
+                    bar_index=int(source_bar_index),
+                    price=price,
+                    bars=strategy_bars,
+                )
+                DashboardWindow._post_deployment_webhook_payload(str(context.get("webhook_url") or ""), payload)
+                self.signal_marker_signal.emit(dict(payload))
+                sizing_summary = DashboardWindow._deployment_signal_sizing_summary(payload)
+                context["position_qty"] = float(position_after)
+                context["avg_price"] = price if float(position_after) != 0.0 else 0.0
+                context["last_signal_bar_ts_ns"] = bar_ts_ns
+                catalog.update_deployment_status(
+                    str(context.get("deployment_id") or ""),
+                    status="live",
+                    status_reason=f"Last signal {action} {side} sent at {signal_ts}. {sizing_summary}",
+                    last_signal_at=signal_ts,
+                )
+                parent_id = str(context.get("parent_deployment_id") or "")
+                if parent_id:
+                    catalog.update_deployment_status(
+                        parent_id,
+                        status="live",
+                        status_reason=f"Last signal {symbol} {action} {side} sent at {signal_ts}. {sizing_summary}",
+                        last_signal_at=signal_ts,
+                    )
+                self.status_signal.emit(f"{symbol} live deployment sent {action} {side}. {sizing_summary}")
+            self._store_context(context)
+            self.refresh_signal.emit()
+            self.sync_signal.emit()
+        except Exception as exc:
+            self._mark_context_error(context, str(exc))
+
+    def _mark_context_error(self, context: dict, message: str) -> None:
+        context_id = str(context.get("context_id") or "")
+        timestamp = pd.Timestamp.now(tz='UTC').isoformat()
+        catalog = ResultCatalog(self.catalog_db_path)
+        deployment_id = str(context.get("deployment_id") or "")
+        parent_deployment_id = str(context.get("parent_deployment_id") or "")
+        if deployment_id:
+            catalog.update_deployment_status(
+                deployment_id,
+                status="error",
+                status_reason=str(message)[:500],
+                last_error_at=timestamp,
+            )
+        if parent_deployment_id:
+            catalog.update_deployment_status(
+                parent_deployment_id,
+                status="error",
+                status_reason=str(message)[:500],
+                last_error_at=timestamp,
+            )
+        with self._lock:
+            self._remove_context_locked(context_id)
+        if context_id:
+            self.context_error_signal.emit(context_id)
+        self.error_signal.emit(f"{context.get('symbol') or ''} live deployment error: {message}")
+        self.refresh_signal.emit()
+
+
+class ChartWatchlistRefreshWorker(QtCore.QThread):
+    finished_signal = QtCore.pyqtSignal(object)
+    status_signal = QtCore.pyqtSignal(str)
+    error_signal = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        symbols: Sequence[str],
+        store_path: Path | str,
+        config: InteractiveBrokersRealtimeConfig,
+        timeout_seconds: float = 20.0,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.symbols = list(
+            dict.fromkeys(
+                normalized
+                for normalized in (_market_symbol_from_dataset_id(symbol) for symbol in list(symbols or []))
+                if normalized
+            )
+        )
+        self.store_path = Path(store_path)
+        self.config = config
+        self.timeout_seconds = float(timeout_seconds)
+
+    def run(self) -> None:
+        if not self.symbols:
+            self.finished_signal.emit({"bars": [], "symbols": []})
+            return
+        try:
+            store = LiveMarketDataStore(self.store_path)
+            bars = wait_for_realtime_bar_samples(
+                self.symbols,
+                config=self.config,
+                timeout_seconds=self.timeout_seconds,
+                status_callback=self.status_signal.emit,
+                error_callback=self.error_signal.emit,
+            )
+            store.upsert_bars(bars)
+            self.finished_signal.emit(
+                {
+                    "bars": [bar.as_record() for bar in bars],
+                    "symbols": list(self.symbols),
+                }
+            )
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+
+
+class ChartHistoricalSyncWorker(QtCore.QThread):
+    finished_signal = QtCore.pyqtSignal(object)
+    status_signal = QtCore.pyqtSignal(str)
+    error_signal = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        store_path: Path | str,
+        config: InteractiveBrokersRealtimeConfig,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.symbol = _market_symbol_from_dataset_id(symbol)
+        self.start_ts = pd.Timestamp(start).tz_convert("UTC") if pd.Timestamp(start).tzinfo else pd.Timestamp(start).tz_localize("UTC")
+        self.end_ts = pd.Timestamp(end).tz_convert("UTC") if pd.Timestamp(end).tzinfo else pd.Timestamp(end).tz_localize("UTC")
+        self.store_path = Path(store_path)
+        self.config = config
+
+    def run(self) -> None:
+        if not self.symbol:
+            self.error_signal.emit("A ticker symbol is required for historical chart sync.")
+            return
+        if self.start_ts >= self.end_ts:
+            self.finished_signal.emit({"symbol": self.symbol, "rows": 0})
+            return
+        try:
+            store = LiveMarketDataStore(self.store_path)
+            from scripts.fetch_interactive_brokers import fetch_bars
+
+            self.status_signal.emit(
+                f"Syncing {self.symbol} historical gap from Interactive Brokers before chart display..."
+            )
+            frame = fetch_bars(
+                self.symbol,
+                start=self.start_ts,
+                end=self.end_ts,
+                history_window="5d",
+                resolution=LIVE_BAR_TIMEFRAME,
+                host=self.config.host,
+                port=int(self.config.port),
+                client_id=int(self.config.client_id),
+                sec_type=self.config.sec_type,
+                exchange=self.config.exchange,
+                currency=self.config.currency,
+                primary_exchange=self.config.primary_exchange or None,
+                what_to_show=self.config.what_to_show,
+                use_rth=bool(self.config.use_rth),
+                chunk_duration="1d",
+                pace_seconds=0.5,
+                timeout_seconds=max(30.0, float(self.config.timeout_seconds)),
+                discover_head_timestamp=False,
+            )
+            frame = frame.sort_index()
+            rows = 0
+            batch: list[LiveMarketBar] = []
+            for timestamp, row in frame.iterrows():
+                if self.isInterruptionRequested():
+                    break
+                bar = LiveMarketBar(
+                    symbol=self.symbol,
+                    timestamp=pd.Timestamp(timestamp).tz_convert("UTC"),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row.get("volume", 0.0)),
+                    provider=DEFAULT_LIVE_PROVIDER,
+                    timeframe=LIVE_BAR_TIMEFRAME,
+                    received_at=pd.Timestamp.now(tz="UTC"),
+                )
+                batch.append(bar)
+                if len(batch) >= 500:
+                    rows += store.upsert_bars(batch)
+                    batch.clear()
+            if batch:
+                rows += store.upsert_bars(batch)
+            self.finished_signal.emit(
+                {
+                    "symbol": self.symbol,
+                    "rows": rows,
+                    "start": self.start_ts.isoformat(),
+                    "end": self.end_ts.isoformat(),
+                }
+            )
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+
+
 # --- Worker thread for grid orchestration -----------------------------------
 class GridWorker(QtCore.QThread):
     finished_signal = QtCore.pyqtSignal(object)  # payload dict with df/spec/message
@@ -2899,6 +4630,9 @@ class GridWorker(QtCore.QThread):
         sharpe_debug: bool,
         risk_free_rate: float,
         bt_settings: Dict[str, float | bool | dict | str],
+        horizon_mode: str = HORIZON_MODE_DYNAMIC,
+        fixed_horizon_start: pd.Timestamp | None = None,
+        fixed_horizon_end: pd.Timestamp | None = None,
         portfolio_strategy_blocks: Sequence[dict] | None = None,
     ) -> None:
         super().__init__()
@@ -2918,6 +4652,9 @@ class GridWorker(QtCore.QThread):
         self.sharpe_debug = sharpe_debug
         self.risk_free_rate = risk_free_rate
         self.bt_settings = bt_settings
+        self.horizon_mode = str(horizon_mode or HORIZON_MODE_DYNAMIC)
+        self.fixed_horizon_start = fixed_horizon_start
+        self.fixed_horizon_end = fixed_horizon_end
         self.portfolio_strategy_blocks = [dict(block) for block in list(portfolio_strategy_blocks or ())]
 
     @staticmethod
@@ -2950,7 +4687,16 @@ class GridWorker(QtCore.QThread):
                     raise RuntimeError(
                         f"Dataset '{dataset_id}' not found in DuckDB/parquet store. Add it first."
                     ) from exc
-            end_ts = min(raw.index[-1] for raw in raw_by_dataset.values())
+                if raw_by_dataset[dataset_id].empty:
+                    raise RuntimeError(f"Dataset '{dataset_id}' is empty and cannot be used for a backtest.")
+            shared_start_ts = max(pd.DatetimeIndex(raw.index).min() for raw in raw_by_dataset.values())
+            shared_end_ts = min(pd.DatetimeIndex(raw.index).max() for raw in raw_by_dataset.values())
+            if pd.isna(shared_start_ts) or pd.isna(shared_end_ts) or shared_start_ts > shared_end_ts:
+                raise RuntimeError(
+                    "The selected datasets do not have an overlapping historical window. "
+                    "Choose datasets with shared coverage or run them separately."
+                )
+            end_ts = shared_end_ts
             dataset_label = self._dataset_label(dataset_ids)
             study_mode = str(self.study_mode or STUDY_MODE_INDEPENDENT)
             batch_dataset_label = dataset_label
@@ -2962,17 +4708,65 @@ class GridWorker(QtCore.QThread):
                 else:
                     batch_strategy_label = f"{self.strategy_factory.__name__} [Portfolio]"
 
-            # Parse horizons (e.g., "7d,30d") -> timedeltas
-            deltas = []
-            for h in self.horizons:
-                try:
-                    deltas.append(pd.Timedelta(h))
-                except Exception:
-                    continue
-            horizons = build_horizons(end_ts, deltas) if deltas else [(None, None)]
+            horizon_mode = str(self.horizon_mode or HORIZON_MODE_DYNAMIC)
+            if horizon_mode == HORIZON_MODE_DATE_RANGE:
+                fixed_start_ts = pd.to_datetime(self.fixed_horizon_start, utc=True, errors="coerce")
+                fixed_end_ts = pd.to_datetime(self.fixed_horizon_end, utc=True, errors="coerce")
+                if pd.isna(fixed_start_ts) or pd.isna(fixed_end_ts):
+                    raise RuntimeError("Specific date range mode requires a valid start date and end date.")
+                if fixed_start_ts > fixed_end_ts:
+                    raise RuntimeError("Specific date range start must be before or equal to the end date.")
+                if (
+                    fixed_start_ts.normalize() < shared_start_ts.normalize()
+                    or fixed_end_ts.normalize() > shared_end_ts.normalize()
+                ):
+                    raise RuntimeError(
+                        "Specific date range is outside the selected dataset coverage. "
+                        f"Available shared range: {_format_coverage_date(shared_start_ts)} "
+                        f"to {_format_coverage_date(shared_end_ts)}."
+                    )
+                horizons = [(fixed_start_ts, fixed_end_ts)]
+                horizon_labels = [
+                    f"{_format_coverage_date(fixed_start_ts)}->{_format_coverage_date(fixed_end_ts)}"
+                ]
+            else:
+                deltas: list[pd.Timedelta] = []
+                invalid_horizons: list[str] = []
+                too_long_horizons: list[str] = []
+                for h in self.horizons:
+                    try:
+                        delta = _parse_horizon_timedelta(h)
+                    except Exception:
+                        invalid_horizons.append(str(h))
+                        continue
+                    if delta <= pd.Timedelta(0):
+                        invalid_horizons.append(str(h))
+                        continue
+                    if end_ts - delta < shared_start_ts:
+                        too_long_horizons.append(str(h))
+                        continue
+                    deltas.append(delta)
+                if invalid_horizons:
+                    raise RuntimeError(
+                        "Invalid horizon value(s): "
+                        + ", ".join(invalid_horizons)
+                        + ". Use values like 7d, 30d, 6mo, or 1y."
+                    )
+                if too_long_horizons:
+                    raise RuntimeError(
+                        "The selected horizon(s) extend before the available shared dataset range: "
+                        + ", ".join(too_long_horizons)
+                        + ". "
+                        f"Available shared range: {_format_coverage_date(shared_start_ts)} "
+                        f"to {_format_coverage_date(shared_end_ts)}."
+                    )
+                horizons = build_horizons(end_ts, deltas) if deltas else [(shared_start_ts, shared_end_ts)]
+                horizon_labels = [str(h) for h in self.horizons] if deltas else [
+                    f"{_format_coverage_date(shared_start_ts)}->{_format_coverage_date(shared_end_ts)}"
+                ]
 
             catalog = ResultCatalog(self.catalog_path)
-            started_at = pd.Timestamp.utcnow().isoformat()
+            started_at = pd.Timestamp.now(tz='UTC').isoformat()
             # Compute expected run_total for batch status.
             param_lists = list(self.strategy_params.values())
             param_combo = 1
@@ -3001,16 +4795,8 @@ class GridWorker(QtCore.QThread):
                 one_order_per_signal=bool(self.bt_settings.get("one_order_per_signal", True)),
                 sharpe_debug=self.sharpe_debug,
                 risk_free_rate=self.risk_free_rate,
+                **_backtest_sizing_kwargs(self.bt_settings),
             )
-            if study_mode != STUDY_MODE_PORTFOLIO and len(dataset_ids) > 1:
-                # Keep multi-asset vectorized studies responsive in the UI by
-                # forcing smaller param batches instead of one giant batch that
-                # only reports progress at the end.
-                base_config = replace(
-                    base_config,
-                    vectorized_param_batch_size=max(1, min(4, param_combo)),
-                )
-
             if not self.strategy_params:
                 raise ValueError("No strategy parameters provided.")
             first_key = list(self.strategy_params.keys())[0]
@@ -3027,6 +4813,7 @@ class GridWorker(QtCore.QThread):
                 execution_mode=str(self.bt_settings.get("execution_mode", ExecutionMode.AUTO.value)),
             )
             batch_params = dict(self.strategy_params)
+            batch_params["_execution_config"] = _backtest_sizing_kwargs(self.bt_settings)
             if study_mode == STUDY_MODE_PORTFOLIO:
                 batch_params["_study_mode"] = STUDY_MODE_PORTFOLIO
                 batch_params["_portfolio_dataset_ids"] = list(dataset_ids)
@@ -3075,7 +4862,7 @@ class GridWorker(QtCore.QThread):
                 dataset_id=batch_dataset_label,
                 params=batch_params,
                 timeframes=self.timeframes,
-                horizons=[str(h) for h in self.horizons],
+                horizons=horizon_labels,
                 run_total=run_total,
                 status="running",
                 started_at=started_at,
@@ -3118,12 +4905,21 @@ class GridWorker(QtCore.QThread):
                     for block in self.portfolio_strategy_blocks:
                         strategy_name = str(block.get("strategy_name") or "").strip()
                         strategy_spec = getattr(self.parent(), "strategy_specs", None) if hasattr(self, "parent") else None
-                        strategy_cls = None
-                        if strategy_name == "SMACrossStrategy":
+                        known_map = {
+                            "SMA Crossover": "SMACrossStrategy",
+                            "Z-Score Mean Reversion": "ZScoreMeanReversionStrategy",
+                            "Inverse Turtle": "InverseTurtleStrategy",
+                            "SMACrossStrategy": "SMACrossStrategy",
+                            "ZScoreMeanReversionStrategy": "ZScoreMeanReversionStrategy",
+                            "InverseTurtleStrategy": "InverseTurtleStrategy",
+                        }
+                        mapped_name = known_map.get(strategy_name, strategy_name)
+
+                        if mapped_name == "SMACrossStrategy":
                             strategy_cls = SMACrossStrategy
-                        elif strategy_name == "ZScoreMeanReversionStrategy":
+                        elif mapped_name == "ZScoreMeanReversionStrategy":
                             strategy_cls = ZScoreMeanReversionStrategy
-                        elif strategy_name == "InverseTurtleStrategy":
+                        elif mapped_name == "InverseTurtleStrategy":
                             strategy_cls = InverseTurtleStrategy
                         else:
                             raise RuntimeError(f"Unknown strategy block strategy: {strategy_name}")
@@ -3237,7 +5033,7 @@ class GridWorker(QtCore.QThread):
                         dataset_scope=dataset_ids,
                         param_names=list(self.strategy_params.keys()),
                         timeframes=list(self.timeframes),
-                        horizons=[str(h) for h in self.horizons],
+                        horizons=horizon_labels,
                         score_version=ROBUST_SCORE_VERSION,
                     )
                     catalog.save_optimization_study(
@@ -3271,11 +5067,11 @@ class GridWorker(QtCore.QThread):
                 dataset_id=batch_dataset_label,
                 params=batch_params,
                 timeframes=self.timeframes,
-                horizons=[str(h) for h in self.horizons],
+                horizons=horizon_labels,
                 run_total=run_total,
                 status="finished" if not self._stop_requested else "stopped",
                 started_at=started_at,
-                finished_at=pd.Timestamp.utcnow().isoformat(),
+                finished_at=pd.Timestamp.now(tz='UTC').isoformat(),
             )
             self.finished_signal.emit(
                 {
@@ -3365,6 +5161,7 @@ class WalkForwardWorker(QtCore.QThread):
                 sharpe_debug=bool(self.bt_settings.get("sharpe_debug", False)),
                 risk_free_rate=float(self.bt_settings.get("risk_free_rate", 0.0)),
                 sharpe_basis="period",
+                **_backtest_sizing_kwargs(self.bt_settings),
             )
 
             param_names = [str(name) for name in list(self.source_study_row.get("param_names") or []) if str(name)]
@@ -3516,6 +5313,7 @@ class PortfolioWalkForwardWorker(QtCore.QThread):
             sharpe_debug=bool(bt_settings.get("sharpe_debug", False)),
             risk_free_rate=float(bt_settings.get("risk_free_rate", 0.0)),
             sharpe_basis="period",
+            **_backtest_sizing_kwargs(bt_settings),
         )
 
     def run(self) -> None:
@@ -3868,6 +5666,23 @@ class DashboardDialog(QtWidgets.QDialog):
 
     def logical_parent(self):
         return self._logical_parent if self._logical_parent is not None else self.parent()
+
+    def _notify_dashboard_hook(self, hook_name: str, *args, **kwargs) -> bool:
+        current = self.logical_parent()
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            hook = getattr(current, hook_name, None)
+            if callable(hook):
+                hook(*args, **kwargs)
+                return True
+            if isinstance(current, DashboardDialog):
+                current = current.logical_parent()
+            elif isinstance(current, QtWidgets.QWidget):
+                current = current.parentWidget() or current.parent()
+            else:
+                current = getattr(current, "parent", lambda: None)()
+        return False
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -4818,9 +6633,26 @@ class ScheduledTaskEditorDialog(DashboardDialog):
         self.source_combo.setCurrentIndex(source_idx if source_idx >= 0 else 0)
         form.addRow("Source", self.source_combo)
 
+        self.concurrency_spin = QtWidgets.QSpinBox()
+        self.concurrency_spin.setRange(1, 50)
+        self.concurrency_spin.setValue(max(1, min(50, int(payload.get("concurrency") or 1))))
+        self.concurrency_spin.setToolTip(
+            "Controls concurrent Interactive Brokers/provider jobs. Massive is always limited to one ticker at a time."
+        )
+        form.addRow("Concurrent Downloads", self.concurrency_spin)
+
         self.force_refresh_chk = QtWidgets.QCheckBox("Force refresh even if local data looks fresh")
         self.force_refresh_chk.setChecked(bool(payload.get("force_refresh", False)))
         form.addRow("Refresh Policy", self.force_refresh_chk)
+
+        self.only_stale_chk = QtWidgets.QCheckBox("Auto-skip fresh datasets (queue stale/missing/gappy only)")
+        self.only_stale_chk.setChecked(
+            bool(payload.get("only_stale", not bool(payload.get("force_refresh", False))))
+            and not bool(payload.get("force_refresh", False))
+        )
+        self.only_stale_chk.toggled.connect(self._on_only_stale_toggled)
+        self.force_refresh_chk.toggled.connect(self._on_force_refresh_toggled)
+        form.addRow("Stale Queue", self.only_stale_chk)
 
         self.frequency_combo = QtWidgets.QComboBox()
         self.frequency_combo.addItems(["Nightly", "Weekly", "Monthly"])
@@ -4952,6 +6784,18 @@ class ScheduledTaskEditorDialog(DashboardDialog):
         self._selected_symbols = []
         self._update_symbol_summary()
 
+    def _on_force_refresh_toggled(self, checked: bool) -> None:
+        if hasattr(self, "only_stale_chk"):
+            self.only_stale_chk.blockSignals(True)
+            self.only_stale_chk.setChecked(not bool(checked))
+            self.only_stale_chk.blockSignals(False)
+
+    def _on_only_stale_toggled(self, checked: bool) -> None:
+        if hasattr(self, "force_refresh_chk"):
+            self.force_refresh_chk.blockSignals(True)
+            self.force_refresh_chk.setChecked(not bool(checked))
+            self.force_refresh_chk.blockSignals(False)
+
     def result_payload(self) -> tuple[dict, dict]:
         universe = self._selected_universe()
         if universe is not None:
@@ -4977,7 +6821,9 @@ class ScheduledTaskEditorDialog(DashboardDialog):
                 str(self.source_combo.currentData() or ""),
                 str((universe or {}).get("source_preference") or ""),
             ),
+            "concurrency": max(1, int(self.concurrency_spin.value())),
             "force_refresh": bool(self.force_refresh_chk.isChecked()),
+            "only_stale": bool(self.only_stale_chk.isChecked()) and not bool(self.force_refresh_chk.isChecked()),
             "resolution": str((self.task.get("symbols") or {}).get("resolution") or "1m"),
             "history": str((self.task.get("symbols") or {}).get("history") or "2y"),
             "schedule": schedule,
@@ -6880,12 +8726,24 @@ class StrategyBlockEditorDialog(DashboardDialog):
         self.block_list.blockSignals(True)
         self.block_list.clear()
         for block in self.blocks:
-            label = str(block.get("display_name") or block.get("block_id") or "Strategy Block")
-            strategy_name = str(block.get("strategy_name") or "")
-            assets = list(block.get("asset_dataset_ids") or [])
-            suffix = f" ({strategy_name}, {len(assets)} asset{'s' if len(assets) != 1 else ''})"
-            self.block_list.addItem(label + suffix)
+            self.block_list.addItem(self._block_list_label(block))
         self.block_list.blockSignals(False)
+
+    @staticmethod
+    def _block_list_label(block: dict) -> str:
+        label = str(block.get("display_name") or block.get("block_id") or "Strategy Block")
+        strategy_name = str(block.get("strategy_name") or "")
+        assets = list(block.get("asset_dataset_ids") or [])
+        suffix = f" ({strategy_name}, {len(assets)} asset{'s' if len(assets) != 1 else ''})"
+        return label + suffix
+
+    def _update_block_list_item(self, row: int) -> None:
+        if row < 0 or row >= len(self.blocks):
+            return
+        item = self.block_list.item(row)
+        if item is None:
+            return
+        item.setText(self._block_list_label(self.blocks[row]))
 
     def _update_asset_summary(self, dataset_ids: Sequence[str]) -> None:
         if not dataset_ids:
@@ -6932,8 +8790,7 @@ class StrategyBlockEditorDialog(DashboardDialog):
             f"block_{row + 1}",
         )
         self.blocks[row] = block
-        self._refresh_block_list()
-        self.block_list.setCurrentRow(row)
+        self._update_block_list_item(row)
 
     def _on_block_selection_changed(self, row: int) -> None:
         self._current_index = row
@@ -7938,8 +9795,16 @@ class PortfolioWalkForwardSetupDialog(DashboardDialog):
                     batch_params = json.loads(str(self.source_row.get("params") or "{}"))
                 except Exception:
                     batch_params = {}
-            strategy_blocks = PortfolioWalkForwardWorker._strategy_blocks_from_batch_params(batch_params or {})
-            issues, _ = parent._portfolio_strategy_block_support_issues(strategy_blocks, bt_settings)
+            strategy_blocks_obj = PortfolioWalkForwardWorker._strategy_blocks_from_batch_params(batch_params or {})
+            mapped_blocks = []
+            for b in strategy_blocks_obj:
+                mapped_blocks.append({
+                    "strategy_name": b.strategy_cls.__name__ if hasattr(b, "strategy_cls") and b.strategy_cls else "",
+                    "display_name": getattr(b, "display_name", ""),
+                    "block_id": getattr(b, "block_id", ""),
+                    "asset_dataset_ids": [a.dataset_id for a in getattr(b, "assets", [])],
+                })
+            issues, _ = parent._portfolio_strategy_block_support_issues(mapped_blocks, bt_settings)
             return list(dict.fromkeys(str(issue) for issue in issues if str(issue).strip()))
         if not hasattr(parent, "_portfolio_vectorized_support_issues"):
             return []
@@ -9492,6 +11357,370 @@ class MonteCarloStudyDialog(DashboardDialog):
         )
 
 
+class AssetFundamentalsDialog(DashboardDialog):
+    def __init__(self, asset_row: dict, provider_detail: dict[str, pd.DataFrame], parent=None) -> None:
+        super().__init__(parent)
+        self.asset_row = dict(asset_row or {})
+        self.provider_detail = dict(provider_detail or {})
+        symbol = self._asset_symbol()
+        self.setWindowTitle(f"{symbol} Asset Fundamentals")
+        self.resize(1100, 780)
+        self.setObjectName("Panel")
+        self.setStyleSheet(
+            f"""
+            QDialog#Panel {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['text']};
+            }}
+            QPlainTextEdit {{
+                background: {PALETTE['panel2']};
+                color: {PALETTE['text']};
+                border: 1px solid rgba(231, 238, 252, 0.42);
+                border-radius: 8px;
+                padding: 10px;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid rgba(231, 238, 252, 0.32);
+                border-radius: 8px;
+                top: -1px;
+            }}
+            """
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        heading = QtWidgets.QLabel(f"{symbol} | {self._display_name()}")
+        heading.setObjectName("Title")
+        layout.addWidget(heading)
+
+        source_note = QtWidgets.QLabel(
+            "Detailed fundamentals are read from the external defeatbeta parquet store. "
+            "No defeatbeta rows are written into backtests.sqlite from this view."
+        )
+        source_note.setObjectName("Sub")
+        source_note.setWordWrap(True)
+        layout.addWidget(source_note)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self._text_panel(self._overview_text()), "Overview")
+        tabs.addTab(self._text_panel(self._fundamentals_text()), "Fundamentals")
+        tabs.addTab(self._text_panel(self._news_text()), "News")
+        tabs.addTab(self._text_panel(self._events_text()), "Events & Filings")
+        tabs.addTab(self._text_panel(self._coverage_text()), "Data Coverage")
+        layout.addWidget(tabs, 1)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _asset_symbol(self) -> str:
+        return self._clean(self.asset_row.get("display_symbol") or self.asset_row.get("symbol") or "Asset")
+
+    def _display_name(self) -> str:
+        return self._clean(self.asset_row.get("name") or self.asset_row.get("symbol") or "Unknown")
+
+    def _text_panel(self, text: str) -> QtWidgets.QPlainTextEdit:
+        panel = QtWidgets.QPlainTextEdit()
+        panel.setReadOnly(True)
+        panel.setObjectName("Panel")
+        panel.setPlainText(text)
+        return panel
+
+    @staticmethod
+    def _is_blank(value: object) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) == 0
+        try:
+            result = pd.isna(value)
+            if isinstance(result, (bool, np.bool_)):
+                return bool(result)
+        except Exception:
+            pass
+        text = str(value).strip()
+        return text == "" or text.lower() in {"nan", "none", "nat"}
+
+    @classmethod
+    def _clean(cls, value: object, default: str = "—") -> str:
+        if cls._is_blank(value):
+            return default
+        return str(value).strip()
+
+    @classmethod
+    def _first_record(cls, detail: dict[str, pd.DataFrame], key: str) -> dict:
+        frame = detail.get(key)
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return {}
+        return frame.iloc[0].to_dict()
+
+    @classmethod
+    def _first_value(cls, *values: object, default: str = "—") -> str:
+        for value in values:
+            if not cls._is_blank(value):
+                return str(value).strip()
+        return default
+
+    @staticmethod
+    def _number(value: object, *, currency: bool = False, precision: int = 2) -> str:
+        if value is None:
+            return "—"
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if not np.isfinite(numeric):
+            return "—"
+        sign = "$" if currency else ""
+        abs_value = abs(numeric)
+        if abs_value >= 1_000_000_000_000:
+            return f"{sign}{numeric / 1_000_000_000_000:.{precision}f}T"
+        if abs_value >= 1_000_000_000:
+            return f"{sign}{numeric / 1_000_000_000:.{precision}f}B"
+        if abs_value >= 1_000_000:
+            return f"{sign}{numeric / 1_000_000:.{precision}f}M"
+        if abs_value >= 1_000:
+            return f"{sign}{numeric:,.0f}"
+        return f"{sign}{numeric:.{precision}f}"
+
+    @staticmethod
+    def _ratio(value: object) -> str:
+        try:
+            numeric = float(value)
+        except Exception:
+            return "—"
+        if not np.isfinite(numeric):
+            return "—"
+        return f"{numeric:.3f}"
+
+    def _profile(self) -> dict:
+        return self._first_record(self.provider_detail, "profile")
+
+    def _metrics(self) -> dict:
+        return self._first_record(self.provider_detail, "metrics")
+
+    def _overview_text(self) -> str:
+        profile = self._profile()
+        metrics = self._metrics()
+        row = self.asset_row
+        address_parts = [
+            self._clean(profile.get("address"), ""),
+            self._clean(profile.get("city"), ""),
+            self._clean(profile.get("country") or row.get("country"), ""),
+            self._clean(profile.get("zip"), ""),
+        ]
+        address = ", ".join([part for part in address_parts if part])
+        description = self._first_value(
+            profile.get("long_business_summary"),
+            row.get("description"),
+            default="No business summary is available in the external data source.",
+        )
+        lines = [
+            "Identity",
+            f"Symbol: {self._asset_symbol()}",
+            f"Name: {self._display_name()}",
+            f"Asset Class: {self._clean(row.get('asset_class'), 'Unclassified')}",
+            f"Security Type: {self._clean(row.get('security_type'))}",
+            f"Exchange: {self._clean(row.get('exchange'))}",
+            f"Country: {self._first_value(profile.get('country'), row.get('country'))}",
+            f"Currency: {self._clean(row.get('currency'))}",
+            f"Sector: {self._first_value(profile.get('sector'), row.get('sector'))}",
+            f"Industry: {self._first_value(profile.get('industry'), row.get('industry'))}",
+            "",
+            "Company Profile",
+            f"Employees: {self._number(profile.get('full_time_employees') or row.get('employee_count'), precision=0)}",
+            f"Website: {self._first_value(profile.get('web_site'), row.get('website'))}",
+            f"Phone: {self._clean(profile.get('phone'))}",
+            f"Address: {address or '—'}",
+            f"Profile As Of: {self._first_value(profile.get('report_date'), metrics.get('profile_as_of_date'), row.get('profile_as_of_date'))}",
+            "",
+            "Business Summary",
+            description,
+        ]
+        return "\n".join(lines)
+
+    def _fundamentals_text(self) -> str:
+        metrics = self._metrics()
+        row = self.asset_row
+        lines = [
+            "Key Metrics",
+            f"Market Cap: {self._number(metrics.get('market_cap') if metrics else row.get('market_cap'), currency=True)}",
+            f"Shares Outstanding: {self._number(metrics.get('shares_outstanding') if metrics else row.get('shares_outstanding'), precision=0)}",
+            f"Beta vs SPY: {self._ratio(metrics.get('beta') if metrics else row.get('beta'))}",
+            f"Metric Source: {self._first_value(metrics.get('profile_source') if metrics else None, row.get('profile_source'), default='defeatbeta')}",
+            "",
+            "Trailing EPS",
+        ]
+        eps = self.provider_detail.get("eps")
+        if isinstance(eps, pd.DataFrame) and not eps.empty:
+            for _, item in eps.head(12).iterrows():
+                lines.append(
+                    f"{self._clean(item.get('report_date'))}: "
+                    f"tailing EPS={self._number(item.get('tailing_eps'), precision=3)} | "
+                    f"EPS={self._number(item.get('eps'), precision=3)} | "
+                    f"updated={self._clean(item.get('update_time'))}"
+                )
+        else:
+            lines.append("No trailing EPS rows are available.")
+
+        lines.extend(["", "Statement Items"])
+        statements = self.provider_detail.get("statements")
+        if isinstance(statements, pd.DataFrame) and not statements.empty:
+            for _, item in statements.head(160).iterrows():
+                lines.append(
+                    f"{self._clean(item.get('finance_type'))} | "
+                    f"{self._clean(item.get('period_type'))} | "
+                    f"{self._clean(item.get('report_date'))} | "
+                    f"{self._clean(item.get('item_name'))}: {self._number(item.get('item_value'))}"
+                )
+        else:
+            lines.append("No statement rows are available.")
+        return "\n".join(lines)
+
+    def _news_text(self) -> str:
+        news = self.provider_detail.get("news")
+        if not isinstance(news, pd.DataFrame) or news.empty:
+            return "No defeatbeta news rows are available for this symbol."
+        lines = ["Latest News"]
+        for _, item in news.head(25).iterrows():
+            lines.extend(
+                [
+                    "",
+                    f"{self._clean(item.get('report_date'))} | {self._clean(item.get('publisher'))} | {self._clean(item.get('type'))}",
+                    self._clean(item.get("title")),
+                    f"Related: {self._clean(item.get('related_symbols'))}",
+                    f"Link: {self._clean(item.get('link'))}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _frame_lines(
+        self,
+        title: str,
+        key: str,
+        columns: Sequence[tuple[str, str]],
+        *,
+        limit: int = 20,
+    ) -> list[str]:
+        frame = self.provider_detail.get(key)
+        lines = [title]
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            lines.append(f"No {title.lower()} rows are available.")
+            return lines
+        for _, item in frame.head(limit).iterrows():
+            pieces = []
+            for label, column in columns:
+                if column not in item.index:
+                    continue
+                value = item.get(column)
+                if self._is_blank(value):
+                    continue
+                pieces.append(f"{label}={self._clean(value)}")
+            lines.append(" | ".join(pieces) if pieces else "—")
+        return lines
+
+    def _events_text(self) -> str:
+        sections: list[str] = []
+        sections.extend(
+            self._frame_lines(
+                "Earnings Calendar",
+                "earnings",
+                [
+                    ("date", "report_date"),
+                    ("time", "time"),
+                    ("name", "name"),
+                    ("quarter ending", "fiscal_quarter_ending"),
+                ],
+                limit=20,
+            )
+        )
+        sections.extend([""])
+        sections.extend(
+            self._frame_lines(
+                "Officers",
+                "officers",
+                [
+                    ("name", "name"),
+                    ("title", "title"),
+                    ("age", "age"),
+                    ("pay", "pay"),
+                ],
+                limit=30,
+            )
+        )
+        sections.extend([""])
+        sections.extend(
+            self._frame_lines(
+                "SEC Filings",
+                "filings",
+                [
+                    ("date", "filing_date"),
+                    ("form", "form_type"),
+                    ("description", "form_type_description"),
+                    ("url", "filing_url"),
+                ],
+                limit=25,
+            )
+        )
+        sections.extend([""])
+        sections.extend(
+            self._frame_lines(
+                "Revenue Breakdown",
+                "revenue_breakdown",
+                [
+                    ("date", "report_date"),
+                    ("type", "breakdown_type"),
+                    ("name", "item_name"),
+                    ("value", "item_value"),
+                ],
+                limit=30,
+            )
+        )
+        sections.extend([""])
+        sections.extend(
+            self._frame_lines(
+                "Earnings Call Transcripts",
+                "transcripts",
+                [
+                    ("date", "report_date"),
+                    ("year", "fiscal_year"),
+                    ("quarter", "fiscal_quarter"),
+                    ("id", "transcripts_id"),
+                ],
+                limit=8,
+            )
+        )
+        return "\n".join(sections)
+
+    def _coverage_text(self) -> str:
+        row = self.asset_row
+        metrics = self._metrics()
+        lines = [
+            "Acquisition Coverage",
+            f"Dataset Status: {self._clean(row.get('dataset_status'), 'Untracked')}",
+            f"Tracked Datasets: {self._clean(row.get('dataset_count'), '0')}",
+            f"Successful Datasets: {self._clean(row.get('successful_dataset_count'), '0')}",
+            f"Latest Dataset ID: {self._clean(row.get('latest_dataset_id'))}",
+            f"Latest Source: {self._clean(row.get('latest_source'))}",
+            f"Coverage Start: {self._clean(row.get('coverage_start'))}",
+            f"Coverage End: {self._clean(row.get('coverage_end'))}",
+            f"Freshness Status: {self._clean(row.get('freshness_status'))}",
+            f"Dataset Health: {self._clean(row.get('dataset_health_status') or row.get('freshness_status'))}",
+            "",
+            "External Provider Coverage",
+            f"defeatbeta Payload Categories: {self._clean(metrics.get('defeatbeta_payload_count') if metrics else row.get('defeatbeta_payload_count'), '0')}",
+            f"defeatbeta Earnings Rows: {self._clean(metrics.get('defeatbeta_earnings_count') if metrics else row.get('defeatbeta_earnings_count'), '0')}",
+            f"defeatbeta News Rows: {self._clean(metrics.get('defeatbeta_news_count') if metrics else row.get('defeatbeta_news_count'), '0')}",
+            f"Latest Earnings Date: {self._clean(metrics.get('latest_earnings_date') if metrics else row.get('latest_earnings_date'))}",
+            f"Latest News Date: {self._clean(metrics.get('latest_news_date') if metrics else row.get('latest_news_date'))}",
+            "",
+            "Catalog Timestamps",
+            f"First Seen: {self._clean(row.get('first_seen_at'))}",
+            f"Last Seen: {self._clean(row.get('last_seen_at'))}",
+            f"Updated At: {self._clean(row.get('updated_at'))}",
+        ]
+        return "\n".join(lines)
+
+
 # --- UI ---------------------------------------------------------------------
 class DashboardWindow(QtWidgets.QMainWindow):
     def __init__(self, catalog_path: Path) -> None:
@@ -9504,11 +11733,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         self.catalog = CatalogReader(catalog_path)
         self.catalog.ensure_catalog()
+        self.defeatbeta_reader = DefeatBetaLocalReader()
+        self.master_asset_cache = MasterAssetInformationCache()
+        self.fundamentals_cache_worker: FundamentalsCacheBuildWorker | None = None
+        self._defeatbeta_enrichment_cache_symbols: tuple[str, ...] = tuple()
+        self._defeatbeta_enrichment_cache_include_counts = False
+        self._defeatbeta_enrichment_cache = pd.DataFrame()
         self.worker: GridWorker | None = None
         self.nasdaq_symbols: list[str] = []
         self.selected_tickers: list[str] = []
         self.select_all_tickers = False
-        self.download_queue: list[str] = []
+        self.download_queue: list[dict] = []
         self.download_proc: QtCore.QProcess | None = None
         self.download_procs: list[QtCore.QProcess] = []
         self.download_policy_workers: dict[str, AcquisitionPolicyWorker] = {}
@@ -9530,19 +11765,30 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.scheduled_tasks: list[dict] = []
         self.universes: list[dict] = []
         self.asset_catalog_frame = pd.DataFrame()
+        self.asset_catalog_all_prepared_frame = pd.DataFrame()
         self.asset_catalog_filtered_frame = pd.DataFrame()
+        self.asset_catalog_page_frame = pd.DataFrame()
         self.asset_information_enrichment_frame = pd.DataFrame()
         self.asset_information_bulk_selected_asset_ids: list[str] = []
+        self.asset_information_alpha_filter = ASSET_INFORMATION_ALPHA_ALL
+        self.asset_information_page = 0
+        self.asset_information_page_size = ASSET_INFORMATION_DEFAULT_PAGE_SIZE
         self.asset_provider_sync_queue: list[str] = []
         self.asset_provider_sync_provider: str | None = None
         self.asset_provider_sync_active_symbol: str | None = None
         self.asset_provider_sync_total: int = 0
         self.asset_provider_sync_completed_symbols: list[str] = []
         self.asset_provider_sync_failed_items: list[tuple[str, str]] = []
+        self.asset_provider_sync_warning_items: list[tuple[str, str]] = []
         self._asset_information_programmatic_selection = False
         self.asset_screener_frame = pd.DataFrame()
         self.asset_screener_filtered_frame = pd.DataFrame()
+        self.asset_screener_page = 0
+        self.asset_screener_page_size = ASSET_INFORMATION_DEFAULT_PAGE_SIZE
         self.correlation_matrix_frame = pd.DataFrame()
+        self._correlation_run_selection: dict[str, set[str]] = {"strategies": set(), "portfolios": set()}
+        self._correlation_run_selector_mode: str = ""
+        self._correlation_run_selector_updating = False
         self.asset_reference_worker: FinanceDatabaseImportWorker | None = None
         self.asset_provider_worker: AssetProviderSyncWorker | None = None
         self.study_universe_id: str = ""
@@ -9554,6 +11800,44 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.deployments_frame = pd.DataFrame()
         self.deployment_metric_snapshots_frame = pd.DataFrame()
         self.deployment_child_links_frame = pd.DataFrame()
+        self.live_market_store = LiveMarketDataStore(DEFAULT_LIVE_MARKET_DB_PATH)
+        self.live_chart_snapshot_exporter = ChartSnapshotExporter(root_dir=Path("data/live_chart_snapshots"))
+        self.charts_embedded_session_id = f"charts:dashboard:{uuid.uuid4().hex[:8]}"
+        self.charts_stream_worker: ChartLiveStreamWorker | None = None
+        self.charts_watchlist_worker: ChartWatchlistRefreshWorker | None = None
+        self.charts_historical_sync_worker: ChartHistoricalSyncWorker | None = None
+        self.charts_watchlist_stream_workers: dict[str, ChartLiveStreamWorker] = {}
+        self.charts_live_paused_symbols: set[str] = set()
+        self.charts_current_symbol = ""
+        self.charts_current_session_id = ""
+        self.charts_current_session_symbol = ""
+        self.charts_current_session_timeframe = ""
+        self.charts_current_session_lookback = ""
+        self.charts_current_session_last_sent_bar_ts_ns = 0
+        self.charts_current_session_last_sent_bar_index = -1
+        self.charts_current_bars = pd.DataFrame()
+        self.charts_pending_open_after_first_bar = False
+        self.charts_pending_open_after_sync = False
+        self._charts_watchlist_refreshing = False
+        self.live_monitor_chart_sessions: dict[str, dict] = {}
+        self.live_symbol_stream_workers: dict[str, ChartLiveStreamWorker] = {}
+        self.live_symbol_stream_consumers: dict[str, set[str]] = {}
+        self.live_monitor_chart_stream_workers: dict[str, ChartLiveStreamWorker] = {}
+        self.live_monitor_historical_sync_workers: dict[str, ChartHistoricalSyncWorker] = {}
+        self.live_monitor_historical_sync_contexts: dict[str, dict] = {}
+        self.live_deployment_execution_contexts: dict[str, dict] = {}
+        self.live_deployment_symbol_index: dict[str, set[str]] = {}
+        self.live_deployment_stream_workers: dict[str, ChartLiveStreamWorker] = {}
+        self.live_deployment_runner_worker: LiveDeploymentRunnerWorker | None = None
+        self._live_monitor_engine_url_refreshing = False
+        self._external_deployment_sync_timer = QtCore.QTimer(self)
+        self._external_deployment_sync_timer.setSingleShot(True)
+        self._external_deployment_sync_timer.timeout.connect(self._run_scheduled_external_deployment_sync)
+        self._download_log_flush_timer = QtCore.QTimer(self)
+        self._download_log_flush_timer.setSingleShot(True)
+        self._download_log_flush_timer.timeout.connect(self._flush_pending_download_logs)
+        self._pending_download_log_chunks: dict[str, list[str]] = {}
+        self._last_download_session_payload_text: str = ""
         self.magellan = MagellanClient(self)
         self.snapshot_exporter = ChartSnapshotExporter()
         self._closing = False
@@ -9569,6 +11853,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._magellan_warm_timer = QtCore.QTimer(self)
         self._magellan_warm_timer.setSingleShot(True)
         self._magellan_warm_timer.timeout.connect(self._warm_magellan)
+        self._universe_acquisition_summary_timer = QtCore.QTimer(self)
+        self._universe_acquisition_summary_timer.setSingleShot(True)
+        self._universe_acquisition_summary_timer.setInterval(150)
+        self._universe_acquisition_summary_timer.timeout.connect(self._refresh_universe_acquisition_summary)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -9582,6 +11870,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self._build_universe_tab(), "Universe Builder")
         self.tabs.addTab(self._build_asset_information_tab(), "Asset Information")
         self.tabs.addTab(self._build_asset_screener_tab(), "Asset Screener")
+        self.tabs.addTab(self._build_charts_tab(), "Charts")
         self.tabs.addTab(self._build_optimization_tab(), "Optimization")
         self.tabs.addTab(self._build_walk_forward_tab(), "Walk Forward")
         self.tabs.addTab(self._build_monte_carlo_tab(), "Monte Carlo")
@@ -9591,6 +11880,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self._build_heatmap_tab(), "Heatmaps")
         self.tabs.addTab(self._build_control_panel(), "Orchestrate")
         self.tabs.addTab(self._build_automate_tab(), "Data Collection")
+        self.tabs.currentChanged.connect(self._on_dashboard_tab_changed)
 
         layout.addWidget(self.tabs)
 
@@ -9602,9 +11892,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._ensure_default_deployment_targets()
         self._load_universes()
         self.refresh()
-        self._request_picker_snapshot_refresh(force=True)
-        QtCore.QTimer.singleShot(0, self._restore_download_session_if_available)
-        self._magellan_warm_timer.start(0)
+        QtCore.QTimer.singleShot(1500, self._maybe_start_fundamentals_cache_build)
+        QtCore.QTimer.singleShot(0, lambda: self._restore_download_session_if_available(auto_resume=False))
 
     # -- sections ------------------------------------------------------------
     def _build_header(self) -> QtWidgets.QWidget:
@@ -9638,6 +11927,62 @@ class DashboardWindow(QtWidgets.QMainWindow):
         h.addWidget(self.status_label)
         h.addWidget(refresh_btn)
         return box
+
+    def _on_dashboard_tab_changed(self, _idx: int) -> None:
+        self._refresh_visible_dashboard_panels()
+
+    def _sync_charts_watchlist_stream_visibility(self, current_widget: QtWidgets.QWidget | None = None) -> None:
+        if not hasattr(self, "charts_tab"):
+            return
+        widget = current_widget if current_widget is not None else self.tabs.currentWidget()
+        if widget is getattr(self, "charts_tab", None):
+            self._start_charts_watchlist_streams()
+            return
+        self._stop_charts_watchlist_streams()
+        if hasattr(self, "charts_watchlist_stream_status"):
+            self.charts_watchlist_stream_status.setText("Watchlist live streams start when Charts is active.")
+
+    def _refresh_visible_dashboard_panels(self, *, refresh_heatmap: bool = True) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        current_widget = self.tabs.currentWidget()
+        self._sync_charts_watchlist_stream_visibility(current_widget)
+        if current_widget in {
+            getattr(self, "charts_tab", None),
+            getattr(self, "deployment_tab", None),
+            getattr(self, "live_monitor_tab", None),
+        }:
+            self._request_magellan_warmup()
+        if current_widget is getattr(self, "asset_information_tab", None):
+            self._refresh_asset_information_tab()
+            return
+        if current_widget is getattr(self, "asset_screener_tab", None):
+            self._refresh_asset_screener_tab()
+            return
+        if current_widget is getattr(self, "optimization_tab", None):
+            self._update_optimization_panel()
+            return
+        if current_widget is getattr(self, "walk_forward_tab", None):
+            self._update_walk_forward_panel()
+            return
+        if current_widget is getattr(self, "monte_carlo_tab", None):
+            self._update_monte_carlo_panel()
+            return
+        if current_widget is getattr(self, "deployment_tab", None):
+            self._update_deployment_panel()
+            return
+        if current_widget is getattr(self, "live_monitor_tab", None):
+            self._update_live_monitor_panel()
+            return
+        if refresh_heatmap and current_widget is getattr(self, "heatmap_tab", None):
+            self._update_heatmap()
+            return
+
+    def _request_magellan_warmup(self) -> None:
+        if self._closing:
+            return
+        if not self._magellan_warm_timer.isActive():
+            self._magellan_warm_timer.start(0)
 
     def _build_control_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
@@ -9769,7 +12114,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.dataset_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         self.dataset_combo.setMinimumContentsLength(12)
         self.dataset_combo.setToolTip("The selected dataset ID still drives the engine, but you can now choose it from a ticker-first picker.")
-        self.dataset_combo.currentTextChanged.connect(lambda _: self._update_study_dataset_summary())
+        self.dataset_combo.currentTextChanged.connect(lambda _: self._on_dataset_scope_changed())
         choose_current_dataset_btn = QtWidgets.QPushButton("Choose Dataset")
         choose_current_dataset_btn.clicked.connect(self._choose_current_dataset)
         current_dataset_acq_btn = QtWidgets.QPushButton("View Acquisition")
@@ -10001,17 +12346,63 @@ class DashboardWindow(QtWidgets.QMainWindow):
         )
         main_layout.addWidget(self.timeframes_combo)
 
-        main_layout.addWidget(QtWidgets.QLabel("Horizons"))
+        main_layout.addWidget(QtWidgets.QLabel("Horizon Mode"))
+        horizon_mode_row = QtWidgets.QHBoxLayout()
+        horizon_mode_row.setSpacing(12)
+        self.dynamic_horizon_radio = QtWidgets.QRadioButton("Dynamic")
+        self.fixed_horizon_radio = QtWidgets.QRadioButton("Specific Dates")
+        self.dynamic_horizon_radio.setChecked(True)
+        self.horizon_mode_group = QtWidgets.QButtonGroup(self)
+        self.horizon_mode_group.addButton(self.dynamic_horizon_radio)
+        self.horizon_mode_group.addButton(self.fixed_horizon_radio)
+        self.horizon_mode_group.buttonToggled.connect(
+            lambda _button, checked: self._update_horizon_controls() if checked else None
+        )
+        horizon_mode_row.addWidget(self.dynamic_horizon_radio)
+        horizon_mode_row.addWidget(self.fixed_horizon_radio)
+        horizon_mode_row.addStretch(1)
+        main_layout.addLayout(horizon_mode_row)
+
+        main_layout.addWidget(QtWidgets.QLabel("Dynamic Lookbacks"))
         self.horizons_combo = QtWidgets.QComboBox()
         self.horizons_combo.setEditable(True)
         self.horizons_combo.addItems(
             [
                 "7d",
                 "30d",
+                "1y",
                 "7d,30d",
             ]
         )
+        self.horizons_combo.currentTextChanged.connect(lambda _: self._update_horizon_coverage_summary())
         main_layout.addWidget(self.horizons_combo)
+
+        main_layout.addWidget(QtWidgets.QLabel("Specific Date Range"))
+        date_row = QtWidgets.QHBoxLayout()
+        date_row.setSpacing(8)
+        today = QtCore.QDate.currentDate()
+        self.horizon_start_date_edit = QtWidgets.QDateEdit()
+        self.horizon_start_date_edit.setCalendarPopup(True)
+        self.horizon_start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.horizon_start_date_edit.setDateRange(QtCore.QDate(1900, 1, 1), QtCore.QDate(2100, 12, 31))
+        self.horizon_start_date_edit.setDate(today.addYears(-1))
+        self.horizon_start_date_edit.dateChanged.connect(self._on_horizon_start_date_changed)
+        self.horizon_end_date_edit = QtWidgets.QDateEdit()
+        self.horizon_end_date_edit.setCalendarPopup(True)
+        self.horizon_end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.horizon_end_date_edit.setDateRange(QtCore.QDate(1900, 1, 1), QtCore.QDate(2100, 12, 31))
+        self.horizon_end_date_edit.setDate(today)
+        self.horizon_end_date_edit.dateChanged.connect(self._on_horizon_end_date_changed)
+        date_row.addWidget(QtWidgets.QLabel("Start"))
+        date_row.addWidget(self.horizon_start_date_edit, 1)
+        date_row.addWidget(QtWidgets.QLabel("End"))
+        date_row.addWidget(self.horizon_end_date_edit, 1)
+        main_layout.addLayout(date_row)
+        self.horizon_coverage_label = QtWidgets.QLabel("")
+        self.horizon_coverage_label.setObjectName("Sub")
+        self.horizon_coverage_label.setWordWrap(True)
+        self.horizon_coverage_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        main_layout.addWidget(self.horizon_coverage_label)
 
         main_layout.addWidget(QtWidgets.QLabel("Risk-free rate (annual, e.g. 0.02)"))
         self.risk_free_edit = QtWidgets.QLineEdit("0.0")
@@ -10075,6 +12466,25 @@ class DashboardWindow(QtWidgets.QMainWindow):
         settings_form.addRow("Borrow Rate", self.borrow_rate_edit)
         self.fill_ratio_edit = QtWidgets.QLineEdit("1.0")
         settings_form.addRow("Fill Ratio", self.fill_ratio_edit)
+        self.margin_enabled_chk = QtWidgets.QCheckBox()
+        self.margin_enabled_chk.setChecked(False)
+        settings_form.addRow("Margin Enabled", self.margin_enabled_chk)
+        self.max_gross_leverage_edit = QtWidgets.QLineEdit("2.0")
+        settings_form.addRow("Max Gross Leverage", self.max_gross_leverage_edit)
+        self.position_sizing_model_combo = QtWidgets.QComboBox()
+        self.position_sizing_model_combo.addItem("Fixed / None", "none")
+        self.position_sizing_model_combo.addItem("Annual Volatility Target", "annual_volatility_target")
+        settings_form.addRow("Position Sizing", self.position_sizing_model_combo)
+        self.annual_vol_window_edit = QtWidgets.QLineEdit("252")
+        settings_form.addRow("Annual Vol Window Days", self.annual_vol_window_edit)
+        self.annual_vol_min_periods_edit = QtWidgets.QLineEdit("20")
+        settings_form.addRow("Annual Vol Min Days", self.annual_vol_min_periods_edit)
+        self.annual_vol_floor_edit = QtWidgets.QLineEdit("0.05")
+        settings_form.addRow("Annual Vol Floor", self.annual_vol_floor_edit)
+        self.max_volatility_multiplier_edit = QtWidgets.QLineEdit("2.0")
+        settings_form.addRow("Max Vol Multiplier", self.max_volatility_multiplier_edit)
+        self.min_position_shares_edit = QtWidgets.QLineEdit("1.0")
+        settings_form.addRow("Min Position Shares", self.min_position_shares_edit)
 
         self.fill_on_close_chk = QtWidgets.QCheckBox()
         self.fill_on_close_chk.setChecked(False)
@@ -10137,11 +12547,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._update_study_mode_note()
         self._update_portfolio_strategy_block_summary()
         self._update_portfolio_allocation_summary()
+        self._update_horizon_controls()
 
         return panel
 
     def _build_home_tab(self) -> QtWidgets.QWidget:
         tab = QtWidgets.QWidget()
+        self.home_tab = tab
         layout = QtWidgets.QVBoxLayout(tab)
         layout.setSpacing(12)
 
@@ -10222,7 +12634,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         title.setObjectName("Title")
         subtitle = QtWidgets.QLabel(
             "Browse the local asset master and per-symbol acquisition coverage. "
-            "This view starts with tracked acquisition symbols, then layers in provider-native enrichment from FinanceDatabase, SimFin, and defeatbeta without mixing their raw records together."
+            "This view starts with tracked acquisition symbols, then layers in FinanceDatabase references and read-only defeatbeta fundamentals from the external parquet store."
         )
         subtitle.setObjectName("Sub")
         subtitle.setWordWrap(True)
@@ -10252,11 +12664,22 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.asset_information_status_combo.addItem("Ready", "Ready")
         self.asset_information_status_combo.addItem("Error", "Error")
         self.asset_information_status_combo.addItem("Tracked", "Tracked")
+        self.asset_information_status_combo.addItem("Untracked", "Untracked")
         self.asset_information_status_combo.currentIndexChanged.connect(self._apply_asset_information_filters)
         controls.addWidget(self.asset_information_status_combo, 1)
 
+        self.asset_information_freshness_combo = QtWidgets.QComboBox()
+        self.asset_information_freshness_combo.addItem("All Freshness", "")
+        self.asset_information_freshness_combo.addItem("Fresh", "fresh")
+        self.asset_information_freshness_combo.addItem("Stale", "stale")
+        self.asset_information_freshness_combo.addItem("Missing/Unknown", "missing")
+        self.asset_information_freshness_combo.addItem("Gappy", "gappy")
+        self.asset_information_freshness_combo.currentIndexChanged.connect(self._apply_asset_information_filters)
+        controls.addWidget(self.asset_information_freshness_combo, 1)
+
         self.asset_information_provider_combo = QtWidgets.QComboBox()
         self.asset_information_provider_combo.addItem("All Provider States", "")
+        self.asset_information_provider_combo.addItem("No Provider", "no_provider")
         self.asset_information_provider_combo.addItem("Has SimFin", "simfin")
         self.asset_information_provider_combo.addItem("Has defeatbeta", "defeatbeta")
         self.asset_information_provider_combo.addItem("Has SimFin or defeatbeta", "simfin_or_defeatbeta")
@@ -10280,15 +12703,39 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.asset_information_import_btn = QtWidgets.QPushButton("Import FinanceDatabase")
         self.asset_information_import_btn.clicked.connect(self._start_financedatabase_import)
         controls.addWidget(self.asset_information_import_btn)
-        self.asset_information_sync_simfin_btn = QtWidgets.QPushButton("Sync SimFin Selected")
+        self.asset_information_sync_simfin_btn = QtWidgets.QPushButton("SimFin External Pending")
         self.asset_information_sync_simfin_btn.clicked.connect(lambda: self._start_asset_provider_sync("simfin"))
         controls.addWidget(self.asset_information_sync_simfin_btn)
-        self.asset_information_sync_defeatbeta_btn = QtWidgets.QPushButton("Sync defeatbeta Selected")
+        self.asset_information_sync_defeatbeta_btn = QtWidgets.QPushButton("defeatbeta External")
         self.asset_information_sync_defeatbeta_btn.clicked.connect(
             lambda: self._start_asset_provider_sync("defeatbeta")
         )
         controls.addWidget(self.asset_information_sync_defeatbeta_btn)
         layout.addLayout(controls)
+
+        alpha_row = QtWidgets.QHBoxLayout()
+        alpha_row.setSpacing(4)
+        alpha_label = QtWidgets.QLabel("Starts With")
+        alpha_label.setObjectName("Sub")
+        alpha_row.addWidget(alpha_label)
+        self.asset_information_alpha_button_group = QtWidgets.QButtonGroup(self)
+        self.asset_information_alpha_button_group.setExclusive(True)
+        self.asset_information_alpha_buttons: dict[str, QtWidgets.QToolButton] = {}
+        alpha_options = [("All", ASSET_INFORMATION_ALPHA_ALL), (ASSET_INFORMATION_ALPHA_NUMERIC, ASSET_INFORMATION_ALPHA_NUMERIC)]
+        alpha_options.extend([(chr(code), chr(code)) for code in range(ord("A"), ord("Z") + 1)])
+        for label, value in alpha_options:
+            button = QtWidgets.QToolButton()
+            button.setText(label)
+            button.setCheckable(True)
+            button.setMinimumWidth(34 if value else 44)
+            button.clicked.connect(lambda _checked=False, selected=value: self._set_asset_information_alpha_filter(selected))
+            self.asset_information_alpha_button_group.addButton(button)
+            self.asset_information_alpha_buttons[value] = button
+            alpha_row.addWidget(button)
+            if value == self.asset_information_alpha_filter:
+                button.setChecked(True)
+        alpha_row.addStretch(1)
+        layout.addLayout(alpha_row)
 
         self.asset_information_import_note = QtWidgets.QLabel("")
         self.asset_information_import_note.setObjectName("Sub")
@@ -10296,7 +12743,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.asset_information_import_note)
 
         self.asset_information_provider_note = QtWidgets.QLabel(
-            "Provider sync can queue one or many selected assets. Use filters plus `Select All Filtered` to stage a sequential SimFin or defeatbeta batch without parallel downloads."
+            "defeatbeta is read from its external parquet database. SimFin will be wired the same way once its separate database path is available."
         )
         self.asset_information_provider_note.setObjectName("Sub")
         self.asset_information_provider_note.setWordWrap(True)
@@ -10343,16 +12790,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
         table_title = QtWidgets.QLabel("Asset Catalog")
         table_title.setObjectName("Title")
         table_note = QtWidgets.QLabel(
-            "Symbols already seen by the acquisition catalog are listed here first. FinanceDatabase fills broad reference coverage, while SimFin and defeatbeta attach provider-native fundamentals and event history."
+            "Symbols already seen by the acquisition catalog are listed here first. Double-click a row to open the external fundamentals, news, events, and filing detail for that asset."
         )
         table_note.setObjectName("Sub")
         table_note.setWordWrap(True)
         table_layout.addWidget(table_title)
         table_layout.addWidget(table_note)
 
-        self.asset_information_table = QtWidgets.QTableWidget(0, 8)
+        self.asset_information_table = QtWidgets.QTableWidget(0, 9)
         self.asset_information_table.setHorizontalHeaderLabels(
-            ["Symbol", "Name", "Class", "Exchange", "Country", "Datasets", "Status", "Latest Source"]
+            ["Symbol", "Name", "Class", "Exchange", "Country", "Datasets", "Status", "Freshness", "Latest Source"]
         )
         self.asset_information_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.asset_information_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -10361,7 +12808,32 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.asset_information_table.horizontalHeader().setStretchLastSection(True)
         self.asset_information_table.setObjectName("Panel")
         self.asset_information_table.itemSelectionChanged.connect(self._on_asset_information_selection_changed)
+        self.asset_information_table.itemDoubleClicked.connect(self._open_asset_information_detail_dialog)
         table_layout.addWidget(self.asset_information_table, 1)
+
+        page_controls = QtWidgets.QHBoxLayout()
+        page_controls.setSpacing(8)
+        self.asset_information_prev_page_btn = QtWidgets.QPushButton("Previous")
+        self.asset_information_prev_page_btn.clicked.connect(self._asset_information_previous_page)
+        page_controls.addWidget(self.asset_information_prev_page_btn)
+        self.asset_information_next_page_btn = QtWidgets.QPushButton("Next")
+        self.asset_information_next_page_btn.clicked.connect(self._asset_information_next_page)
+        page_controls.addWidget(self.asset_information_next_page_btn)
+        self.asset_information_page_label = QtWidgets.QLabel("Page 0 of 0")
+        self.asset_information_page_label.setObjectName("Sub")
+        page_controls.addWidget(self.asset_information_page_label)
+        page_controls.addStretch(1)
+        page_size_label = QtWidgets.QLabel("Rows")
+        page_size_label.setObjectName("Sub")
+        page_controls.addWidget(page_size_label)
+        self.asset_information_page_size_combo = QtWidgets.QComboBox()
+        for value in (100, 250, 500, 1000):
+            self.asset_information_page_size_combo.addItem(str(value), value)
+        page_size_index = self.asset_information_page_size_combo.findData(self.asset_information_page_size)
+        self.asset_information_page_size_combo.setCurrentIndex(page_size_index if page_size_index >= 0 else 1)
+        self.asset_information_page_size_combo.currentIndexChanged.connect(self._asset_information_page_size_changed)
+        page_controls.addWidget(self.asset_information_page_size_combo)
+        table_layout.addLayout(page_controls)
         split.addWidget(table_panel)
 
         detail_panel = QtWidgets.QWidget()
@@ -10398,8 +12870,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
         split.addWidget(detail_panel)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
-
-        self._refresh_asset_information_tab()
         return panel
 
     def _selected_asset_information_asset_id(self) -> str | None:
@@ -10521,8 +12991,87 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._update_asset_information_provider_controls()
         self._update_asset_information_detail()
         self.status_label.setText(
-            f"Selected all {len(self.asset_information_bulk_selected_asset_ids)} filtered assets for queued provider sync."
+            f"Selected all {len(self.asset_information_bulk_selected_asset_ids)} filtered assets."
         )
+
+    def _set_asset_information_alpha_filter(self, value: str) -> None:
+        selected = str(value or "").strip().upper()
+        if selected not in {ASSET_INFORMATION_ALPHA_ALL, ASSET_INFORMATION_ALPHA_NUMERIC} and not re.fullmatch(r"[A-Z]", selected):
+            selected = ASSET_INFORMATION_ALPHA_ALL
+        self.asset_information_alpha_filter = selected
+        if hasattr(self, "asset_information_alpha_buttons"):
+            for key, button in self.asset_information_alpha_buttons.items():
+                button.blockSignals(True)
+                button.setChecked(str(key or "") == selected)
+                button.blockSignals(False)
+        self.asset_information_page = 0
+        self._refresh_asset_information_tab()
+
+    def _asset_information_alpha_mask(self, frame: pd.DataFrame) -> pd.Series:
+        selected = str(self.asset_information_alpha_filter or "").strip().upper()
+        if not selected or frame.empty:
+            return pd.Series(True, index=frame.index)
+        symbol_text = (
+            frame.get("display_symbol", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+        )
+        fallback_symbol = frame.get("symbol", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+        fallback_name = frame.get("name", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+        starts = symbol_text.where(symbol_text.ne(""), fallback_symbol)
+        starts = starts.where(starts.ne(""), fallback_name).str[:1].str.upper()
+        if selected == ASSET_INFORMATION_ALPHA_NUMERIC:
+            return starts.str.match(r"[0-9]", na=False)
+        return starts == selected
+
+    def _asset_information_page_count(self) -> int:
+        total = len(self.asset_catalog_filtered_frame)
+        if total <= 0:
+            return 0
+        page_size = max(1, int(self.asset_information_page_size or ASSET_INFORMATION_DEFAULT_PAGE_SIZE))
+        return int(np.ceil(total / page_size))
+
+    def _refresh_asset_information_page_controls(self) -> None:
+        if not hasattr(self, "asset_information_page_label"):
+            return
+        total = len(self.asset_catalog_filtered_frame)
+        page_count = self._asset_information_page_count()
+        if total <= 0 or page_count <= 0:
+            self.asset_information_page_label.setText("Page 0 of 0 | Rows 0 of 0")
+            self.asset_information_prev_page_btn.setEnabled(False)
+            self.asset_information_next_page_btn.setEnabled(False)
+            return
+        self.asset_information_page = max(0, min(int(self.asset_information_page), page_count - 1))
+        page_size = max(1, int(self.asset_information_page_size or ASSET_INFORMATION_DEFAULT_PAGE_SIZE))
+        start = (self.asset_information_page * page_size) + 1
+        end = min(total, start + len(self.asset_catalog_page_frame) - 1)
+        if end < start:
+            end = min(total, self.asset_information_page * page_size + page_size)
+        self.asset_information_page_label.setText(
+            f"Page {self.asset_information_page + 1} of {page_count} | Rows {start}-{end} of {total}"
+        )
+        self.asset_information_prev_page_btn.setEnabled(self.asset_information_page > 0)
+        self.asset_information_next_page_btn.setEnabled(self.asset_information_page < page_count - 1)
+
+    def _asset_information_previous_page(self) -> None:
+        if self.asset_information_page <= 0:
+            return
+        self.asset_information_page -= 1
+        self._render_asset_information_table()
+
+    def _asset_information_next_page(self) -> None:
+        page_count = self._asset_information_page_count()
+        if page_count <= 0 or self.asset_information_page >= page_count - 1:
+            return
+        self.asset_information_page += 1
+        self._render_asset_information_table()
+
+    def _asset_information_page_size_changed(self, *_args) -> None:
+        if not hasattr(self, "asset_information_page_size_combo"):
+            return
+        self.asset_information_page_size = int(
+            self.asset_information_page_size_combo.currentData() or ASSET_INFORMATION_DEFAULT_PAGE_SIZE
+        )
+        self.asset_information_page = 0
+        self._render_asset_information_table(preferred_asset_id=self._selected_asset_information_asset_id())
 
     def _set_asset_information_progress(self, percent: int | None, label: str) -> None:
         if not hasattr(self, "asset_information_progress_bar") or not hasattr(
@@ -10567,17 +13116,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 provider_messages.append("Provider sync is idle.")
             selected_count = self._asset_information_selected_count()
             if selected_count:
-                provider_messages.append(f"Selected for queue: {selected_count}.")
+                provider_messages.append(f"Selected: {selected_count}.")
             provider_messages.append(
-                "SimFin ready."
-                if simfin_available()
-                else f"SimFin unavailable. {simfin_install_hint()}"
+                "SimFin external database is not configured yet; SimFin rows are no longer written to backtests.sqlite from this view."
             )
             provider_messages.append(
-                "defeatbeta ready."
-                if defeatbeta_available()
-                else f"defeatbeta unavailable. {defeatbeta_install_hint()}"
+                "External defeatbeta parquet store is available."
+                if self.defeatbeta_reader.available()
+                else f"External defeatbeta parquet store not found at {DEFEATBETA_DATA_DIR}."
             )
+            provider_messages.append(self._fundamentals_cache_status_text())
             self.asset_information_provider_note.setText(" ".join(provider_messages))
         provider_busy = self.asset_provider_worker is not None or bool(self.asset_provider_sync_provider)
         if hasattr(self, "asset_information_select_all_btn"):
@@ -10585,9 +13133,364 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if hasattr(self, "asset_information_clear_selection_btn"):
             self.asset_information_clear_selection_btn.setEnabled((not provider_busy) and self._asset_information_selected_count() > 0)
         if hasattr(self, "asset_information_sync_simfin_btn"):
-            self.asset_information_sync_simfin_btn.setEnabled((not provider_busy) and simfin_available())
+            self.asset_information_sync_simfin_btn.setEnabled(False)
+            self.asset_information_sync_simfin_btn.setToolTip("SimFin will be read from its separate external database once that path is configured.")
         if hasattr(self, "asset_information_sync_defeatbeta_btn"):
-            self.asset_information_sync_defeatbeta_btn.setEnabled((not provider_busy) and defeatbeta_available())
+            self.asset_information_sync_defeatbeta_btn.setEnabled(False)
+            self.asset_information_sync_defeatbeta_btn.setToolTip("defeatbeta is read from the external parquet store and is not synced into backtests.sqlite.")
+
+    def _fundamentals_cache_status_text(self) -> str:
+        if not self.master_asset_cache.available():
+            return "Fundamentals cache is not built yet."
+        metadata = self.master_asset_cache.metadata()
+        refreshed_at = str(metadata.get("refreshed_at") or "unknown")
+        row_count = self.master_asset_cache.row_count()
+        stale_note = " stale" if self.master_asset_cache.is_stale() else ""
+        return f"Fundamentals cache: {row_count:,} defeatbeta symbols, refreshed {refreshed_at}{stale_note}."
+
+    def _maybe_start_fundamentals_cache_build(self) -> None:
+        if self._closing or self.fundamentals_cache_worker is not None:
+            return
+        if not self.defeatbeta_reader.available():
+            return
+        if self.master_asset_cache.is_stale():
+            self._start_fundamentals_cache_build(manual=False)
+
+    def _start_fundamentals_cache_build(self, *, manual: bool = False) -> None:
+        if self.fundamentals_cache_worker is not None:
+            if manual:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Fundamentals Cache",
+                    "A fundamentals cache refresh is already running.",
+                )
+            return
+        if not self.defeatbeta_reader.available():
+            QtWidgets.QMessageBox.information(
+                self,
+                "defeatbeta Unavailable",
+                f"The defeatbeta parquet store was not found at {DEFEATBETA_DATA_DIR}.",
+            )
+            return
+        self.fundamentals_cache_worker = FundamentalsCacheBuildWorker(
+            cache_path=self.master_asset_cache.db_path,
+            defeatbeta_data_dir=self.defeatbeta_reader.data_dir,
+        )
+        self.fundamentals_cache_worker.finished_signal.connect(self._fundamentals_cache_build_finished)
+        self.fundamentals_cache_worker.error_signal.connect(self._fundamentals_cache_build_error)
+        self.fundamentals_cache_worker.finished.connect(self._fundamentals_cache_worker_stopped)
+        self.fundamentals_cache_worker.finished.connect(self.fundamentals_cache_worker.deleteLater)
+        if hasattr(self, "status_label"):
+            self.status_label.setText("Refreshing external fundamentals cache from defeatbeta...")
+        if hasattr(self, "asset_information_progress_bar"):
+            self._set_asset_information_progress(None, "Refreshing external fundamentals cache from defeatbeta...")
+        self.fundamentals_cache_worker.start()
+
+    def _fundamentals_cache_build_finished(self, payload: object) -> None:
+        data = dict(payload or {}) if isinstance(payload, dict) else {}
+        row_count = int(data.get("row_count") or self.master_asset_cache.row_count())
+        if hasattr(self, "status_label"):
+            self.status_label.setText(f"Fundamentals cache refreshed ({row_count:,} symbols).")
+        if hasattr(self, "asset_information_progress_bar"):
+            self._clear_asset_information_progress()
+        self.asset_catalog_all_prepared_frame = pd.DataFrame()
+        if hasattr(self, "asset_information_table"):
+            self._refresh_asset_information_tab(announce=False)
+        if hasattr(self, "asset_screener_table"):
+            self._refresh_asset_screener_tab(announce=False)
+
+    def _fundamentals_cache_build_error(self, message: str) -> None:
+        if hasattr(self, "asset_information_progress_bar"):
+            self._clear_asset_information_progress()
+        if hasattr(self, "status_label"):
+            self.status_label.setText(f"Fundamentals cache refresh failed: {message}")
+        self._show_error_dialog("Fundamentals Cache Error", str(message or "Unknown error"))
+
+    def _fundamentals_cache_worker_stopped(self) -> None:
+        if self.fundamentals_cache_worker is not None and not self.fundamentals_cache_worker.isRunning():
+            self.fundamentals_cache_worker = None
+
+    def _load_external_defeatbeta_enrichment(
+        self,
+        symbols: Sequence[str],
+        *,
+        include_event_counts: bool = False,
+    ) -> pd.DataFrame:
+        cleaned = tuple(sorted(DefeatBetaLocalReader._symbols(symbols)))
+        if not cleaned:
+            return pd.DataFrame(columns=DefeatBetaLocalReader.ENRICHMENT_COLUMNS)
+        if self.master_asset_cache.available():
+            cached = self.master_asset_cache.load(cleaned)
+            if not cached.empty:
+                return cached
+        if not self.defeatbeta_reader.available() or len(cleaned) > 500:
+            return pd.DataFrame(columns=DefeatBetaLocalReader.ENRICHMENT_COLUMNS)
+        cache_symbols = getattr(self, "_defeatbeta_enrichment_cache_symbols", tuple())
+        cache_include_counts = bool(getattr(self, "_defeatbeta_enrichment_cache_include_counts", False))
+        if (
+            cleaned == cache_symbols
+            and include_event_counts == cache_include_counts
+            and not self._defeatbeta_enrichment_cache.empty
+        ):
+            return self._defeatbeta_enrichment_cache.copy()
+        try:
+            enrichment = self.defeatbeta_reader.load_enrichment(cleaned, include_event_counts=include_event_counts)
+        except Exception as exc:
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"External defeatbeta enrichment failed: {exc}")
+            return pd.DataFrame(columns=DefeatBetaLocalReader.ENRICHMENT_COLUMNS)
+        self._defeatbeta_enrichment_cache_symbols = cleaned
+        self._defeatbeta_enrichment_cache_include_counts = include_event_counts
+        self._defeatbeta_enrichment_cache = enrichment.copy()
+        return enrichment
+
+    def _merge_external_defeatbeta_enrichment(
+        self,
+        frame: pd.DataFrame,
+        *,
+        include_event_counts: bool = False,
+    ) -> pd.DataFrame:
+        if frame.empty or "symbol" not in frame.columns:
+            return frame
+        symbols = [
+            str(item).strip().upper()
+            for item in frame.get("symbol", pd.Series(dtype=str)).fillna("").tolist()
+            if str(item).strip()
+        ]
+        enrichment = self._load_external_defeatbeta_enrichment(symbols, include_event_counts=include_event_counts)
+        if enrichment.empty:
+            return frame
+
+        working = frame.copy()
+        working["_symbol_key"] = working["symbol"].fillna("").astype(str).str.upper()
+        external = enrichment.copy()
+        external["_symbol_key"] = external["symbol"].fillna("").astype(str).str.upper()
+        external = external.drop(columns=["symbol"], errors="ignore")
+        merged = working.merge(external, on="_symbol_key", how="left", suffixes=("", "_external"))
+
+        def _external_column(name: str) -> str | None:
+            if f"{name}_external" in merged.columns:
+                return f"{name}_external"
+            if name in external.columns and name in merged.columns:
+                return name
+            return None
+
+        for column in ("market_cap", "shares_outstanding", "beta"):
+            ext_col = _external_column(column)
+            if ext_col is None:
+                continue
+            if column not in merged.columns:
+                merged[column] = np.nan
+            external_values = pd.to_numeric(merged[ext_col], errors="coerce")
+            current_values = pd.to_numeric(merged[column], errors="coerce")
+            merged[column] = external_values.where(external_values.notna(), current_values)
+
+        for column in ("employee_count",):
+            ext_col = _external_column(column)
+            if ext_col is None:
+                continue
+            if column not in merged.columns:
+                merged[column] = np.nan
+            external_values = pd.to_numeric(merged[ext_col], errors="coerce")
+            current_values = pd.to_numeric(merged[column], errors="coerce")
+            merged[column] = current_values.where(current_values.notna(), external_values)
+
+        for column in ("description", "website"):
+            ext_col = _external_column(column)
+            if ext_col is None:
+                continue
+            if column not in merged.columns:
+                merged[column] = ""
+            current_text = merged[column].fillna("").astype(str).str.strip()
+            external_text = merged[ext_col].fillna("").astype(str).str.strip()
+            merged[column] = current_text.where(current_text.ne(""), external_text)
+
+        for base_column, external_column in (
+            ("sector", "sector_defeatbeta"),
+            ("industry", "industry_defeatbeta"),
+            ("country", "country_defeatbeta"),
+        ):
+            ext_col = _external_column(external_column)
+            if ext_col is None:
+                continue
+            if base_column not in merged.columns:
+                merged[base_column] = ""
+            current_text = merged[base_column].fillna("").astype(str).str.strip()
+            external_text = merged[ext_col].fillna("").astype(str).str.strip()
+            merged[base_column] = current_text.where(current_text.ne(""), external_text)
+
+        for column in ("defeatbeta_payload_count", "defeatbeta_earnings_count", "defeatbeta_news_count", "provider_payload_count"):
+            ext_col = _external_column(column)
+            if ext_col is None:
+                continue
+            if column not in merged.columns:
+                merged[column] = 0
+            external_values = pd.to_numeric(merged[ext_col], errors="coerce").fillna(0)
+            current_values = pd.to_numeric(merged[column], errors="coerce").fillna(0)
+            merged[column] = np.maximum(current_values, external_values).astype(int)
+
+        for column in ("profile_as_of_date", "latest_earnings_date", "latest_news_date"):
+            ext_col = _external_column(column)
+            if ext_col is None:
+                continue
+            if column not in merged.columns:
+                merged[column] = ""
+            external_text = merged[ext_col].fillna("").astype(str).str.strip()
+            current_text = merged[column].fillna("").astype(str).str.strip()
+            merged[column] = external_text.where(external_text.ne(""), current_text)
+
+        if "profile_source" not in merged.columns:
+            merged["profile_source"] = ""
+        external_payloads = pd.to_numeric(merged.get("defeatbeta_payload_count", pd.Series(0, index=merged.index)), errors="coerce").fillna(0)
+        merged["profile_source"] = merged["profile_source"].fillna("").astype(str).str.strip()
+        merged.loc[external_payloads.gt(0), "profile_source"] = "defeatbeta"
+
+        drop_columns = [column for column in merged.columns if column.endswith("_external")]
+        drop_columns.extend(["_symbol_key", "sector_defeatbeta", "industry_defeatbeta", "country_defeatbeta"])
+        return merged.drop(columns=[column for column in drop_columns if column in merged.columns], errors="ignore")
+
+    @staticmethod
+    def _symbol_matches_asset_alpha(symbol: object, alpha_filter: str) -> bool:
+        selected = str(alpha_filter or "").strip().upper()
+        if not selected:
+            return True
+        text = str(symbol or "").strip().upper()
+        if not text:
+            return False
+        first = text[:1]
+        if selected == ASSET_INFORMATION_ALPHA_NUMERIC:
+            return bool(re.fullmatch(r"[0-9]", first))
+        if re.fullmatch(r"[A-Z]", selected):
+            return first == selected
+        return True
+
+    def _cached_fundamental_symbols(self, *, alpha_filter: str = "") -> list[str]:
+        if not self.master_asset_cache.available():
+            return []
+        frame = self.master_asset_cache.load()
+        if frame.empty or "symbol" not in frame.columns:
+            return []
+        symbols = [
+            str(item).strip().upper()
+            for item in frame["symbol"].fillna("").tolist()
+            if str(item).strip()
+        ]
+        if alpha_filter:
+            symbols = [symbol for symbol in symbols if self._symbol_matches_asset_alpha(symbol, alpha_filter)]
+        return list(dict.fromkeys(symbols))
+
+    def _tracked_asset_symbols(self, *, alpha_filter: str = "") -> list[str]:
+        try:
+            datasets = self.catalog.load_acquisition_datasets(include_untracked_local=False)
+        except Exception:
+            datasets = pd.DataFrame()
+        if datasets.empty or "symbol" not in datasets.columns:
+            return []
+        symbols = [
+            str(item).strip().upper()
+            for item in datasets["symbol"].fillna("").tolist()
+            if str(item).strip()
+        ]
+        if alpha_filter:
+            symbols = [symbol for symbol in symbols if self._symbol_matches_asset_alpha(symbol, alpha_filter)]
+        return list(dict.fromkeys(symbols))
+
+    def _apply_asset_class_overrides(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty or "symbol" not in frame.columns:
+            return frame
+        working = frame.copy()
+        if "asset_class" not in working.columns:
+            working["asset_class"] = ""
+        if "security_type" not in working.columns:
+            working["security_type"] = ""
+        symbols = working["symbol"].fillna("").astype(str).str.upper()
+        for symbol, (asset_class, security_type) in ASSET_CLASS_OVERRIDES.items():
+            mask = symbols == str(symbol).upper()
+            if not bool(mask.any()):
+                continue
+            working.loc[mask, "asset_class"] = asset_class
+            working.loc[mask, "security_type"] = security_type
+        return working
+
+    def _load_asset_working_catalog_frame(self, *, alpha_filter: str = "") -> pd.DataFrame:
+        selected_alpha = str(alpha_filter or "").strip().upper()
+        if selected_alpha:
+            frame = self.catalog.load_asset_catalog_by_alpha(selected_alpha)
+        else:
+            frame = self.catalog.load_asset_catalog(
+                bootstrap_from_acquisition=False,
+                limit=ASSET_INFORMATION_STARTUP_LIMIT,
+            )
+
+        extra_symbols = self._tracked_asset_symbols(alpha_filter=selected_alpha)
+        extra_symbols.extend(self._cached_fundamental_symbols(alpha_filter=selected_alpha))
+        extra_symbols = list(dict.fromkeys(symbol for symbol in extra_symbols if symbol))
+        if extra_symbols:
+            symbol_rows = self.catalog.load_asset_catalog_for_symbols(extra_symbols)
+            if not symbol_rows.empty:
+                frame = pd.concat([frame, symbol_rows], ignore_index=True, sort=False)
+                frame = frame.drop_duplicates("asset_id", keep="first")
+        frame = self._apply_asset_class_overrides(frame)
+        frame = self._append_cached_fundamental_asset_rows(frame, symbols=extra_symbols if selected_alpha else None)
+        return self._apply_asset_class_overrides(frame)
+
+    def _append_cached_fundamental_asset_rows(
+        self,
+        frame: pd.DataFrame,
+        *,
+        symbols: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        if symbols is not None and not list(symbols):
+            return frame
+        enrichment = self.master_asset_cache.load(symbols)
+        if enrichment.empty:
+            return frame
+        working = frame.copy()
+        for column in CatalogReader._asset_catalog_columns():
+            if column not in working.columns:
+                working[column] = ""
+        existing_symbols = (
+            set(working["symbol"].fillna("").astype(str).str.upper().tolist())
+            if "symbol" in working.columns
+            else set()
+        )
+        extras = enrichment.loc[
+            ~enrichment["symbol"].fillna("").astype(str).str.upper().isin(existing_symbols)
+        ].copy()
+        if extras.empty:
+            return working
+        extra_rows = pd.DataFrame(
+            {
+                "asset_id": "defeatbeta:" + extras["symbol"].fillna("").astype(str),
+                "symbol": extras["symbol"].fillna("").astype(str),
+                "display_symbol": extras["symbol"].fillna("").astype(str),
+                "name": extras["symbol"].fillna("").astype(str),
+                "asset_class": "Equity",
+                "security_type": "Stock",
+                "exchange": "",
+                "country": extras.get("country_defeatbeta", pd.Series("", index=extras.index)).fillna("").astype(str),
+                "currency": "USD",
+                "sector": extras.get("sector_defeatbeta", pd.Series("", index=extras.index)).fillna("").astype(str),
+                "industry": extras.get("industry_defeatbeta", pd.Series("", index=extras.index)).fillna("").astype(str),
+                "dataset_status": "Untracked",
+                "dataset_count": 0,
+                "successful_dataset_count": 0,
+                "latest_dataset_id": "",
+                "latest_source": "defeatbeta",
+                "latest_download_at": "",
+                "latest_success_at": "",
+                "latest_failure_at": "",
+                "latest_failure_reason": "",
+                "coverage_start": "",
+                "coverage_end": "",
+                "freshness_status": "missing",
+                "first_seen_at": "",
+                "last_seen_at": "",
+                "created_at": "",
+                "updated_at": "",
+            }
+        )
+        return pd.concat([working, extra_rows], ignore_index=True, sort=False)
 
     def _refresh_asset_information_tab(self, *, announce: bool = False) -> None:
         if not hasattr(self, "asset_information_table"):
@@ -10599,8 +13502,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
             else ""
         )
         bootstrapped = self.catalog.bootstrap_asset_catalog()
-        self.asset_catalog_frame = self.catalog.load_asset_catalog(bootstrap_from_acquisition=False)
-        enrichment = self.catalog.load_asset_screener_enrichment()
+        self.asset_catalog_frame = self._load_asset_working_catalog_frame(
+            alpha_filter=self.asset_information_alpha_filter
+        )
+        enrichment = pd.DataFrame()
         self.asset_information_enrichment_frame = enrichment
         if not enrichment.empty:
             self.asset_catalog_frame = self.asset_catalog_frame.merge(enrichment, on="asset_id", how="left")
@@ -10624,6 +13529,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         ):
             if column not in self.asset_catalog_frame.columns:
                 self.asset_catalog_frame[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta"} else ""
+        self.asset_catalog_frame = self._merge_external_defeatbeta_enrichment(self.asset_catalog_frame, include_event_counts=True)
+        self.asset_catalog_frame = self._augment_asset_catalog_freshness(self.asset_catalog_frame)
+        if not str(self.asset_information_alpha_filter or "").strip():
+            self.asset_catalog_all_prepared_frame = self.asset_catalog_frame.copy()
         if hasattr(self, "asset_information_import_note"):
             if self.asset_reference_worker is not None:
                 self.asset_information_import_note.setText("FinanceDatabase import is running in the background…")
@@ -10661,23 +13570,39 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._apply_asset_information_filters(selected_asset_id=selected_asset_id)
         if announce:
             self.status_label.setText(
-                f"Asset catalog refreshed ({len(self.asset_catalog_frame)} assets, {bootstrapped} bootstrapped from tracked datasets)."
+                f"Asset catalog refreshed ({len(self.asset_catalog_frame)} visible-scope assets, {bootstrapped} bootstrapped from tracked datasets)."
             )
 
     def _apply_asset_information_filters(self, *_args, selected_asset_id: str | None = None) -> None:
         if not hasattr(self, "asset_information_table"):
             return
+        if selected_asset_id is None:
+            self.asset_information_page = 0
         frame = self.asset_catalog_frame.copy()
         if frame.empty:
             self.asset_catalog_filtered_frame = frame
+            self.asset_catalog_page_frame = pd.DataFrame()
             self.asset_information_table.setRowCount(0)
             self.asset_information_summary_label.setText(
                 "No assets are cataloged yet. Use Data Collection or manual CSV import to create tracked symbols, then refresh this tab."
             )
             self.asset_information_detail.setPlainText("No asset records are available yet.")
+            self._refresh_asset_information_page_controls()
             return
 
-        for column in ("display_symbol", "name", "asset_class", "exchange", "country", "sector", "industry", "latest_source", "dataset_status"):
+        for column in (
+            "display_symbol",
+            "name",
+            "asset_class",
+            "exchange",
+            "country",
+            "sector",
+            "industry",
+            "latest_source",
+            "dataset_status",
+            "freshness_status",
+            "dataset_health_status",
+        ):
             if column not in frame.columns:
                 frame[column] = ""
         frame["asset_class"] = frame["asset_class"].fillna("").replace("", "Unclassified")
@@ -10708,6 +13633,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             ).str.lower()
             frame = frame.loc[haystack.str.contains(re.escape(search_text), regex=True, na=False)].copy()
 
+        frame = frame.loc[self._asset_information_alpha_mask(frame)].copy()
+
         selected_class = (
             str(self.asset_information_class_combo.currentData() or "")
             if hasattr(self, "asset_information_class_combo")
@@ -10724,12 +13651,27 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if selected_status:
             frame = frame.loc[frame["dataset_status"].astype(str) == selected_status].copy()
 
+        selected_freshness = (
+            str(self.asset_information_freshness_combo.currentData() or "")
+            if hasattr(self, "asset_information_freshness_combo")
+            else ""
+        )
+        frame = self._filter_frame_by_freshness(frame, selected_freshness)
+
         selected_provider_state = (
             str(self.asset_information_provider_combo.currentData() or "")
             if hasattr(self, "asset_information_provider_combo")
             else ""
         )
-        if selected_provider_state == "simfin":
+        has_any_provider = (
+            pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0)
+            + pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0)
+            + pd.to_numeric(frame["defeatbeta_earnings_count"], errors="coerce").fillna(0)
+            + pd.to_numeric(frame["defeatbeta_news_count"], errors="coerce").fillna(0)
+        ) > 0
+        if selected_provider_state == "no_provider":
+            frame = frame.loc[~has_any_provider].copy()
+        elif selected_provider_state == "simfin":
             frame = frame.loc[pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0) > 0].copy()
         elif selected_provider_state == "defeatbeta":
             frame = frame.loc[pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0) > 0].copy()
@@ -10752,7 +13694,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "asset_information_summary_label"):
             return
         frame = self.asset_catalog_filtered_frame.copy()
-        render_count = min(len(frame), 1000)
         if frame.empty:
             self.asset_information_summary_label.setText(
                 f"Showing 0 of {len(self.asset_catalog_frame)} assets for the current filters."
@@ -10761,34 +13702,67 @@ class DashboardWindow(QtWidgets.QMainWindow):
         ready_count = int((frame["dataset_status"].astype(str) == "Ready").sum())
         error_count = int((frame["dataset_status"].astype(str) == "Error").sum())
         tracked_count = int((frame["dataset_status"].astype(str) == "Tracked").sum())
+        freshness = frame.get("freshness_status", pd.Series(dtype=str)).fillna("").astype(str).str.lower()
+        health = frame.get("dataset_health_status", pd.Series(dtype=str)).fillna("").astype(str).str.lower()
+        fresh_count = int(((freshness == "fresh") & (health != "gappy")).sum())
+        stale_count = int(((freshness == "stale") & (health != "gappy")).sum())
+        gappy_count = int((health == "gappy").sum())
         selected_count = self._asset_information_selected_count()
-        rendered_note = f" | Rendered first {render_count}" if len(frame) > render_count else ""
+        page_count = self._asset_information_page_count()
+        page_note = f" | Page {self.asset_information_page + 1}/{page_count}" if page_count else ""
+        alpha_note = (
+            f" | Starts With: {self.asset_information_alpha_filter}"
+            if self.asset_information_alpha_filter
+            else ""
+        )
         selected_note = f" | Selected: {selected_count}" if selected_count else ""
         self.asset_information_summary_label.setText(
-            f"Showing {len(frame)} of {len(self.asset_catalog_frame)} assets{rendered_note} | "
-            f"Ready: {ready_count} | Error: {error_count} | Tracked: {tracked_count}{selected_note}"
+            f"Showing {len(frame)} of {len(self.asset_catalog_frame)} assets{page_note}{alpha_note} | "
+            f"Ready: {ready_count} | Error: {error_count} | Tracked: {tracked_count} | "
+            f"Fresh: {fresh_count} | Stale: {stale_count} | Gappy: {gappy_count}{selected_note}"
         )
 
     def _render_asset_information_table(self, *, preferred_asset_id: str | None = None) -> None:
         frame = self.asset_catalog_filtered_frame.copy()
-        max_rows = 1000
-        render_frame = frame.head(max_rows).copy()
+        page_size = max(1, int(self.asset_information_page_size or ASSET_INFORMATION_DEFAULT_PAGE_SIZE))
+        if preferred_asset_id and not frame.empty and "asset_id" in frame.columns:
+            matches = frame.index[frame["asset_id"].astype(str) == str(preferred_asset_id)].tolist()
+            if matches:
+                self.asset_information_page = int(matches[0]) // page_size
+        page_count = self._asset_information_page_count()
+        if page_count <= 0:
+            self.asset_information_page = 0
+        else:
+            self.asset_information_page = max(0, min(int(self.asset_information_page), page_count - 1))
+        start = self.asset_information_page * page_size
+        render_frame = frame.iloc[start : start + page_size].copy().reset_index(drop=True)
+        self.asset_catalog_page_frame = render_frame.copy()
         self.asset_information_table.setRowCount(len(render_frame))
+        self._refresh_asset_information_page_controls()
         status_colors = {
             "Ready": PALETTE["green"],
             "Error": PALETTE["red"],
             "Tracked": PALETTE["amber"],
             "Untracked": PALETTE["muted"],
         }
+        freshness_colors = {
+            "Fresh": PALETTE["green"],
+            "Stale": PALETTE["amber"],
+            "Missing": PALETTE["muted"],
+            "Unknown": PALETTE["muted"],
+            "Gappy": PALETTE["red"],
+        }
         for row_idx, (_, row) in enumerate(render_frame.iterrows()):
+            freshness_label = self._asset_freshness_label(row.get("dataset_health_status") or row.get("freshness_status"))
             values = [
                 str(row.get("display_symbol") or row.get("symbol") or ""),
                 str(row.get("name") or row.get("symbol") or ""),
                 str(row.get("asset_class") or "Unclassified"),
                 str(row.get("exchange") or "—"),
                 str(row.get("country") or "—"),
-                str(int(row.get("dataset_count", 0) or 0)),
+                str(self._asset_int_value(row.get("dataset_count"))),
                 str(row.get("dataset_status") or "Untracked"),
+                freshness_label,
                 str(row.get("latest_source") or "—"),
             ]
             for col_idx, value in enumerate(values):
@@ -10797,6 +13771,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
                     item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("asset_id") or ""))
                 if col_idx == 6:
                     item.setForeground(QtGui.QColor(status_colors.get(value, PALETTE["text"])))
+                if col_idx == 7:
+                    item.setForeground(QtGui.QColor(freshness_colors.get(value, PALETTE["text"])))
                 self.asset_information_table.setItem(row_idx, col_idx, item)
 
         if frame.empty:
@@ -10831,7 +13807,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
                     matches = render_frame.index[render_frame["asset_id"].astype(str) == str(preferred_asset_id)].tolist()
                     if matches:
                         selected_row = int(matches[0])
-                self.asset_information_table.selectRow(selected_row)
+                if len(render_frame):
+                    self.asset_information_table.selectRow(selected_row)
         finally:
             self._asset_information_programmatic_selection = False
         self._update_asset_information_summary()
@@ -10854,6 +13831,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         row = match.iloc[0].to_dict()
         identifiers = self.catalog.load_asset_identifiers(asset_id)
         provider_payload_summary = self.catalog.load_asset_provider_payload_summary(asset_id)
+        provider_sync_events = self.catalog.load_asset_provider_sync_events(asset_id, limit=6)
         lines = [
             f"Symbol: {row.get('display_symbol') or row.get('symbol') or '—'}",
             f"Name: {row.get('name') or row.get('symbol') or '—'}",
@@ -10872,8 +13850,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             f"Shareclass FIGI: {identifiers.get('shareclass_figi') or '—'}",
             "",
             f"Dataset Status: {row.get('dataset_status') or 'Untracked'}",
-            f"Tracked Datasets: {int(row.get('dataset_count', 0) or 0)}",
-            f"Successful Datasets: {int(row.get('successful_dataset_count', 0) or 0)}",
+            f"Tracked Datasets: {self._asset_int_value(row.get('dataset_count'))}",
+            f"Successful Datasets: {self._asset_int_value(row.get('successful_dataset_count'))}",
             f"Latest Dataset ID: {row.get('latest_dataset_id') or '—'}",
             f"Latest Source: {row.get('latest_source') or '—'}",
             f"Latest Download Attempt: {row.get('latest_download_at') or '—'}",
@@ -10882,7 +13860,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             f"Latest Failure Reason: {row.get('latest_failure_reason') or '—'}",
             f"Coverage Start: {row.get('coverage_start') or '—'}",
             f"Coverage End: {row.get('coverage_end') or '—'}",
-            f"Freshness Status: {row.get('freshness_status') or '—'}",
+            f"Freshness Status: {self._asset_freshness_label(row.get('freshness_status'))}",
+            f"Dataset Health: {self._asset_freshness_label(row.get('dataset_health_status') or row.get('freshness_status'))}",
             "",
             "Provider Payload Coverage:",
         ]
@@ -10890,10 +13869,31 @@ class DashboardWindow(QtWidgets.QMainWindow):
             for item in provider_payload_summary:
                 lines.append(
                     f"{item.get('provider') or '—'} | {item.get('dataset_code') or '—'} | "
-                    f"records={int(item.get('record_count') or 0)} | latest={item.get('latest_fetched_at') or '—'}"
+                    f"records={self._asset_int_value(item.get('record_count'))} | latest={item.get('latest_fetched_at') or '—'}"
                 )
         else:
             lines.append("No provider-native payloads have been synced yet.")
+        lines.extend(["", "Recent Provider Sync Events:"])
+        if provider_sync_events:
+            for item in provider_sync_events:
+                status = str(item.get("status") or "unknown").strip() or "unknown"
+                provider = str(item.get("provider") or "—").strip() or "—"
+                updated_at = str(item.get("updated_at") or item.get("created_at") or "—")
+                record_count = item.get("record_count")
+                record_note = (
+                    f" | records={self._asset_int_value(record_count)}"
+                    if record_count is not None and not pd.isna(record_count)
+                    else ""
+                )
+                lines.append(f"{provider} | {status} | {updated_at}{record_note}")
+                message = str(item.get("message") or "").strip()
+                details = str(item.get("details") or "").strip()
+                if message:
+                    lines.append(f"  {message}")
+                if details:
+                    lines.append(f"  Details: {details}")
+        else:
+            lines.append("No provider sync events have been recorded for this asset yet.")
         lines.extend(
             [
                 "",
@@ -10903,6 +13903,51 @@ class DashboardWindow(QtWidgets.QMainWindow):
             ]
         )
         self.asset_information_detail.setPlainText("\n".join(lines))
+
+    def _asset_row_for_asset_id(self, asset_id: str, *frames: pd.DataFrame) -> dict:
+        target = str(asset_id or "").strip()
+        if not target:
+            return {}
+        for frame in frames:
+            if not isinstance(frame, pd.DataFrame) or frame.empty or "asset_id" not in frame.columns:
+                continue
+            match = frame.loc[frame["asset_id"].astype(str) == target]
+            if not match.empty:
+                return match.iloc[0].to_dict()
+        return {}
+
+    def _open_asset_fundamentals_dialog_for_row(self, row: dict) -> None:
+        if not row:
+            return
+        symbol = str(row.get("symbol") or row.get("display_symbol") or "").strip().upper()
+        detail: dict[str, pd.DataFrame] = {}
+        if symbol and self.defeatbeta_reader.available():
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"Loading {symbol} external fundamentals from defeatbeta…")
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+            try:
+                detail = self.defeatbeta_reader.load_symbol_detail(symbol)
+            except Exception as exc:
+                QtWidgets.QApplication.restoreOverrideCursor()
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "External Fundamentals Error",
+                    f"Could not load defeatbeta fundamentals for {symbol}: {exc}",
+                )
+                detail = {}
+            else:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        dlg = AssetFundamentalsDialog(row, detail, self)
+        dlg.exec()
+        if symbol and hasattr(self, "status_label"):
+            self.status_label.setText(f"Closed {symbol} asset fundamentals.")
+
+    def _open_asset_information_detail_dialog(self, _item: QtWidgets.QTableWidgetItem | None = None) -> None:
+        asset_id = self._selected_asset_information_asset_id()
+        if not asset_id:
+            return
+        row = self._asset_row_for_asset_id(asset_id, self.asset_catalog_filtered_frame, self.asset_catalog_frame)
+        self._open_asset_fundamentals_dialog_for_row(row)
 
     def _start_financedatabase_import(self) -> None:
         if self.asset_reference_worker is not None:
@@ -10933,6 +13978,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if self.asset_provider_worker is not None or self.asset_provider_sync_provider:
             return
         normalized_provider = str(provider or "").strip().lower()
+        if normalized_provider in {"simfin", "defeatbeta"}:
+            QtWidgets.QMessageBox.information(
+                self,
+                "External Provider Storage",
+                "SimFin and defeatbeta are now treated as separate external data stores. "
+                "This dashboard view no longer syncs those provider rows into backtests.sqlite.",
+            )
+            return
         symbols = self._selected_asset_information_symbols()
         if not symbols:
             self._show_error_dialog(
@@ -10952,6 +14005,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.asset_provider_sync_total = len(self.asset_provider_sync_queue)
         self.asset_provider_sync_completed_symbols = []
         self.asset_provider_sync_failed_items = []
+        self.asset_provider_sync_warning_items = []
         self.status_label.setText(
             f"Queued {self.asset_provider_sync_total} asset{'s' if self.asset_provider_sync_total != 1 else ''} for {normalized_provider} sync."
         )
@@ -10992,14 +14046,51 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._refresh_asset_information_tab(announce=False)
         self.asset_provider_worker.start()
 
+    def _persist_asset_provider_sync_event(
+        self,
+        *,
+        symbol: str,
+        provider: str,
+        status: str,
+        message: str | None = None,
+        details: str | None = None,
+        record_count: int | None = None,
+        asset_count: int | None = None,
+        new_field_count: int | None = None,
+    ) -> None:
+        normalized_symbol = str(symbol or "").strip().upper()
+        normalized_provider = str(provider or "").strip().lower()
+        if not normalized_symbol or not normalized_provider:
+            return
+        try:
+            self.catalog.save_asset_provider_sync_event(
+                symbol=normalized_symbol,
+                provider=normalized_provider,
+                status=str(status or "").strip().lower() or "completed",
+                message=str(message or "").strip() or None,
+                details=str(details or "").strip() or None,
+                record_count=record_count,
+                asset_count=asset_count,
+                new_field_count=new_field_count,
+            )
+        except Exception:
+            return
+
     def _finish_asset_provider_sync_queue(self) -> None:
         provider = str(self.asset_provider_sync_provider or "provider")
         total = int(self.asset_provider_sync_total or 0)
         success_count = len(self.asset_provider_sync_completed_symbols)
         failure_count = len(self.asset_provider_sync_failed_items)
+        warning_count = len(self.asset_provider_sync_warning_items)
         failure_details = "\n".join(
             f"{symbol}: {error}" for symbol, error in self.asset_provider_sync_failed_items[:25]
         )
+        warning_details = "\n".join(
+            f"{symbol}: {warning}" for symbol, warning in self.asset_provider_sync_warning_items[:25]
+        )
+        issue_preview = failure_details or warning_details
+        if issue_preview:
+            issue_preview = issue_preview.splitlines()[0].strip()
         self.asset_provider_sync_queue = []
         self.asset_provider_sync_provider = None
         self.asset_provider_sync_active_symbol = None
@@ -11008,16 +14099,32 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._clear_asset_information_progress()
         self._refresh_asset_information_tab(announce=False)
         self.status_label.setText(
-            f"{provider} sync queue completed ({success_count}/{total} succeeded, {failure_count} failed)."
+            f"{provider} sync queue completed ({success_count}/{total} succeeded, {failure_count} failed, {warning_count} warning{'s' if warning_count != 1 else ''})."
         )
         if failure_count:
             self._show_error_dialog(
-                "Asset Provider Sync Completed With Errors",
-                f"{provider} sync queue completed with {failure_count} failure{'s' if failure_count != 1 else ''}.",
-                details=failure_details or None,
+                "Asset Provider Sync Completed With Issues",
+                (
+                    f"{provider} sync queue completed with {failure_count} failure{'s' if failure_count != 1 else ''} "
+                    f"and {warning_count} warning{'s' if warning_count != 1 else ''}."
+                    + (f"\n\nFirst issue: {issue_preview}" if issue_preview else "")
+                ),
+                details="\n\n".join([section for section in [failure_details, warning_details] if section]) or None,
+            )
+        elif warning_count:
+            self._show_message_dialog(
+                "Asset Provider Sync Completed With Warnings",
+                (
+                    f"{provider} sync queue completed with {warning_count} warning"
+                    f"{'s' if warning_count != 1 else ''}. Partial provider data may still have been saved."
+                    + (f"\n\nFirst warning: {issue_preview}" if issue_preview else "")
+                ),
+                details=warning_details or None,
+                icon=QtWidgets.QMessageBox.Icon.Information,
             )
         self.asset_provider_sync_completed_symbols = []
         self.asset_provider_sync_failed_items = []
+        self.asset_provider_sync_warning_items = []
 
     def _on_financedatabase_import_progress(self, payload: object) -> None:
         if self._closing:
@@ -11077,13 +14184,36 @@ class DashboardWindow(QtWidgets.QMainWindow):
         provider = str(summary.get("provider") or "").strip() or "provider"
         record_count = int(summary.get("record_count") or 0)
         asset_count = int(summary.get("asset_count") or 0)
+        new_field_count = int(summary.get("new_field_count") or 0)
         active_symbol = str(self.asset_provider_sync_active_symbol or "").strip().upper()
+        warning_summary = str(summary.get("warning_summary") or "").strip()
         if active_symbol:
             self.asset_provider_sync_completed_symbols.append(active_symbol)
+            if warning_summary:
+                self.asset_provider_sync_warning_items.append((active_symbol, warning_summary))
+            self._persist_asset_provider_sync_event(
+                symbol=active_symbol,
+                provider=provider,
+                status="completed_with_errors" if warning_summary else "completed",
+                message=(
+                    f"{provider} sync partially completed for {active_symbol}."
+                    if warning_summary
+                    else f"{provider} sync completed for {active_symbol}."
+                ),
+                details=warning_summary or None,
+                record_count=record_count,
+                asset_count=asset_count,
+                new_field_count=new_field_count,
+            )
         completed_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
-        self.status_label.setText(
-            f"{provider} synced {active_symbol or 'asset'} ({record_count} records, {completed_count}/{max(self.asset_provider_sync_total, 1)} done)."
-        )
+        if warning_summary:
+            self.status_label.setText(
+                f"{provider} synced {active_symbol or 'asset'} with warnings ({record_count} records, {completed_count}/{max(self.asset_provider_sync_total, 1)} done)."
+            )
+        else:
+            self.status_label.setText(
+                f"{provider} synced {active_symbol or 'asset'} ({record_count} records, {completed_count}/{max(self.asset_provider_sync_total, 1)} done)."
+            )
 
     def _asset_provider_sync_error(self, message: str) -> None:
         if self._closing:
@@ -11091,6 +14221,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         active_symbol = str(self.asset_provider_sync_active_symbol or "").strip().upper() or "—"
         error_summary = self._summarize_error(str(message or "Unknown error"))
         self.asset_provider_sync_failed_items.append((active_symbol, error_summary))
+        if active_symbol != "—":
+            self._persist_asset_provider_sync_event(
+                symbol=active_symbol,
+                provider=self.asset_provider_sync_provider or "provider",
+                status="failed",
+                message=f"{self.asset_provider_sync_provider or 'provider'} sync failed for {active_symbol}.",
+                details=error_summary,
+            )
         completed_count = len(self.asset_provider_sync_completed_symbols) + len(self.asset_provider_sync_failed_items)
         self.status_label.setText(
             f"Provider sync failed for {active_symbol} ({completed_count}/{max(self.asset_provider_sync_total, 1)} done)."
@@ -11126,7 +14264,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("Asset Screener")
         title.setObjectName("Title")
         subtitle = QtWidgets.QLabel(
-            "Filter the asset master using exchange, sector, country, acquisition readiness, and the provider-specific metadata already synced from FinanceDatabase, SimFin, and defeatbeta."
+            "Filter the asset master using exchange, sector, country, acquisition readiness, and cached external defeatbeta fundamentals such as market cap and beta."
         )
         subtitle.setObjectName("Sub")
         subtitle.setWordWrap(True)
@@ -11155,11 +14293,22 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.asset_screener_status_combo.addItem("Ready", "Ready")
         self.asset_screener_status_combo.addItem("Tracked", "Tracked")
         self.asset_screener_status_combo.addItem("Error", "Error")
+        self.asset_screener_status_combo.addItem("Untracked", "Untracked")
         self.asset_screener_status_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
         controls_top.addWidget(self.asset_screener_status_combo, 1)
 
+        self.asset_screener_freshness_combo = QtWidgets.QComboBox()
+        self.asset_screener_freshness_combo.addItem("All Freshness", "")
+        self.asset_screener_freshness_combo.addItem("Fresh", "fresh")
+        self.asset_screener_freshness_combo.addItem("Stale", "stale")
+        self.asset_screener_freshness_combo.addItem("Missing/Unknown", "missing")
+        self.asset_screener_freshness_combo.addItem("Gappy", "gappy")
+        self.asset_screener_freshness_combo.currentIndexChanged.connect(self._apply_asset_screener_filters)
+        controls_top.addWidget(self.asset_screener_freshness_combo, 1)
+
         self.asset_screener_provider_combo = QtWidgets.QComboBox()
         self.asset_screener_provider_combo.addItem("All Provider States", "")
+        self.asset_screener_provider_combo.addItem("No Provider", "no_provider")
         self.asset_screener_provider_combo.addItem("Has SimFin", "simfin")
         self.asset_screener_provider_combo.addItem("Has defeatbeta", "defeatbeta")
         self.asset_screener_provider_combo.addItem("Has SimFin or defeatbeta", "simfin_or_defeatbeta")
@@ -11195,6 +14344,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
         refresh_btn.clicked.connect(lambda: self._refresh_asset_screener_tab(announce=True))
         controls_bottom.addWidget(refresh_btn)
 
+        refresh_cache_btn = QtWidgets.QPushButton("Refresh Fundamentals Cache")
+        refresh_cache_btn.setToolTip("Rebuilds the external master_asset_information cache from defeatbeta so screener filters stay fast and complete.")
+        refresh_cache_btn.clicked.connect(lambda: self._start_fundamentals_cache_build(manual=True))
+        controls_bottom.addWidget(refresh_cache_btn)
+
         create_universe_btn = QtWidgets.QPushButton("Create / Replace Universe")
         create_universe_btn.clicked.connect(self._create_universe_from_asset_screener)
         controls_bottom.addWidget(create_universe_btn)
@@ -11216,16 +14370,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
         table_title = QtWidgets.QLabel("Screened Assets")
         table_title.setObjectName("Title")
         table_note = QtWidgets.QLabel(
-            "The screener keeps provider provenance visible. FinanceDatabase fills the broad catalog, while SimFin and defeatbeta contribute optional enrichment counts and event coverage."
+            "The screener reads indexed fundamentals from the external master asset information cache. Double-click a row for live provider detail."
         )
         table_note.setObjectName("Sub")
         table_note.setWordWrap(True)
         table_layout.addWidget(table_title)
         table_layout.addWidget(table_note)
 
-        self.asset_screener_table = QtWidgets.QTableWidget(0, 10)
+        self.asset_screener_table = QtWidgets.QTableWidget(0, 11)
         self.asset_screener_table.setHorizontalHeaderLabels(
-            ["Symbol", "Name", "Class", "Sector", "Country", "Status", "Sources", "Market Cap", "Beta", "Datasets"]
+            ["Symbol", "Name", "Class", "Sector", "Country", "Status", "Freshness", "Sources", "Market Cap", "Beta", "Datasets"]
         )
         self.asset_screener_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.asset_screener_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -11234,7 +14388,32 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.asset_screener_table.verticalHeader().setVisible(False)
         self.asset_screener_table.setObjectName("Panel")
         self.asset_screener_table.itemSelectionChanged.connect(self._update_asset_screener_detail)
+        self.asset_screener_table.itemDoubleClicked.connect(self._open_asset_screener_detail_dialog)
         table_layout.addWidget(self.asset_screener_table, 1)
+
+        screener_page_controls = QtWidgets.QHBoxLayout()
+        screener_page_controls.setSpacing(8)
+        self.asset_screener_prev_page_btn = QtWidgets.QPushButton("Previous")
+        self.asset_screener_prev_page_btn.clicked.connect(self._asset_screener_previous_page)
+        screener_page_controls.addWidget(self.asset_screener_prev_page_btn)
+        self.asset_screener_next_page_btn = QtWidgets.QPushButton("Next")
+        self.asset_screener_next_page_btn.clicked.connect(self._asset_screener_next_page)
+        screener_page_controls.addWidget(self.asset_screener_next_page_btn)
+        self.asset_screener_page_label = QtWidgets.QLabel("Page 0 of 0")
+        self.asset_screener_page_label.setObjectName("Sub")
+        screener_page_controls.addWidget(self.asset_screener_page_label)
+        screener_page_controls.addStretch(1)
+        screener_page_size_label = QtWidgets.QLabel("Rows")
+        screener_page_size_label.setObjectName("Sub")
+        screener_page_controls.addWidget(screener_page_size_label)
+        self.asset_screener_page_size_combo = QtWidgets.QComboBox()
+        for value in (100, 250, 500, 1000):
+            self.asset_screener_page_size_combo.addItem(str(value), value)
+        screener_page_size_index = self.asset_screener_page_size_combo.findData(self.asset_screener_page_size)
+        self.asset_screener_page_size_combo.setCurrentIndex(screener_page_size_index if screener_page_size_index >= 0 else 1)
+        self.asset_screener_page_size_combo.currentIndexChanged.connect(self._asset_screener_page_size_changed)
+        screener_page_controls.addWidget(self.asset_screener_page_size_combo)
+        table_layout.addLayout(screener_page_controls)
         split.addWidget(table_panel)
 
         detail_panel = QtWidgets.QWidget()
@@ -11260,8 +14439,6 @@ class DashboardWindow(QtWidgets.QMainWindow):
         split.addWidget(detail_panel)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
-
-        self._refresh_asset_screener_tab()
         return panel
 
     @staticmethod
@@ -11288,15 +14465,220 @@ class DashboardWindow(QtWidgets.QMainWindow):
             return f"{numeric / 1_000_000:.1f}M"
         return f"{numeric:,.0f}"
 
+    @staticmethod
+    def _asset_text_value(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        return str(value).strip()
+
+    @staticmethod
+    def _asset_int_value(value: object, default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            if pd.isna(value):
+                return default
+        except Exception:
+            pass
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(float(str(value).replace(",", "")))
+            except Exception:
+                return default
+
+    @staticmethod
+    def _asset_freshness_label(value: object) -> str:
+        text = DashboardWindow._asset_text_value(value).lower()
+        labels = {
+            "fresh": "Fresh",
+            "stale": "Stale",
+            "missing": "Missing",
+            "unknown": "Unknown",
+            "gappy": "Gappy",
+        }
+        return labels.get(text, "Unknown")
+
+    def _augment_asset_catalog_freshness(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        working = frame.copy()
+        for column in (
+            "asset_id",
+            "symbol",
+            "latest_dataset_id",
+            "latest_source",
+            "coverage_start",
+            "coverage_end",
+            "dataset_count",
+            "freshness_status",
+        ):
+            if column not in working.columns:
+                working[column] = "" if column != "dataset_count" else 0
+        try:
+            datasets = self.catalog.load_acquisition_datasets(include_untracked_local=False)
+        except Exception:
+            datasets = pd.DataFrame()
+
+        dataset_info_rows: list[dict[str, object]] = []
+        if not datasets.empty:
+            for column in (
+                "dataset_id",
+                "symbol",
+                "source",
+                "resolution",
+                "coverage_start",
+                "coverage_end",
+                "quality_state",
+                "suspicious_gap_count",
+                "bar_count",
+            ):
+                if column not in datasets.columns:
+                    datasets[column] = ""
+            for _, dataset_row in datasets.iterrows():
+                dataset_id = self._asset_text_value(dataset_row.get("dataset_id"))
+                symbol = self._asset_text_value(dataset_row.get("symbol")).upper()
+                coverage_end = self._asset_text_value(dataset_row.get("coverage_end"))
+                resolution = self._asset_text_value(dataset_row.get("resolution"))
+                freshness = compute_freshness_state(coverage_end, resolution)
+                quality = _quality_snapshot_from_mapping(dataset_row)
+                quality_state = str(quality.get("quality_state") or "unknown").strip().lower()
+                try:
+                    gap_count = int(quality.get("suspicious_gap_count") or 0)
+                except Exception:
+                    gap_count = 0
+                if quality_state == "gappy":
+                    health = "gappy"
+                elif freshness in {"fresh", "stale", "missing", "unknown"}:
+                    health = freshness
+                else:
+                    health = "unknown"
+                info = {
+                    "dataset_id": dataset_id,
+                    "symbol": symbol,
+                    "source": self._asset_text_value(dataset_row.get("source")),
+                    "resolution": resolution,
+                    "coverage_start": self._asset_text_value(dataset_row.get("coverage_start")),
+                    "coverage_end": coverage_end,
+                    "freshness_status": freshness,
+                    "dataset_health_status": health,
+                    "quality_state": quality_state,
+                    "suspicious_gap_count": gap_count,
+                    "bar_count": dataset_row.get("bar_count"),
+                }
+                dataset_info_rows.append(info)
+
+        if not dataset_info_rows:
+            freshness = working["freshness_status"].fillna("").astype(str).str.strip().str.lower()
+            dataset_count = pd.to_numeric(working["dataset_count"], errors="coerce").fillna(0)
+            working["freshness_status"] = freshness.where(freshness.ne(""), np.where(dataset_count.gt(0), "unknown", "missing"))
+            working["dataset_health_status"] = working["freshness_status"]
+            return working
+
+        info_frame = pd.DataFrame(dataset_info_rows)
+        info_frame["_dataset_id_key"] = info_frame["dataset_id"].fillna("").astype(str)
+        info_frame["_symbol_key"] = info_frame["symbol"].fillna("").astype(str).str.upper()
+
+        def _clean_text_series(series: pd.Series) -> pd.Series:
+            return series.fillna("").astype(str).str.strip()
+
+        def _nonempty(series: pd.Series) -> pd.Series:
+            cleaned = _clean_text_series(series)
+            return cleaned.mask(cleaned.eq(""), pd.NA)
+
+        working["_dataset_id_key"] = _clean_text_series(working["latest_dataset_id"])
+        working["_symbol_key"] = _clean_text_series(working["symbol"]).str.upper()
+
+        by_id = info_frame.drop_duplicates("_dataset_id_key", keep="first").add_prefix("id_")
+        working = working.merge(
+            by_id,
+            left_on="_dataset_id_key",
+            right_on="id__dataset_id_key",
+            how="left",
+        )
+        by_symbol = (
+            info_frame.loc[info_frame["_symbol_key"].astype(str).str.len().gt(0)]
+            .drop_duplicates("_symbol_key", keep="first")
+            .add_prefix("sym_")
+        )
+        working = working.merge(
+            by_symbol,
+            left_on="_symbol_key",
+            right_on="sym__symbol_key",
+            how="left",
+        )
+
+        def _coalesced_info(column: str) -> pd.Series:
+            id_col = f"id_{column}"
+            sym_col = f"sym_{column}"
+            id_values = _nonempty(working[id_col]) if id_col in working.columns else pd.Series(pd.NA, index=working.index)
+            sym_values = _nonempty(working[sym_col]) if sym_col in working.columns else pd.Series(pd.NA, index=working.index)
+            return id_values.combine_first(sym_values)
+
+        existing_freshness = _nonempty(working["freshness_status"]).str.lower()
+        info_freshness = _coalesced_info("freshness_status").str.lower()
+        dataset_count = pd.to_numeric(working["dataset_count"], errors="coerce").fillna(0)
+        freshness = info_freshness.combine_first(existing_freshness)
+        fallback_freshness = pd.Series(np.where(dataset_count.gt(0), "unknown", "missing"), index=working.index)
+        working["freshness_status"] = freshness.combine_first(fallback_freshness).fillna("unknown").astype(str).str.lower()
+
+        info_health = _coalesced_info("dataset_health_status").str.lower()
+        working["dataset_health_status"] = (
+            info_health.combine_first(working["freshness_status"]).fillna("unknown").astype(str).str.lower()
+        )
+        for target, info_column in (
+            ("latest_source", "source"),
+            ("coverage_start", "coverage_start"),
+            ("coverage_end", "coverage_end"),
+        ):
+            info_values = _coalesced_info(info_column)
+            current_values = _nonempty(working[target]) if target in working.columns else pd.Series(pd.NA, index=working.index)
+            working[target] = info_values.combine_first(current_values).fillna("").astype(str)
+
+        drop_columns = [
+            column
+            for column in working.columns
+            if column.startswith("id_") or column.startswith("sym_") or column in {"_dataset_id_key", "_symbol_key"}
+        ]
+        return working.drop(columns=drop_columns, errors="ignore")
+
+    def _filter_frame_by_freshness(self, frame: pd.DataFrame, filter_value: str) -> pd.DataFrame:
+        selected = str(filter_value or "").strip().lower()
+        if not selected or frame.empty:
+            return frame
+        for column in ("freshness_status", "dataset_health_status", "dataset_count"):
+            if column not in frame.columns:
+                frame[column] = "" if column != "dataset_count" else 0
+        freshness = frame["freshness_status"].fillna("").astype(str).str.lower()
+        health = frame["dataset_health_status"].fillna("").astype(str).str.lower()
+        dataset_count = pd.to_numeric(frame["dataset_count"], errors="coerce").fillna(0)
+        if selected == "fresh":
+            return frame.loc[(freshness == "fresh") & (health != "gappy")].copy()
+        if selected == "stale":
+            return frame.loc[(freshness == "stale") & (health != "gappy")].copy()
+        if selected == "missing":
+            return frame.loc[freshness.isin(["missing", "unknown", ""]) | dataset_count.le(0)].copy()
+        if selected == "gappy":
+            return frame.loc[health == "gappy"].copy()
+        return frame
+
     def _asset_screener_sources_label(self, row: dict) -> str:
         labels: list[str] = []
-        profile_source = str(row.get("profile_source") or "").strip()
+        profile_source = self._asset_text_value(row.get("profile_source"))
         if profile_source:
             labels.append(profile_source)
-        if int(row.get("simfin_payload_count", 0) or 0) > 0:
-            labels.append(f"SimFin {int(row.get('simfin_payload_count', 0) or 0)}")
-        if int(row.get("defeatbeta_payload_count", 0) or 0) > 0:
-            labels.append(f"defeatbeta {int(row.get('defeatbeta_payload_count', 0) or 0)}")
+        simfin_count = self._asset_int_value(row.get("simfin_payload_count"))
+        defeatbeta_count = self._asset_int_value(row.get("defeatbeta_payload_count"))
+        if simfin_count > 0:
+            labels.append(f"SimFin {simfin_count}")
+        if defeatbeta_count > 0:
+            labels.append(f"defeatbeta {defeatbeta_count}")
         return ", ".join(labels) if labels else "—"
 
     def _refresh_asset_screener_tab(self, *, announce: bool = False) -> None:
@@ -11307,11 +14689,38 @@ class DashboardWindow(QtWidgets.QMainWindow):
         current_sector = str(self.asset_screener_sector_combo.currentData() or "") if hasattr(self, "asset_screener_sector_combo") else ""
         current_country = str(self.asset_screener_country_combo.currentData() or "") if hasattr(self, "asset_screener_country_combo") else ""
 
-        if self.asset_catalog_frame.empty:
-            self.asset_catalog_frame = self.catalog.load_asset_catalog()
-        enrichment = self.catalog.load_asset_screener_enrichment()
-        frame = self.asset_catalog_frame.copy()
+        if not self.asset_catalog_all_prepared_frame.empty:
+            frame = self.asset_catalog_all_prepared_frame.copy()
+        else:
+            frame = self._load_asset_working_catalog_frame(alpha_filter="")
+            for column in (
+                "market_cap",
+                "shares_outstanding",
+                "beta",
+                "description",
+                "website",
+                "employee_count",
+                "profile_source",
+                "profile_as_of_date",
+                "provider_payload_count",
+                "simfin_payload_count",
+                "defeatbeta_payload_count",
+                "defeatbeta_earnings_count",
+                "defeatbeta_news_count",
+                "provider_last_sync_at",
+                "latest_earnings_date",
+                "latest_news_date",
+            ):
+                if column not in frame.columns:
+                    frame[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta"} else ""
+            frame = self._merge_external_defeatbeta_enrichment(frame, include_event_counts=True)
+            frame = self._augment_asset_catalog_freshness(frame)
+            self.asset_catalog_all_prepared_frame = frame.copy()
+        enrichment = pd.DataFrame()
         if not enrichment.empty:
+            overlapping_columns = [column for column in enrichment.columns if column != "asset_id" and column in frame.columns]
+            if overlapping_columns:
+                frame = frame.drop(columns=overlapping_columns)
             frame = frame.merge(enrichment, on="asset_id", how="left")
         for column in (
             "market_cap",
@@ -11376,18 +14785,194 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if announce:
             self.status_label.setText(f"Asset screener refreshed ({len(self.asset_screener_frame)} assets).")
 
+    def _asset_screener_page_count(self) -> int:
+        total = len(self.asset_screener_filtered_frame)
+        if total <= 0:
+            return 0
+        page_size = max(1, int(self.asset_screener_page_size or ASSET_INFORMATION_DEFAULT_PAGE_SIZE))
+        return int(np.ceil(total / page_size))
+
+    def _refresh_asset_screener_page_controls(self) -> None:
+        if not hasattr(self, "asset_screener_page_label"):
+            return
+        total = len(self.asset_screener_filtered_frame)
+        page_count = self._asset_screener_page_count()
+        if total <= 0 or page_count <= 0:
+            self.asset_screener_page_label.setText("Page 0 of 0 | Rows 0 of 0")
+            self.asset_screener_prev_page_btn.setEnabled(False)
+            self.asset_screener_next_page_btn.setEnabled(False)
+            return
+        self.asset_screener_page = max(0, min(int(self.asset_screener_page), page_count - 1))
+        page_size = max(1, int(self.asset_screener_page_size or ASSET_INFORMATION_DEFAULT_PAGE_SIZE))
+        start = (self.asset_screener_page * page_size) + 1
+        end = min(total, (self.asset_screener_page + 1) * page_size)
+        self.asset_screener_page_label.setText(
+            f"Page {self.asset_screener_page + 1} of {page_count} | Rows {start}-{end} of {total}"
+        )
+        self.asset_screener_prev_page_btn.setEnabled(self.asset_screener_page > 0)
+        self.asset_screener_next_page_btn.setEnabled(self.asset_screener_page < page_count - 1)
+
+    def _asset_screener_previous_page(self) -> None:
+        if self.asset_screener_page <= 0:
+            return
+        self.asset_screener_page -= 1
+        self._render_asset_screener_table()
+
+    def _asset_screener_next_page(self) -> None:
+        page_count = self._asset_screener_page_count()
+        if page_count <= 0 or self.asset_screener_page >= page_count - 1:
+            return
+        self.asset_screener_page += 1
+        self._render_asset_screener_table()
+
+    def _asset_screener_page_size_changed(self, *_args) -> None:
+        if not hasattr(self, "asset_screener_page_size_combo"):
+            return
+        self.asset_screener_page_size = int(
+            self.asset_screener_page_size_combo.currentData() or ASSET_INFORMATION_DEFAULT_PAGE_SIZE
+        )
+        self.asset_screener_page = 0
+        self._render_asset_screener_table(preferred_asset_id=self._selected_asset_screener_asset_id())
+
+    @staticmethod
+    def _value_present(value: object) -> bool:
+        if value is None:
+            return False
+        try:
+            result = pd.isna(value)
+            if isinstance(result, (bool, np.bool_)) and bool(result):
+                return False
+        except Exception:
+            pass
+        return str(value).strip().lower() not in {"", "nan", "none", "nat"}
+
+    def _apply_external_enrichment_rows(self, frame: pd.DataFrame, enriched: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty or enriched.empty:
+            return frame
+        working = frame.copy()
+        update_columns = [
+            "market_cap",
+            "shares_outstanding",
+            "beta",
+            "description",
+            "website",
+            "employee_count",
+            "profile_source",
+            "profile_as_of_date",
+            "provider_payload_count",
+            "defeatbeta_payload_count",
+            "defeatbeta_earnings_count",
+            "defeatbeta_news_count",
+            "latest_earnings_date",
+            "latest_news_date",
+            "sector",
+            "industry",
+            "country",
+        ]
+        for column in update_columns:
+            if column not in working.columns:
+                working[column] = np.nan if column in {"market_cap", "shares_outstanding", "beta", "employee_count"} else ""
+
+        for _, row in enriched.iterrows():
+            asset_id = str(row.get("asset_id") or "").strip()
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if asset_id and "asset_id" in working.columns:
+                mask = working["asset_id"].astype(str) == asset_id
+            elif symbol and "symbol" in working.columns:
+                mask = working["symbol"].fillna("").astype(str).str.upper() == symbol
+            else:
+                continue
+            if not bool(mask.any()):
+                continue
+            for column in update_columns:
+                if column not in row.index:
+                    continue
+                value = row.get(column)
+                if not self._value_present(value):
+                    continue
+                if column in {"provider_payload_count", "defeatbeta_payload_count", "defeatbeta_earnings_count", "defeatbeta_news_count"}:
+                    current = pd.to_numeric(working.loc[mask, column], errors="coerce").fillna(0)
+                    try:
+                        incoming = float(value)
+                    except Exception:
+                        incoming = 0.0
+                    working.loc[mask, column] = np.maximum(current.to_numpy(dtype=float), incoming).astype(int)
+                    continue
+                working.loc[mask, column] = value
+        return working
+
+    def _visible_asset_screener_frame(self, *, limit: int = 250) -> pd.DataFrame:
+        frame = self.asset_screener_filtered_frame.copy()
+        if frame.empty:
+            return frame
+        asset_ids: list[str] = []
+        if hasattr(self, "asset_screener_table"):
+            for row_idx in range(min(self.asset_screener_table.rowCount(), int(limit))):
+                item = self.asset_screener_table.item(row_idx, 0)
+                if item is None:
+                    continue
+                asset_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+                if asset_id:
+                    asset_ids.append(asset_id)
+        if asset_ids and "asset_id" in frame.columns:
+            visible = frame.loc[frame["asset_id"].astype(str).isin(asset_ids)].copy()
+            if not visible.empty:
+                return visible.head(limit).copy()
+        return frame.head(limit).copy()
+
+    def _load_visible_asset_screener_fundamentals(self, *_args) -> None:
+        visible = self._visible_asset_screener_frame(limit=250)
+        if visible.empty:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Visible Assets",
+                "Adjust the screener filters until at least one asset is visible before loading external fundamentals.",
+            )
+            return
+        symbols = [
+            str(item).strip().upper()
+            for item in visible.get("symbol", pd.Series(dtype=str)).fillna("").tolist()
+            if str(item).strip()
+        ]
+        if not symbols:
+            return
+        selected_asset_id = self._selected_asset_screener_asset_id()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            enriched = self._merge_external_defeatbeta_enrichment(visible, include_event_counts=False)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.asset_screener_frame = self._apply_external_enrichment_rows(self.asset_screener_frame, enriched)
+        self.asset_screener_filtered_frame = self._apply_external_enrichment_rows(self.asset_screener_filtered_frame, enriched)
+        self._apply_asset_screener_filters(selected_asset_id=selected_asset_id)
+        self.status_label.setText(f"Loaded external defeatbeta fundamentals for {len(set(symbols))} visible screener assets.")
+
     def _apply_asset_screener_filters(self, *_args, selected_asset_id: str | None = None) -> None:
         if not hasattr(self, "asset_screener_table"):
             return
+        if selected_asset_id is None:
+            self.asset_screener_page = 0
         frame = self.asset_screener_frame.copy()
         if frame.empty:
             self.asset_screener_filtered_frame = frame
             self.asset_screener_table.setRowCount(0)
             self.asset_screener_summary_label.setText("No screener records are available yet.")
             self.asset_screener_detail.setPlainText("No assets are available for screening yet.")
+            self._refresh_asset_screener_page_controls()
             return
 
-        for column in ("display_symbol", "name", "asset_class", "country", "sector", "industry", "dataset_status", "description"):
+        for column in (
+            "display_symbol",
+            "name",
+            "asset_class",
+            "country",
+            "sector",
+            "industry",
+            "dataset_status",
+            "description",
+            "freshness_status",
+            "dataset_health_status",
+        ):
             if column not in frame.columns:
                 frame[column] = ""
         frame["asset_class"] = frame["asset_class"].fillna("").replace("", "Unclassified")
@@ -11420,6 +15005,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if selected_status:
             frame = frame.loc[frame["dataset_status"].astype(str) == selected_status].copy()
 
+        selected_freshness = str(self.asset_screener_freshness_combo.currentData() or "") if hasattr(self, "asset_screener_freshness_combo") else ""
+        frame = self._filter_frame_by_freshness(frame, selected_freshness)
+
         selected_sector = str(self.asset_screener_sector_combo.currentData() or "") if hasattr(self, "asset_screener_sector_combo") else ""
         if selected_sector:
             frame = frame.loc[frame["sector"].astype(str) == selected_sector].copy()
@@ -11429,7 +15017,15 @@ class DashboardWindow(QtWidgets.QMainWindow):
             frame = frame.loc[frame["country"].astype(str) == selected_country].copy()
 
         provider_filter = str(self.asset_screener_provider_combo.currentData() or "") if hasattr(self, "asset_screener_provider_combo") else ""
-        if provider_filter == "simfin":
+        has_any_provider = (
+            pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0)
+            + pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0)
+            + pd.to_numeric(frame["defeatbeta_earnings_count"], errors="coerce").fillna(0)
+            + pd.to_numeric(frame["defeatbeta_news_count"], errors="coerce").fillna(0)
+        ) > 0
+        if provider_filter == "no_provider":
+            frame = frame.loc[~has_any_provider].copy()
+        elif provider_filter == "simfin":
             frame = frame.loc[pd.to_numeric(frame["simfin_payload_count"], errors="coerce").fillna(0) > 0].copy()
         elif provider_filter == "defeatbeta":
             frame = frame.loc[pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0) > 0].copy()
@@ -11460,15 +15056,35 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _render_asset_screener_table(self, *, preferred_asset_id: str | None = None) -> None:
         frame = self.asset_screener_filtered_frame.copy()
-        render_frame = frame.head(1500).copy()
+        page_size = max(1, int(self.asset_screener_page_size or ASSET_INFORMATION_DEFAULT_PAGE_SIZE))
+        if preferred_asset_id and not frame.empty and "asset_id" in frame.columns:
+            matches = frame.index[frame["asset_id"].astype(str) == str(preferred_asset_id)].tolist()
+            if matches:
+                self.asset_screener_page = int(matches[0]) // page_size
+        page_count = self._asset_screener_page_count()
+        if page_count <= 0:
+            self.asset_screener_page = 0
+        else:
+            self.asset_screener_page = max(0, min(int(self.asset_screener_page), page_count - 1))
+        start = self.asset_screener_page * page_size
+        render_frame = frame.iloc[start : start + page_size].copy().reset_index(drop=True)
         self.asset_screener_table.setRowCount(len(render_frame))
+        self._refresh_asset_screener_page_controls()
         status_colors = {
             "Ready": PALETTE["green"],
             "Error": PALETTE["red"],
             "Tracked": PALETTE["amber"],
             "Untracked": PALETTE["muted"],
         }
+        freshness_colors = {
+            "Fresh": PALETTE["green"],
+            "Stale": PALETTE["amber"],
+            "Missing": PALETTE["muted"],
+            "Unknown": PALETTE["muted"],
+            "Gappy": PALETTE["red"],
+        }
         for row_idx, (_, row) in enumerate(render_frame.iterrows()):
+            freshness_label = self._asset_freshness_label(row.get("dataset_health_status") or row.get("freshness_status"))
             values = [
                 str(row.get("display_symbol") or row.get("symbol") or ""),
                 str(row.get("name") or row.get("symbol") or ""),
@@ -11476,10 +15092,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 str(row.get("sector") or "—"),
                 str(row.get("country") or "—"),
                 str(row.get("dataset_status") or "Untracked"),
+                freshness_label,
                 self._asset_screener_sources_label(row.to_dict()),
                 self._format_market_cap(row.get("market_cap")),
                 self._deployment_fmt_ratio(row.get("beta")) if pd.notna(row.get("beta")) else "—",
-                str(int(row.get("dataset_count", 0) or 0)),
+                str(self._asset_int_value(row.get("dataset_count"))),
             ]
             for col_idx, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
@@ -11487,6 +15104,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
                     item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("asset_id") or ""))
                 if col_idx == 5:
                     item.setForeground(QtGui.QColor(status_colors.get(value, PALETTE["text"])))
+                if col_idx == 6:
+                    item.setForeground(QtGui.QColor(freshness_colors.get(value, PALETTE["text"])))
                 self.asset_screener_table.setItem(row_idx, col_idx, item)
 
         if frame.empty:
@@ -11500,10 +15119,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 + pd.to_numeric(frame["defeatbeta_payload_count"], errors="coerce").fillna(0)
             ).gt(0).sum()
         )
-        rendered_note = f" | Rendered first {len(render_frame)}" if len(frame) > len(render_frame) else ""
+        freshness = frame.get("freshness_status", pd.Series(dtype=str)).fillna("").astype(str).str.lower()
+        health = frame.get("dataset_health_status", pd.Series(dtype=str)).fillna("").astype(str).str.lower()
+        fresh_count = int(((freshness == "fresh") & (health != "gappy")).sum())
+        stale_count = int(((freshness == "stale") & (health != "gappy")).sum())
+        gappy_count = int((health == "gappy").sum())
+        page_note = f" | Page {self.asset_screener_page + 1}/{self._asset_screener_page_count()}" if self._asset_screener_page_count() else ""
         self.asset_screener_summary_label.setText(
-            f"Showing {len(frame)} assets{rendered_note} | Provider-enriched: {provider_ready_count} | "
-            f"Tracked datasets: {int(pd.to_numeric(frame['dataset_count'], errors='coerce').fillna(0).gt(0).sum())}"
+            f"Showing {len(frame)} assets{page_note} | Provider-enriched: {provider_ready_count} | "
+            f"Tracked datasets: {int(pd.to_numeric(frame['dataset_count'], errors='coerce').fillna(0).gt(0).sum())} | "
+            f"Fresh: {fresh_count} | Stale: {stale_count} | Gappy: {gappy_count}"
         )
 
         selected_row = 0
@@ -11555,7 +15180,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
             f"Industry: {row.get('industry') or '—'}",
             "",
             f"Dataset Status: {row.get('dataset_status') or 'Untracked'}",
-            f"Tracked Datasets: {int(row.get('dataset_count', 0) or 0)}",
+            f"Freshness Status: {self._asset_freshness_label(row.get('freshness_status'))}",
+            f"Dataset Health: {self._asset_freshness_label(row.get('dataset_health_status') or row.get('freshness_status'))}",
+            f"Tracked Datasets: {self._asset_int_value(row.get('dataset_count'))}",
             f"Latest Dataset ID: {row.get('latest_dataset_id') or '—'}",
             f"Latest Source: {row.get('latest_source') or '—'}",
             "",
@@ -11564,8 +15191,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             f"Market Cap: {self._format_market_cap(row.get('market_cap'))}",
             f"Shares Outstanding: {self._format_market_cap(row.get('shares_outstanding'))}",
             f"Beta: {self._deployment_fmt_ratio(row.get('beta'))}",
-            f"defeatbeta Earnings Rows: {int(row.get('defeatbeta_earnings_count', 0) or 0)}",
-            f"defeatbeta News Rows: {int(row.get('defeatbeta_news_count', 0) or 0)}",
+            f"defeatbeta Earnings Rows: {self._asset_int_value(row.get('defeatbeta_earnings_count'))}",
+            f"defeatbeta News Rows: {self._asset_int_value(row.get('defeatbeta_news_count'))}",
             f"Latest Earnings Date: {row.get('latest_earnings_date') or '—'}",
             f"Latest News Date: {row.get('latest_news_date') or '—'}",
             "",
@@ -11574,7 +15201,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if provider_payload_summary:
             for item in provider_payload_summary:
                 lines.append(
-                    f"{item.get('provider') or '—'} | {item.get('dataset_code') or '—'} | records={int(item.get('record_count') or 0)} | latest={item.get('latest_fetched_at') or '—'}"
+                    f"{item.get('provider') or '—'} | {item.get('dataset_code') or '—'} | records={self._asset_int_value(item.get('record_count'))} | latest={item.get('latest_fetched_at') or '—'}"
                 )
         else:
             lines.append("No provider-native payload rows are cached for this asset yet.")
@@ -11582,6 +15209,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if description:
             lines.extend(["", "Description:", description])
         self.asset_screener_detail.setPlainText("\n".join(lines))
+
+    def _open_asset_screener_detail_dialog(self, _item: QtWidgets.QTableWidgetItem | None = None) -> None:
+        asset_id = self._selected_asset_screener_asset_id()
+        if not asset_id:
+            return
+        row = self._asset_row_for_asset_id(asset_id, self.asset_screener_filtered_frame, self.asset_screener_frame, self.asset_catalog_frame)
+        self._open_asset_fundamentals_dialog_for_row(row)
 
     def _create_universe_from_asset_screener(self) -> None:
         frame = self.asset_screener_filtered_frame.copy()
@@ -11609,7 +15243,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         symbols = [str(item).strip().upper() for item in frame["symbol"].fillna("").tolist() if str(item).strip()]
         dataset_ids = [str(item).strip() for item in frame["latest_dataset_id"].fillna("").tolist() if str(item).strip()]
         description = (
-            f"Built from Asset Screener on {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M UTC')} "
+            f"Built from Asset Screener on {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M UTC')} "
             f"with {len(symbols)} symbols and {len(dataset_ids)} tracked datasets."
         )
         ResultCatalog(self.catalog.db_path).save_universe(
@@ -11622,6 +15256,1673 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._load_universes()
         self.status_label.setText(f"Universe '{name}' saved from screener results.")
 
+    def _build_charts_tab(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        self.charts_tab = panel
+        panel.setObjectName("Panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Charts")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel(
+            "Ticker charts are seeded from local historical data and updated from the separate live market store."
+        )
+        subtitle.setObjectName("Sub")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        chart_panel = QtWidgets.QWidget()
+        chart_panel.setObjectName("Panel")
+        chart_layout = QtWidgets.QVBoxLayout(chart_panel)
+        chart_layout.setContentsMargins(8, 8, 8, 8)
+        chart_layout.setSpacing(8)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(8)
+        self.charts_symbol_edit = QtWidgets.QLineEdit()
+        self.charts_symbol_edit.setPlaceholderText("Ticker")
+        self.charts_symbol_edit.returnPressed.connect(lambda: self._select_charts_symbol(self.charts_symbol_edit.text(), force_open=True))
+        controls.addWidget(self.charts_symbol_edit, 1)
+
+        self.charts_provider_combo = QtWidgets.QComboBox()
+        self.charts_provider_combo.addItem("Interactive Brokers", DEFAULT_LIVE_PROVIDER)
+        self.charts_provider_combo.addItem("Massive (Later)", "massive")
+        self.charts_provider_combo.addItem("Alpaca (Later)", "alpaca")
+        self.charts_provider_combo.currentIndexChanged.connect(self._on_charts_provider_changed)
+        controls.addWidget(self.charts_provider_combo)
+
+        self.charts_timeframe_combo = QtWidgets.QComboBox()
+        for label, timeframe in CHART_TIMEFRAME_OPTIONS:
+            self.charts_timeframe_combo.addItem(label, timeframe)
+        self.charts_timeframe_combo.currentIndexChanged.connect(self._on_charts_chart_controls_changed)
+        controls.addWidget(self.charts_timeframe_combo)
+
+        self.charts_lookback_combo = QtWidgets.QComboBox()
+        self.charts_lookback_combo.addItem("5D", "5d")
+        self.charts_lookback_combo.addItem("1M", "1mo")
+        self.charts_lookback_combo.addItem("3M", "3mo")
+        self.charts_lookback_combo.addItem("1Y", "1y")
+        self.charts_lookback_combo.addItem("All", "all")
+        self.charts_lookback_combo.currentIndexChanged.connect(self._on_charts_chart_controls_changed)
+        controls.addWidget(self.charts_lookback_combo)
+
+        self.charts_start_btn = QtWidgets.QPushButton("Start Live")
+        self.charts_start_btn.clicked.connect(self._start_all_charts_live_streams)
+        controls.addWidget(self.charts_start_btn)
+        self.charts_stop_btn = QtWidgets.QPushButton("Stop Live")
+        self.charts_stop_btn.clicked.connect(self._stop_all_charts_live_streams)
+        controls.addWidget(self.charts_stop_btn)
+        chart_layout.addLayout(controls)
+
+        indicator_row = QtWidgets.QHBoxLayout()
+        indicator_row.setSpacing(10)
+        indicator_label = QtWidgets.QLabel("Indicators")
+        indicator_label.setObjectName("Sub")
+        indicator_row.addWidget(indicator_label)
+        self.charts_indicator_checks: dict[str, QtWidgets.QCheckBox] = {}
+        for key, label, checked in (
+            ("sma20", "SMA 20", True),
+            ("sma50", "SMA 50", True),
+            ("ema20", "EMA 20", False),
+            ("vwap", "VWAP", False),
+            ("rsi14", "RSI 14", False),
+        ):
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.setChecked(checked)
+            checkbox.stateChanged.connect(self._on_charts_indicator_selection_changed)
+            self.charts_indicator_checks[key] = checkbox
+            indicator_row.addWidget(checkbox)
+        indicator_row.addStretch(1)
+        chart_layout.addLayout(indicator_row)
+
+        self.charts_status_label = QtWidgets.QLabel("Select a ticker from the watchlist or enter one above.")
+        self.charts_status_label.setObjectName("Sub")
+        self.charts_status_label.setWordWrap(True)
+        self.charts_status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        chart_layout.addWidget(self.charts_status_label)
+
+        self.charts_embed_host = MagellanEmbedHost(self)
+        self.charts_embed_host.resized.connect(self._resize_charts_embedded_surface)
+        chart_layout.addWidget(self.charts_embed_host, 1)
+        split.addWidget(chart_panel)
+
+        watchlist_panel = QtWidgets.QWidget()
+        watchlist_panel.setObjectName("Panel")
+        watchlist_layout = QtWidgets.QVBoxLayout(watchlist_panel)
+        watchlist_layout.setContentsMargins(8, 8, 8, 8)
+        watchlist_layout.setSpacing(8)
+        watchlist_title = QtWidgets.QLabel("Watchlist")
+        watchlist_title.setObjectName("Title")
+        watchlist_layout.addWidget(watchlist_title)
+
+        watchlist_actions = QtWidgets.QHBoxLayout()
+        watchlist_actions.setSpacing(6)
+        self.charts_watchlist_symbol_edit = QtWidgets.QLineEdit()
+        self.charts_watchlist_symbol_edit.setPlaceholderText("Add ticker")
+        self.charts_watchlist_symbol_edit.returnPressed.connect(self._add_charts_watchlist_symbol)
+        watchlist_actions.addWidget(self.charts_watchlist_symbol_edit, 1)
+        add_btn = QtWidgets.QPushButton("Add")
+        add_btn.clicked.connect(self._add_charts_watchlist_symbol)
+        watchlist_actions.addWidget(add_btn)
+        remove_btn = QtWidgets.QPushButton("Remove")
+        remove_btn.clicked.connect(self._remove_selected_charts_watchlist_symbol)
+        watchlist_actions.addWidget(remove_btn)
+        watchlist_layout.addLayout(watchlist_actions)
+
+        watchlist_refresh = QtWidgets.QHBoxLayout()
+        self.charts_provider_settings_btn = QtWidgets.QPushButton("Provider Settings")
+        self.charts_provider_settings_btn.clicked.connect(self._open_provider_settings_dialog)
+        watchlist_refresh.addWidget(self.charts_provider_settings_btn)
+        self.charts_watchlist_stream_status = QtWidgets.QLabel("Watchlist live streams start when Charts is active.")
+        self.charts_watchlist_stream_status.setObjectName("Sub")
+        watchlist_refresh.addWidget(self.charts_watchlist_stream_status)
+        watchlist_refresh.addStretch(1)
+        watchlist_layout.addLayout(watchlist_refresh)
+
+        self.charts_watchlist_table = QtWidgets.QTableWidget(0, 6)
+        self.charts_watchlist_table.setHorizontalHeaderLabels(["Symbol", "Price", "Today", "Age", "Provider", "Status"])
+        self.charts_watchlist_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.charts_watchlist_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.charts_watchlist_table.setAlternatingRowColors(True)
+        self.charts_watchlist_table.horizontalHeader().setStretchLastSection(True)
+        self.charts_watchlist_table.verticalHeader().setVisible(False)
+        self.charts_watchlist_table.setObjectName("Panel")
+        self.charts_watchlist_table.itemSelectionChanged.connect(self._on_charts_watchlist_selection_changed)
+        self.charts_watchlist_table.itemDoubleClicked.connect(lambda _item: self._select_charts_symbol(self._selected_charts_watchlist_symbol(), force_open=True))
+        watchlist_layout.addWidget(self.charts_watchlist_table, 1)
+        split.addWidget(watchlist_panel)
+        split.setStretchFactor(0, 7)
+        split.setStretchFactor(1, 3)
+
+        try:
+            self.live_market_store.ensure_default_watchlist()
+        except sqlite3.Error as exc:
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+        else:
+            self._refresh_charts_watchlist_table()
+        self._update_charts_live_buttons()
+        self._draw_charts_preview(pd.DataFrame())
+        return panel
+
+    def _charts_ib_config(self, *, client_offset: int = 0) -> InteractiveBrokersRealtimeConfig:
+        settings = load_provider_settings(DEFAULT_LIVE_PROVIDER, catalog=self.catalog)
+
+        def _int_value(value: object, fallback: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return fallback
+
+        def _float_value(value: object, fallback: float) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return fallback
+
+        return InteractiveBrokersRealtimeConfig(
+            host=str(settings.get("host") or os.getenv("IB_HOST", "127.0.0.1")),
+            port=_int_value(settings.get("port") or os.getenv("IB_PORT", "7497"), 7497),
+            client_id=_int_value(settings.get("client_id") or os.getenv("IB_CLIENT_ID", "9301"), 9301) + int(client_offset),
+            primary_exchange=str(settings.get("primary_exchange") or os.getenv("IB_PRIMARY_EXCHANGE", "")),
+            use_rth=False,
+            timeout_seconds=_float_value(settings.get("timeout_seconds"), 15.0),
+        )
+
+    def _selected_chart_indicator_ids(self) -> list[str]:
+        return [
+            key
+            for key, checkbox in getattr(self, "charts_indicator_checks", {}).items()
+            if checkbox.isChecked()
+        ]
+
+    def _selected_charts_timeframe(self) -> str:
+        combo = getattr(self, "charts_timeframe_combo", None)
+        value = combo.currentData() if combo is not None else LIVE_BAR_TIMEFRAME
+        return normalize_chart_timeframe(str(value or LIVE_BAR_TIMEFRAME))
+
+    def _selected_charts_lookback(self) -> str:
+        combo = getattr(self, "charts_lookback_combo", None)
+        value = combo.currentData() if combo is not None else "5d"
+        return str(value or "5d")
+
+    def _charts_symbol_live_paused(self, symbol: str) -> bool:
+        return _market_symbol_from_dataset_id(symbol) in self.charts_live_paused_symbols
+
+    def _charts_symbol_stream_running(self, symbol: str) -> bool:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        watch_worker = self.charts_watchlist_stream_workers.get(cleaned)
+        if watch_worker is not None and watch_worker.isRunning():
+            return True
+        shared_worker = getattr(self, "live_symbol_stream_workers", {}).get(cleaned)
+        if shared_worker is not None and shared_worker.isRunning():
+            return True
+        monitor_worker = self.live_monitor_chart_stream_workers.get(cleaned)
+        if monitor_worker is not None and monitor_worker.isRunning():
+            return True
+        deployment_worker = getattr(self, "live_deployment_stream_workers", {}).get(cleaned)
+        if deployment_worker is not None and deployment_worker.isRunning():
+            return True
+        worker = getattr(self, "charts_stream_worker", None)
+        if worker is not None and worker.isRunning() and str(getattr(worker, "symbol", "") or "") == cleaned:
+            return True
+        return False
+
+    def _stop_non_deployment_symbol_streams(self, symbol: str) -> None:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        self._stop_charts_watchlist_stream(cleaned)
+        worker = getattr(self, "charts_stream_worker", None)
+        if (
+            worker is not None
+            and worker.isRunning()
+            and str(getattr(worker, "symbol", "") or "").strip().upper() == cleaned
+        ):
+            self._stop_charts_live_stream(cleaned, update_status=False)
+
+    def _charts_tab_stream_running(self, symbol: str | None = None) -> bool:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        watch_workers = getattr(self, "charts_watchlist_stream_workers", {})
+        if cleaned:
+            watch_worker = watch_workers.get(cleaned)
+            if watch_worker is not None and watch_worker.isRunning():
+                return True
+            worker = getattr(self, "charts_stream_worker", None)
+            return bool(
+                worker is not None
+                and worker.isRunning()
+                and str(getattr(worker, "symbol", "") or "").strip().upper() == cleaned
+            )
+        if any(worker is not None and worker.isRunning() for worker in watch_workers.values()):
+            return True
+        worker = getattr(self, "charts_stream_worker", None)
+        return bool(worker is not None and worker.isRunning())
+
+    def _update_charts_live_buttons(self) -> None:
+        symbol = str(getattr(self, "charts_current_symbol", "") or "").strip().upper()
+        watchlist_has_symbols = False
+        try:
+            watchlist_has_symbols = bool(self.live_market_store.load_watchlist())
+        except Exception:
+            watchlist_has_symbols = False
+        paused = bool(getattr(self, "charts_live_paused_symbols", set()))
+        running = self._charts_tab_stream_running()
+        if hasattr(self, "charts_start_btn"):
+            self.charts_start_btn.setEnabled((bool(symbol) or watchlist_has_symbols or paused) and not running)
+        if hasattr(self, "charts_stop_btn"):
+            self.charts_stop_btn.setEnabled(running)
+
+    def _on_charts_provider_changed(self, *_args) -> None:
+        provider = str(self.charts_provider_combo.currentData() or DEFAULT_LIVE_PROVIDER)
+        if provider != DEFAULT_LIVE_PROVIDER:
+            self._stop_charts_watchlist_streams()
+            self._stop_charts_live_stream()
+            self.charts_status_label.setText(f"{provider_display_name(provider)} live data is planned but not wired yet.")
+            self._update_charts_live_buttons()
+            return
+        self._start_charts_watchlist_streams()
+        if self.charts_current_symbol:
+            self._select_charts_symbol(self.charts_current_symbol, force_open=bool(self.charts_current_session_id))
+        self._update_charts_live_buttons()
+
+    def _on_charts_chart_controls_changed(self, *_args) -> None:
+        self._refresh_charts_current_symbol()
+        if not self.charts_current_symbol:
+            return
+        if self.charts_current_session_id:
+            self._start_charts_magellan_session(
+                self.charts_current_symbol,
+                status_text="Chart timeframe/lookback updated.",
+            )
+
+    def _start_charts_watchlist_streams(self) -> None:
+        if not hasattr(self, "charts_provider_combo"):
+            return
+        provider = str(self.charts_provider_combo.currentData() or DEFAULT_LIVE_PROVIDER)
+        if provider != DEFAULT_LIVE_PROVIDER:
+            return
+        try:
+            symbols = list(
+                dict.fromkeys(
+                    normalized
+                    for normalized in (
+                        _market_symbol_from_dataset_id(symbol)
+                        for symbol in self.live_market_store.ensure_default_watchlist()
+                    )
+                    if normalized
+                )
+            )[:MAX_WATCHLIST_STREAM_SYMBOLS]
+        except sqlite3.Error as exc:
+            if hasattr(self, "charts_status_label"):
+                self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        active_symbols = set(symbols)
+        for symbol in list(self.charts_watchlist_stream_workers):
+            if symbol not in active_symbols:
+                self._stop_charts_watchlist_stream(symbol)
+        for idx, symbol in enumerate(symbols, start=1):
+            if self._charts_symbol_live_paused(symbol):
+                continue
+            if self._charts_symbol_stream_running(symbol):
+                continue
+            self._start_charts_watchlist_stream(symbol, client_offset=1000 + idx)
+        if hasattr(self, "charts_watchlist_stream_status"):
+            active = len([worker for worker in self.charts_watchlist_stream_workers.values() if worker.isRunning()])
+            self.charts_watchlist_stream_status.setText(f"Live streams: {active}/{len(symbols)}")
+        self._update_charts_live_buttons()
+
+    def _start_charts_watchlist_stream(self, symbol: str, *, client_offset: int) -> None:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        if self._charts_symbol_stream_running(cleaned):
+            return
+        worker = ChartLiveStreamWorker(
+            symbol=cleaned,
+            store_path=self.live_market_store.db_path,
+            config=self._charts_ib_config(client_offset=client_offset),
+            parent=self,
+        )
+        worker.bar_signal.connect(self._on_charts_live_bar)
+        worker.preview_bar_signal.connect(self._on_charts_live_preview_bar)
+        worker.status_signal.connect(lambda text, sym=cleaned: self._on_charts_watchlist_stream_status(sym, text))
+        worker.error_signal.connect(lambda message, sym=cleaned: self._on_charts_watchlist_stream_error(sym, message))
+        worker.finished.connect(lambda sym=cleaned: self.charts_watchlist_stream_workers.pop(sym, None))
+        worker.finished.connect(self._update_charts_live_buttons)
+        worker.finished.connect(worker.deleteLater)
+        self.charts_watchlist_stream_workers[cleaned] = worker
+        worker.start()
+        self._update_charts_live_buttons()
+
+    def _on_charts_watchlist_stream_status(self, symbol: str, text: str) -> None:
+        if hasattr(self, "charts_watchlist_stream_status"):
+            self.charts_watchlist_stream_status.setText(str(text or f"{symbol} stream active."))
+
+    def _on_charts_watchlist_stream_error(self, symbol: str, message: str) -> None:
+        self.charts_status_label.setText(f"{symbol} live stream error: {message}")
+        if hasattr(self, "charts_watchlist_stream_status"):
+            self.charts_watchlist_stream_status.setText(f"{symbol} stream error")
+        self._update_charts_live_buttons()
+
+    def _stop_charts_watchlist_stream(self, symbol: str) -> None:
+        worker = self.charts_watchlist_stream_workers.pop(_market_symbol_from_dataset_id(symbol), None)
+        if worker is None:
+            return
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(1500)
+        self._update_charts_live_buttons()
+
+    def _stop_charts_watchlist_streams(self) -> None:
+        for symbol in list(self.charts_watchlist_stream_workers):
+            self._stop_charts_watchlist_stream(symbol)
+        self.charts_watchlist_stream_workers.clear()
+        if hasattr(self, "charts_watchlist_stream_status"):
+            self.charts_watchlist_stream_status.setText("Live streams stopped.")
+        self._update_charts_live_buttons()
+
+    def _refresh_charts_watchlist_table(self, *, preferred_symbol: str | None = None, force: bool = False) -> None:
+        if not hasattr(self, "charts_watchlist_table"):
+            return
+        now = time.perf_counter()
+        if not force and now - getattr(self, "_last_charts_watchlist_refresh", 0.0) < 1.0:
+            return
+        self._last_charts_watchlist_refresh = now
+        try:
+            symbols = self.live_market_store.ensure_default_watchlist()
+            quotes = self.live_market_store.latest_quotes(
+                symbols,
+                provider=DEFAULT_LIVE_PROVIDER,
+                stale_after_seconds=DEFAULT_STALE_QUOTE_SECONDS,
+            )
+        except sqlite3.Error as exc:
+            if hasattr(self, "charts_status_label"):
+                self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        selected_symbol = str(preferred_symbol or self.charts_current_symbol or "").strip().upper()
+        self._charts_watchlist_refreshing = True
+        try:
+            self.charts_watchlist_table.setRowCount(len(quotes))
+            for row_idx, quote in enumerate(quotes):
+                price = quote.get("price")
+                change_percent = quote.get("change_percent")
+                age = quote.get("age_seconds")
+                stale = bool(quote.get("stale", True))
+                direction_color = None
+                try:
+                    change_float = float(change_percent)
+                    if np.isfinite(change_float):
+                        direction_color = PALETTE["green"] if change_float >= 0.0 else PALETTE["red"]
+                        change_text = f"{change_float:+.2f}%"
+                    else:
+                        change_text = "—"
+                except Exception:
+                    change_text = "—"
+                values = [
+                    str(quote.get("symbol") or ""),
+                    "—" if price is None else f"{float(price):,.2f}",
+                    change_text,
+                    "—" if age is None else self._format_charts_age(float(age)),
+                    provider_display_name(str(quote.get("provider") or DEFAULT_LIVE_PROVIDER)),
+                    "Stale" if stale else "Live",
+                ]
+                for col_idx, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    if col_idx == 0:
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, str(quote.get("symbol") or ""))
+                    if col_idx in {1, 2} and direction_color:
+                        item.setForeground(QtGui.QColor(direction_color))
+                    if col_idx == 5:
+                        item.setForeground(QtGui.QColor(PALETTE["amber"] if stale else PALETTE["green"]))
+                    self.charts_watchlist_table.setItem(row_idx, col_idx, item)
+                if values[0] == selected_symbol:
+                    self.charts_watchlist_table.selectRow(row_idx)
+        finally:
+            self._charts_watchlist_refreshing = False
+
+    @staticmethod
+    def _format_charts_age(age_seconds: float) -> str:
+        if age_seconds < 60:
+            return f"{age_seconds:.0f}s"
+        if age_seconds < 3600:
+            return f"{age_seconds / 60:.1f}m"
+        return f"{age_seconds / 3600:.1f}h"
+
+    def _selected_charts_watchlist_symbol(self) -> str:
+        if not hasattr(self, "charts_watchlist_table"):
+            return ""
+        selection_model = self.charts_watchlist_table.selectionModel()
+        if selection_model is None:
+            return ""
+        rows = selection_model.selectedRows()
+        if not rows:
+            return ""
+        item = self.charts_watchlist_table.item(rows[0].row(), 0)
+        if item is None:
+            return ""
+        return str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text() or "").strip().upper()
+
+    def _on_charts_watchlist_selection_changed(self) -> None:
+        if self._charts_watchlist_refreshing:
+            return
+        symbol = self._selected_charts_watchlist_symbol()
+        if symbol:
+            self._select_charts_symbol(symbol, force_open=True)
+
+    def _add_charts_watchlist_symbol(self) -> None:
+        symbol = str(self.charts_watchlist_symbol_edit.text() or "").strip().upper()
+        if not symbol:
+            return
+        self.charts_live_paused_symbols.discard(symbol)
+        try:
+            self.live_market_store.add_watchlist_symbol(symbol)
+        except sqlite3.Error as exc:
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        self.charts_watchlist_symbol_edit.clear()
+        self._refresh_charts_watchlist_table(preferred_symbol=symbol)
+        self._start_charts_watchlist_streams()
+
+    def _remove_selected_charts_watchlist_symbol(self) -> None:
+        symbol = self._selected_charts_watchlist_symbol()
+        if not symbol:
+            return
+        try:
+            self.live_market_store.remove_watchlist_symbol(symbol)
+        except sqlite3.Error as exc:
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        self.charts_live_paused_symbols.discard(symbol)
+        self._stop_charts_watchlist_stream(symbol)
+        if self.charts_current_symbol == symbol:
+            self._stop_charts_live_stream(symbol, update_status=False)
+            if self.charts_current_session_id:
+                try:
+                    self.magellan.close_session(self.charts_current_session_id, timeout_ms=500)
+                except Exception:
+                    pass
+            self.charts_current_symbol = ""
+            self.charts_current_session_id = ""
+            self.charts_current_session_symbol = ""
+            self.charts_current_session_timeframe = ""
+            self.charts_current_session_lookback = ""
+            self.charts_current_session_last_sent_bar_ts_ns = 0
+            self.charts_current_session_last_sent_bar_index = -1
+            self.charts_symbol_edit.clear()
+            self._draw_charts_preview(pd.DataFrame())
+        self._refresh_charts_watchlist_table()
+        self._start_charts_watchlist_streams()
+        self._update_charts_live_buttons()
+
+    def _refresh_charts_watchlist_prices(self) -> None:
+        self._start_charts_watchlist_streams()
+        if self.charts_watchlist_worker and self.charts_watchlist_worker.isRunning():
+            return
+        provider = str(self.charts_provider_combo.currentData() or DEFAULT_LIVE_PROVIDER)
+        if provider != DEFAULT_LIVE_PROVIDER:
+            self.charts_status_label.setText(f"{provider_display_name(provider)} live data is planned but not wired yet.")
+            return
+        try:
+            symbols = list(
+                dict.fromkeys(
+                    normalized
+                    for normalized in (
+                        _market_symbol_from_dataset_id(symbol)
+                        for symbol in self.live_market_store.load_watchlist()
+                    )
+                    if normalized
+                )
+            )
+        except sqlite3.Error as exc:
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        if not symbols:
+            return
+        if hasattr(self, "charts_refresh_watchlist_btn"):
+            self.charts_refresh_watchlist_btn.setEnabled(False)
+        self.charts_status_label.setText(f"Refreshing {len(symbols)} watchlist price(s) from Interactive Brokers...")
+        worker = ChartWatchlistRefreshWorker(
+            symbols=symbols,
+            store_path=self.live_market_store.db_path,
+            config=self._charts_ib_config(client_offset=31),
+            timeout_seconds=20.0,
+            parent=self,
+        )
+        worker.status_signal.connect(lambda text: self.charts_status_label.setText(text))
+        worker.error_signal.connect(self._on_charts_worker_error)
+        worker.finished_signal.connect(self._on_charts_watchlist_refresh_finished)
+        if hasattr(self, "charts_refresh_watchlist_btn"):
+            worker.finished.connect(lambda: self.charts_refresh_watchlist_btn.setEnabled(True))
+        worker.finished.connect(lambda: setattr(self, "charts_watchlist_worker", None))
+        worker.finished.connect(worker.deleteLater)
+        self.charts_watchlist_worker = worker
+        worker.start()
+
+    def _on_charts_watchlist_refresh_finished(self, payload: object) -> None:
+        bars = list((payload or {}).get("bars") or []) if isinstance(payload, dict) else []
+        self._refresh_charts_watchlist_table()
+        self.charts_status_label.setText(f"Watchlist refresh captured {len(bars)} live price update(s).")
+
+    def _on_charts_worker_error(self, message: str) -> None:
+        self.charts_status_label.setText(f"Live data error: {message}")
+        if self.charts_pending_open_after_first_bar and self.charts_current_symbol:
+            self.charts_pending_open_after_first_bar = False
+            self._start_charts_magellan_session(self.charts_current_symbol, status_text="Historical seed opened after live refresh failed.")
+
+    def _select_charts_symbol(self, symbol: str | None, *, force_open: bool = False) -> None:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        provider = str(self.charts_provider_combo.currentData() or DEFAULT_LIVE_PROVIDER)
+        if provider != DEFAULT_LIVE_PROVIDER:
+            self.charts_status_label.setText(f"{provider_display_name(provider)} live data is planned but not wired yet.")
+            return
+        symbol_changed = cleaned != self.charts_current_symbol
+        if symbol_changed:
+            self.charts_pending_open_after_first_bar = False
+            self.charts_pending_open_after_sync = False
+            self.charts_current_session_symbol = ""
+            self.charts_current_session_timeframe = ""
+            self.charts_current_session_lookback = ""
+            self.charts_current_session_last_sent_bar_ts_ns = 0
+            self.charts_current_session_last_sent_bar_index = -1
+        self.charts_symbol_edit.setText(cleaned)
+        self.charts_current_symbol = cleaned
+        self._refresh_charts_current_symbol()
+        sync_window = self._charts_historical_sync_window(cleaned)
+        if sync_window is not None:
+            self.charts_pending_open_after_sync = bool(force_open)
+            self._start_charts_historical_sync(cleaned, sync_window[0], sync_window[1])
+        paused = self._charts_symbol_live_paused(cleaned)
+        if paused:
+            self.charts_pending_open_after_first_bar = False
+            if force_open and sync_window is None:
+                self._start_charts_magellan_session(cleaned, status_text=f"{cleaned} live stream is paused.")
+            self.charts_status_label.setText(f"{cleaned} live stream is paused. Use Start Live to resume updates.")
+            self._update_charts_live_buttons()
+            return
+        try:
+            is_stale = self.live_market_store.quote_is_stale(
+                cleaned,
+                provider=DEFAULT_LIVE_PROVIDER,
+                stale_after_seconds=DEFAULT_STALE_QUOTE_SECONDS,
+            )
+        except sqlite3.Error as exc:
+            is_stale = True
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+        if is_stale:
+            self.charts_pending_open_after_first_bar = bool(force_open and sync_window is None)
+            self.charts_status_label.setText(f"{cleaned} quote is stale or missing. Requesting a fresh IB real-time bar first...")
+            self._start_charts_live_stream(cleaned)
+            if not force_open or sync_window is not None:
+                return
+        else:
+            if force_open and sync_window is None:
+                self._start_charts_magellan_session(cleaned)
+            self._start_charts_live_stream(cleaned)
+        self._update_charts_live_buttons()
+
+    def _refresh_charts_current_symbol(self, *_args) -> None:
+        symbol = _market_symbol_from_dataset_id(getattr(self, "charts_current_symbol", ""))
+        if not symbol:
+            return
+        bars, dataset_id, note = self._build_charts_combined_bars(symbol)
+        self.charts_current_bars = bars
+        self._draw_charts_preview(bars)
+        if note:
+            self.charts_status_label.setText(note)
+
+    def _on_charts_indicator_selection_changed(self, *_args) -> None:
+        self._refresh_charts_current_symbol()
+        if self.charts_current_session_id and self.charts_current_bars is not None and not self.charts_current_bars.empty:
+            self._replace_charts_magellan_indicators()
+
+    def _build_charts_combined_bars(
+        self,
+        symbol: str,
+        *,
+        timeframe: str | None = None,
+        lookback: str | None = None,
+        extra_records: Sequence[dict] | None = None,
+    ) -> tuple[pd.DataFrame, str, str]:
+        symbol = _market_symbol_from_dataset_id(symbol)
+        if not symbol:
+            return pd.DataFrame(), "", "No ticker symbol was provided."
+        resolved_timeframe = normalize_chart_timeframe(timeframe or self._selected_charts_timeframe())
+        resolved_lookback = str(lookback or self._selected_charts_lookback())
+        historical, dataset_id, note = self._load_charts_historical_bars(
+            symbol,
+            timeframe=resolved_timeframe,
+            lookback=resolved_lookback,
+        )
+        try:
+            live = self.live_market_store.load_recent_bars(symbol, provider=DEFAULT_LIVE_PROVIDER, limit=500000)
+        except sqlite3.Error as exc:
+            live = pd.DataFrame()
+            note = f"{note} Live market store unavailable: {exc}"
+        frames = [frame for frame in (historical, live) if frame is not None and not frame.empty]
+        for record in list(extra_records or []):
+            frame = self._live_record_ohlcv_frame(record, symbol=symbol)
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return pd.DataFrame(), dataset_id, f"No local historical or live bars are available for {symbol} yet."
+        raw = pd.concat(frames).sort_index()
+        if resolved_lookback != "all":
+            end_ts = pd.Timestamp.now(tz="UTC")
+            start_ts = self._charts_lookback_start(end_ts, resolved_lookback)
+            raw = raw.loc[(raw.index >= start_ts) & (raw.index <= end_ts)]
+        combined = resample_ohlcv(raw, resolved_timeframe)
+        combined = combined[~combined.index.duplicated(keep="last")]
+        return combined[["open", "high", "low", "close", "volume"]].astype(float), dataset_id, note
+
+    @staticmethod
+    def _live_record_ohlcv_frame(record: dict, *, symbol: str = "") -> pd.DataFrame:
+        if not isinstance(record, dict):
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        record_symbol = _market_symbol_from_dataset_id(record.get("symbol"))
+        if symbol and record_symbol and record_symbol != _market_symbol_from_dataset_id(symbol):
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        timestamp = pd.to_datetime(record.get("ts_utc"), utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        values: dict[str, float] = {}
+        for column in ("open", "high", "low", "close", "volume"):
+            try:
+                values[column] = float(record.get(column) or 0.0)
+            except Exception:
+                values[column] = 0.0
+        if not all(np.isfinite(values[column]) for column in ("open", "high", "low", "close")):
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        frame = pd.DataFrame([values], index=pd.DatetimeIndex([pd.Timestamp(timestamp).tz_convert("UTC")]))
+        return frame[["open", "high", "low", "close", "volume"]]
+
+    @staticmethod
+    def _normalize_live_monitor_cached_bars(bars: object) -> pd.DataFrame:
+        columns = ["open", "high", "low", "close", "volume"]
+        if not isinstance(bars, pd.DataFrame) or bars.empty:
+            return pd.DataFrame(columns=columns)
+        frame = bars.copy()
+        for column in columns:
+            if column not in frame.columns:
+                frame[column] = 0.0
+        index = pd.to_datetime(frame.index, utc=True, errors="coerce")
+        valid_mask = ~pd.isna(index)
+        if not bool(np.asarray(valid_mask).any()):
+            return pd.DataFrame(columns=columns)
+        frame = frame.loc[valid_mask, columns].copy()
+        frame.index = pd.DatetimeIndex(index[valid_mask]).tz_convert("UTC")
+        frame = frame.apply(pd.to_numeric, errors="coerce")
+        frame = frame.dropna(subset=["open", "high", "low", "close"])
+        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        return frame[columns].astype(float)
+
+    @staticmethod
+    def _live_monitor_record_bucket_timestamp(record_ts: object, timeframe: str) -> pd.Timestamp | None:
+        ts = pd.to_datetime(record_ts, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        ts = pd.Timestamp(ts).tz_convert("UTC").floor("min")
+        normalized = normalize_chart_timeframe(timeframe)
+        if normalized == LIVE_BAR_TIMEFRAME:
+            return ts
+        try:
+            bucket_start = ts.floor(chart_timeframe_to_pandas_rule(normalized))
+        except Exception:
+            bucket_start = ts.floor("min")
+        return pd.Timestamp(bucket_start).tz_convert("UTC")
+
+    def _live_monitor_cached_bars_with_record(
+        self,
+        cached_bars: object,
+        record: dict,
+        *,
+        timeframe: str,
+        symbol: str,
+    ) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+        bars = self._normalize_live_monitor_cached_bars(cached_bars)
+        if bars.empty:
+            return bars, None
+        frame = self._live_record_ohlcv_frame(record, symbol=symbol)
+        if frame.empty:
+            return bars, None
+        source_ts = pd.Timestamp(frame.index[-1]).tz_convert("UTC")
+        bucket_ts = self._live_monitor_record_bucket_timestamp(source_ts, timeframe)
+        if bucket_ts is None:
+            return bars, None
+        row = frame.iloc[-1]
+        incoming = {
+            "open": float(row.get("open") or 0.0),
+            "high": float(row.get("high") or 0.0),
+            "low": float(row.get("low") or 0.0),
+            "close": float(row.get("close") or 0.0),
+            "volume": float(row.get("volume") or 0.0),
+        }
+        if not all(np.isfinite(incoming[column]) for column in ("open", "high", "low", "close")):
+            return bars, None
+
+        if bucket_ts in bars.index:
+            existing = bars.loc[bucket_ts]
+            if isinstance(existing, pd.DataFrame):
+                existing = existing.iloc[-1]
+            open_value = float(existing.get("open") or incoming["open"])
+            high_value = max(float(existing.get("high") or incoming["high"]), incoming["high"])
+            low_value = min(float(existing.get("low") or incoming["low"]), incoming["low"])
+            volume_value = max(float(existing.get("volume") or 0.0), incoming["volume"])
+            bars.loc[bucket_ts, ["open", "high", "low", "close", "volume"]] = [
+                open_value,
+                high_value,
+                low_value,
+                incoming["close"],
+                volume_value,
+            ]
+        else:
+            bars = pd.concat(
+                [
+                    bars,
+                    pd.DataFrame([incoming], index=pd.DatetimeIndex([bucket_ts])),
+                ]
+            )
+        bars = self._normalize_live_monitor_cached_bars(bars)
+        return bars, bucket_ts
+
+    @staticmethod
+    def _live_deployment_cached_bars_with_record(
+        cached_bars: object,
+        record: dict,
+        *,
+        timeframe: str,
+        symbol: str,
+    ) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+        bars = DashboardWindow._normalize_live_monitor_cached_bars(cached_bars)
+        frame = DashboardWindow._live_record_ohlcv_frame(record, symbol=symbol)
+        if bars.empty:
+            if frame.empty:
+                return bars, None
+            bars = resample_ohlcv(frame, timeframe)
+            return DashboardWindow._normalize_live_monitor_cached_bars(bars), (
+                pd.Timestamp(bars.index[-1]).tz_convert("UTC") if not bars.empty else None
+            )
+        if frame.empty:
+            return bars, None
+        source_ts = pd.Timestamp(frame.index[-1]).tz_convert("UTC")
+        bucket_ts = DashboardWindow._live_monitor_record_bucket_timestamp(source_ts, timeframe)
+        if bucket_ts is None:
+            return bars, None
+        row = frame.iloc[-1]
+        incoming = {
+            "open": float(row.get("open") or 0.0),
+            "high": float(row.get("high") or 0.0),
+            "low": float(row.get("low") or 0.0),
+            "close": float(row.get("close") or 0.0),
+            "volume": float(row.get("volume") or 0.0),
+        }
+        if not all(np.isfinite(incoming[column]) for column in ("open", "high", "low", "close")):
+            return bars, None
+
+        if bucket_ts in bars.index:
+            existing = bars.loc[bucket_ts]
+            if isinstance(existing, pd.DataFrame):
+                existing = existing.iloc[-1]
+            open_value = float(existing.get("open") or incoming["open"])
+            high_value = max(float(existing.get("high") or incoming["high"]), incoming["high"])
+            low_value = min(float(existing.get("low") or incoming["low"]), incoming["low"])
+            volume_value = max(float(existing.get("volume") or 0.0), incoming["volume"])
+            bars.loc[bucket_ts, ["open", "high", "low", "close", "volume"]] = [
+                open_value,
+                high_value,
+                low_value,
+                incoming["close"],
+                volume_value,
+            ]
+        else:
+            bars = pd.concat(
+                [
+                    bars,
+                    pd.DataFrame([incoming], index=pd.DatetimeIndex([bucket_ts])),
+                ]
+            )
+        return DashboardWindow._normalize_live_monitor_cached_bars(bars), bucket_ts
+
+    def _load_charts_historical_bars(
+        self,
+        symbol: str,
+        *,
+        timeframe: str | None = None,
+        lookback: str | None = None,
+    ) -> tuple[pd.DataFrame, str, str]:
+        symbol = _market_symbol_from_dataset_id(symbol)
+        if not symbol:
+            return pd.DataFrame(), "", "No ticker symbol was provided."
+        record = self._chart_dataset_record_for_symbol(symbol)
+        if record is None:
+            return pd.DataFrame(), "", f"No ingested 1-minute historical dataset was found for {symbol}."
+        duck = DuckDBStore()
+        resolved_lookback = str(lookback or self._selected_charts_lookback())
+        try:
+            if resolved_lookback == "all":
+                bars = duck.load(record.dataset_id)
+            else:
+                end_ts = pd.Timestamp.now(tz="UTC")
+                start_ts = self._charts_lookback_start(pd.Timestamp(end_ts), resolved_lookback)
+                bars = duck.load_range(record.dataset_id, start_ts, pd.Timestamp(end_ts))
+        except Exception as exc:
+            return pd.DataFrame(), str(record.dataset_id), f"Unable to load historical bars for {symbol}: {exc}"
+        timeframe_label = chart_timeframe_label(timeframe or self._selected_charts_timeframe())
+        return bars, str(record.dataset_id), f"{symbol} {timeframe_label} seeded from {record.dataset_id}; live/backfill bars remain in {self.live_market_store.db_path}."
+
+    @staticmethod
+    def _charts_lookback_start(end_ts: pd.Timestamp, lookback: str) -> pd.Timestamp:
+        if lookback == "1mo":
+            return end_ts - pd.DateOffset(months=1)
+        if lookback == "3mo":
+            return end_ts - pd.DateOffset(months=3)
+        if lookback == "1y":
+            return end_ts - pd.DateOffset(years=1)
+        return end_ts - pd.Timedelta(days=5)
+
+    @staticmethod
+    def _charts_extended_market_segments(
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        timezone: str = "America/New_York",
+    ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+        start_ts = pd.Timestamp(start)
+        start_ts = start_ts.tz_convert("UTC") if start_ts.tzinfo else start_ts.tz_localize("UTC")
+        end_ts = pd.Timestamp(end)
+        end_ts = end_ts.tz_convert("UTC") if end_ts.tzinfo else end_ts.tz_localize("UTC")
+        if end_ts <= start_ts:
+            return []
+        try:
+            local_start = start_ts.tz_convert(timezone)
+            local_end = end_ts.tz_convert(timezone)
+        except Exception:
+            return [(start_ts, end_ts)]
+        segments: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        day = local_start.normalize()
+        final_day = local_end.normalize()
+        while day <= final_day:
+            if day.dayofweek < 5:
+                segment_start_local = day + pd.Timedelta(hours=4)
+                segment_end_local = day + pd.Timedelta(hours=20)
+                segment_start = max(start_ts, pd.Timestamp(segment_start_local).tz_convert("UTC"))
+                segment_end = min(end_ts, pd.Timestamp(segment_end_local).tz_convert("UTC"))
+                if segment_start < segment_end:
+                    segments.append((segment_start.floor("min"), segment_end.floor("min")))
+            day += pd.Timedelta(days=1)
+        return segments
+
+    @staticmethod
+    def _minute_bars_cover_segment(
+        bars: pd.DataFrame,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        max_gap: pd.Timedelta = pd.Timedelta(minutes=2),
+    ) -> bool:
+        if bars is None or bars.empty:
+            return False
+        start_ts = pd.Timestamp(start)
+        start_ts = start_ts.tz_convert("UTC") if start_ts.tzinfo else start_ts.tz_localize("UTC")
+        end_ts = pd.Timestamp(end)
+        end_ts = end_ts.tz_convert("UTC") if end_ts.tzinfo else end_ts.tz_localize("UTC")
+        start_ts = start_ts.floor("min")
+        end_ts = end_ts.floor("min")
+        if end_ts <= start_ts:
+            return True
+        normalized = bars.sort_index().copy()
+        if normalized.index.tz is None:
+            normalized.index = normalized.index.tz_localize("UTC")
+        else:
+            normalized.index = normalized.index.tz_convert("UTC")
+        covered = normalized.loc[(normalized.index >= start_ts) & (normalized.index <= end_ts)]
+        if covered.empty:
+            return False
+        stamps = pd.Index(covered.index).drop_duplicates().sort_values()
+        if pd.Timestamp(stamps[0]).tz_convert("UTC") > start_ts + max_gap:
+            return False
+        if pd.Timestamp(stamps[-1]).tz_convert("UTC") < end_ts - max_gap:
+            return False
+        if len(stamps) <= 1:
+            return (end_ts - start_ts) <= max_gap
+        gaps = pd.Series(stamps).diff().dropna()
+        if gaps.empty:
+            return True
+        return bool(gaps.max() <= max_gap)
+
+    @classmethod
+    def _minute_bars_cover_window(
+        cls,
+        bars: pd.DataFrame,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        max_gap: pd.Timedelta = pd.Timedelta(minutes=2),
+    ) -> bool:
+        segments = cls._charts_extended_market_segments(start, end)
+        if not segments:
+            return True
+        return all(
+            cls._minute_bars_cover_segment(bars, segment_start, segment_end, max_gap=max_gap)
+            for segment_start, segment_end in segments
+        )
+
+    def _charts_historical_sync_window(self, symbol: str, *, lookback: str | None = None) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        symbol = _market_symbol_from_dataset_id(symbol)
+        if not symbol:
+            return None
+        now = pd.Timestamp.now(tz="UTC").floor("min")
+        end = now - pd.Timedelta(minutes=1)
+        max_gap = pd.Timedelta(minutes=2)
+        record = self._chart_dataset_record_for_symbol(symbol)
+        if record is None:
+            resolved_lookback = str(lookback or self._selected_charts_lookback())
+            start = self._charts_lookback_start(end, resolved_lookback) if resolved_lookback != "all" else end - pd.Timedelta(days=5)
+            try:
+                live = self.live_market_store.load_recent_bars(symbol, provider=DEFAULT_LIVE_PROVIDER, limit=500000)
+            except sqlite3.Error as exc:
+                if hasattr(self, "charts_status_label"):
+                    self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+                return None
+            if self._minute_bars_cover_window(live, start, end, max_gap=max_gap):
+                return None
+            return (pd.Timestamp(start).tz_convert("UTC"), end) if start < end - max_gap else None
+        historical_end = pd.to_datetime(record.coverage_end, utc=True, errors="coerce")
+        if pd.isna(historical_end):
+            return None
+        start = pd.Timestamp(historical_end).tz_convert("UTC") + pd.Timedelta(minutes=1)
+        if start >= end - max_gap:
+            return None
+        try:
+            live = self.live_market_store.load_recent_bars(symbol, provider=DEFAULT_LIVE_PROVIDER, limit=500000)
+        except sqlite3.Error as exc:
+            if hasattr(self, "charts_status_label"):
+                self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return None
+        if self._minute_bars_cover_window(live, start, end, max_gap=max_gap):
+            return None
+        return start, end
+
+    def _start_charts_historical_sync(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> None:
+        symbol = _market_symbol_from_dataset_id(symbol)
+        if not symbol:
+            return
+        existing = getattr(self, "charts_historical_sync_worker", None)
+        if existing is not None and existing.isRunning():
+            if _market_symbol_from_dataset_id(getattr(existing, "symbol", "")) == symbol:
+                return
+            existing.requestInterruption()
+            existing.wait(500)
+        worker = ChartHistoricalSyncWorker(
+            symbol=symbol,
+            start=start,
+            end=end,
+            store_path=self.live_market_store.db_path,
+            config=self._charts_ib_config(client_offset=51),
+            parent=self,
+        )
+        worker.status_signal.connect(lambda text: self.charts_status_label.setText(text))
+        worker.error_signal.connect(lambda message, sym=symbol: self._on_charts_historical_sync_error(sym, message))
+        worker.finished_signal.connect(self._on_charts_historical_sync_finished)
+        worker.finished.connect(lambda: setattr(self, "charts_historical_sync_worker", None))
+        worker.finished.connect(worker.deleteLater)
+        self.charts_historical_sync_worker = worker
+        worker.start()
+
+    def _on_charts_historical_sync_finished(self, payload: object) -> None:
+        data = dict(payload or {}) if isinstance(payload, dict) else {}
+        symbol = _market_symbol_from_dataset_id(data.get("symbol"))
+        rows = int(data.get("rows") or 0)
+        self._refresh_charts_watchlist_table(preferred_symbol=symbol)
+        if symbol and symbol == self.charts_current_symbol:
+            self._refresh_charts_current_symbol()
+            if self.charts_pending_open_after_sync:
+                self.charts_pending_open_after_sync = False
+                self.charts_pending_open_after_first_bar = False
+                self._start_charts_magellan_session(symbol, status_text=f"Historical gap synced from IB ({rows} bar(s)); live session ready.")
+            elif self.charts_current_session_id:
+                self._start_charts_magellan_session(symbol, status_text=f"Historical gap synced from IB ({rows} bar(s)).")
+        if symbol:
+            self.charts_status_label.setText(f"{symbol} historical sync stored {rows} bar(s) in the live-market store.")
+        self._update_charts_live_buttons()
+
+    def _on_charts_historical_sync_error(self, symbol: str, message: str) -> None:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        self.charts_status_label.setText(f"{cleaned} historical sync failed: {message}")
+        if self.charts_pending_open_after_sync and cleaned == self.charts_current_symbol:
+            self.charts_pending_open_after_sync = False
+            self._start_charts_magellan_session(cleaned, status_text="Historical gap sync failed; opened the best available seed.")
+        self._update_charts_live_buttons()
+
+    def _chart_dataset_record_for_symbol(self, symbol: str):
+        normalized = _market_symbol_from_dataset_id(symbol)
+        if not normalized:
+            return None
+        records = ResultCatalog(self.catalog.db_path).load_acquisition_datasets()
+        candidates = []
+        for record in records:
+            if str(record.symbol or "").strip().upper() != normalized:
+                continue
+            if str(record.resolution or "").strip().lower().replace(" ", "") not in {"1m", "1min", "1minute", "1minutes"}:
+                continue
+            if not bool(record.ingested):
+                continue
+            if record.last_status and str(record.last_status).lower() in _DATASET_PICKER_ERROR_STATUSES:
+                continue
+            if not DuckDBStore().dataset_path(record.dataset_id).exists():
+                continue
+            source_rank = {
+                "interactive_brokers": 0,
+                "massive": 1,
+                "stooq": 2,
+            }.get(str(record.source or "").strip().lower(), 9)
+            end_ts = pd.to_datetime(record.coverage_end, utc=True, errors="coerce")
+            end_sort = pd.Timestamp.min.tz_localize("UTC") if pd.isna(end_ts) else pd.Timestamp(end_ts)
+            candidates.append((source_rank, end_sort, record))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], -item[1].value))
+        return candidates[0][2]
+
+    def _draw_charts_preview(self, bars: pd.DataFrame) -> None:
+        if not hasattr(self, "charts_figure"):
+            return
+        self.charts_figure.clear()
+        if bars is None or bars.empty:
+            ax = self.charts_figure.add_subplot(111)
+            ax.set_facecolor(PALETTE["panel2"])
+            ax.text(0.5, 0.5, "No chart data loaded", color=PALETTE["muted"], ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            self.charts_canvas.draw_idle()
+            return
+        overlays, panes, styles = compute_chart_indicators(bars, self._selected_chart_indicator_ids())
+        has_panes = bool(panes)
+        if has_panes:
+            ax_price = self.charts_figure.add_subplot(211)
+            ax_pane = self.charts_figure.add_subplot(212, sharex=ax_price)
+        else:
+            ax_price = self.charts_figure.add_subplot(111)
+            ax_pane = None
+        for ax in [ax_price, ax_pane] if ax_pane is not None else [ax_price]:
+            ax.set_facecolor(PALETTE["panel2"])
+            ax.tick_params(colors=PALETTE["muted"])
+            for spine in ax.spines.values():
+                spine.set_color(PALETTE["grid"])
+            ax.grid(True, color=PALETTE["grid"], alpha=0.35)
+        display = bars.tail(2500).copy()
+        x = np.arange(len(display))
+        ax_price.plot(x, display["close"].to_numpy(dtype=float), color=PALETTE["text"], linewidth=1.1, label="Close")
+        for name, series in overlays.items():
+            aligned = pd.to_numeric(series.reindex(display.index), errors="coerce")
+            ax_price.plot(x, aligned.to_numpy(dtype=float), linewidth=1.0, label=name, color=styles.get(name, {}).get("color", PALETTE["blue"]))
+        ax_price.set_title(str(self.charts_current_symbol or "Ticker"), color=PALETTE["text"])
+        ax_price.legend(loc="upper left", fontsize=8)
+        if ax_pane is not None:
+            for name, series in panes.items():
+                aligned = pd.to_numeric(series.reindex(display.index), errors="coerce")
+                ax_pane.plot(x, aligned.to_numpy(dtype=float), linewidth=1.0, label=name, color=styles.get(name, {}).get("color", PALETTE["amber"]))
+            ax_pane.legend(loc="upper left", fontsize=8)
+        target_ax = ax_pane if ax_pane is not None else ax_price
+        tick_positions = np.linspace(0, max(0, len(display) - 1), min(6, len(display)), dtype=int)
+        labels = [display.index[pos].tz_convert("America/New_York").strftime("%m-%d %H:%M") for pos in tick_positions]
+        target_ax.set_xticks(tick_positions)
+        target_ax.set_xticklabels(labels, rotation=0, ha="center")
+        self.charts_canvas.draw_idle()
+
+    def _charts_preview_redraw_due(self) -> bool:
+        now = time.monotonic()
+        try:
+            last_redraw = float(getattr(self, "_last_charts_preview_redraw_monotonic", 0.0) or 0.0)
+        except Exception:
+            last_redraw = 0.0
+        if last_redraw > 0.0 and now - last_redraw < CHARTS_PREVIEW_REDRAW_MIN_INTERVAL_SECONDS:
+            return False
+        self._last_charts_preview_redraw_monotonic = now
+        return True
+
+    def _start_charts_magellan_session(self, symbol: str, *, status_text: str = "") -> None:
+        symbol = _market_symbol_from_dataset_id(symbol)
+        if not symbol or symbol != _market_symbol_from_dataset_id(getattr(self, "charts_current_symbol", "")):
+            return
+        bars, _dataset_id, note = self._build_charts_combined_bars(symbol)
+        if bars.empty:
+            self.charts_status_label.setText(note)
+            return
+        self.charts_current_bars = bars
+        self._draw_charts_preview(bars)
+        overlays, panes, styles = compute_chart_indicators(bars, self._selected_chart_indicator_ids())
+        timeframe = self._selected_charts_timeframe()
+        timeframe_title = chart_timeframe_label(timeframe)
+        lookback = self._selected_charts_lookback()
+        session_id = self.charts_current_session_id or self.charts_embedded_session_id
+        session_was_open = bool(self.charts_current_session_id)
+        self.charts_current_session_symbol = ""
+        title = f"{symbol} {timeframe_title}"
+        subtitle = "Interactive Brokers live market session"
+        status = status_text or note
+        try:
+            snapshot = self.live_chart_snapshot_exporter.export_market_snapshot(
+                symbol=symbol,
+                timeframe=timeframe,
+                bars=bars,
+                overlays=overlays,
+                panes=panes,
+                series_styles=styles,
+                snapshot_root=Path("data/live_chart_snapshots") / "market" / symbol / timeframe / lookback,
+                title=title,
+                subtitle="Historical seed plus Interactive Brokers live bars",
+                status_text=status,
+                overwrite=True,
+            )
+            if session_was_open:
+                self.magellan.reload_live_seed(
+                    session_id,
+                    title=title,
+                    subtitle=subtitle,
+                    status_text=status,
+                    snapshot_path=snapshot.snapshot_root,
+                    timeout_ms=5000,
+                )
+            else:
+                parent_id, width, height = self._charts_embed_target()
+                if parent_id:
+                    self.magellan.open_embedded_live_session(
+                        session_id,
+                        parent_window_id=parent_id,
+                        width=width,
+                        height=height,
+                        title=title,
+                        subtitle=subtitle,
+                        status_text=status,
+                        snapshot_path=snapshot.snapshot_root,
+                    )
+                else:
+                    self.magellan.open_live_session(
+                        session_id,
+                        title=title,
+                        subtitle=subtitle,
+                        status_text=status,
+                        snapshot_path=snapshot.snapshot_root,
+                    )
+            self.charts_current_session_id = session_id
+            self.charts_current_session_symbol = symbol
+            self.charts_current_session_timeframe = timeframe
+            self.charts_current_session_lookback = lookback
+            self.charts_current_session_last_sent_bar_ts_ns = int(pd.Timestamp(bars.index[-1]).tz_convert("UTC").value)
+            self.charts_current_session_last_sent_bar_index = int(len(bars) - 1)
+            action = "updated" if session_was_open else "opened"
+            self.charts_status_label.setText(f"Embedded Magellan live session {action} for {symbol} {timeframe_title}.")
+        except Exception as exc:
+            self.charts_status_label.setText(f"Unable to open Magellan live chart: {exc}")
+
+    def _charts_embed_target(self) -> tuple[str, int, int]:
+        host = getattr(self, "charts_embed_host", None)
+        if host is None:
+            return "", 0, 0
+        parent_id = host.native_parent_id()
+        width = max(1, int(host.width()))
+        height = max(1, int(host.height()))
+        return parent_id, width, height
+
+    def _resize_charts_embedded_surface(self, width: int, height: int) -> None:
+        if not getattr(self, "charts_current_session_id", ""):
+            return
+        try:
+            self.magellan.resize_embedded(
+                self.charts_current_session_id,
+                width=max(1, int(width)),
+                height=max(1, int(height)),
+                timeout_ms=250,
+            )
+        except Exception:
+            pass
+
+    def _replace_charts_magellan_indicators(self) -> None:
+        bars = self.charts_current_bars
+        if bars is None or bars.empty or not self.charts_current_session_id:
+            return
+        if self.charts_current_session_symbol != self.charts_current_symbol:
+            return
+        overlays, panes, styles = compute_chart_indicators(bars, self._selected_chart_indicator_ids())
+        try:
+            self.magellan.replace_series(
+                self.charts_current_session_id,
+                title=f"{self.charts_current_symbol} {chart_timeframe_label(self._selected_charts_timeframe())}",
+                status_text="Indicator selection updated.",
+                overlay_series=series_replacement_payload(overlays, styles=styles),
+                pane_series=series_replacement_payload(panes, styles=styles),
+                replace_overlays=True,
+                replace_panes=True,
+                timeout_ms=5000,
+            )
+            self.charts_status_label.setText("Indicator selection updated in Magellan.")
+        except Exception as exc:
+            self.charts_status_label.setText(f"Unable to update Magellan indicators: {exc}")
+
+    @staticmethod
+    def _magellan_bars_replacement_payload(bars: pd.DataFrame) -> list[dict]:
+        if bars is None or bars.empty:
+            return []
+        payload: list[dict] = []
+        normalized = bars.sort_index().copy()
+        if normalized.index.tz is None:
+            normalized.index = normalized.index.tz_localize("UTC")
+        else:
+            normalized.index = normalized.index.tz_convert("UTC")
+        for bar_index, (timestamp, row) in enumerate(normalized.iterrows()):
+            payload.append(
+                {
+                    "timestamp_utc_ns": str(int(pd.Timestamp(timestamp).value)),
+                    "bar_index": int(bar_index),
+                    "open": float(row.get("open") or 0.0),
+                    "high": float(row.get("high") or 0.0),
+                    "low": float(row.get("low") or 0.0),
+                    "close": float(row.get("close") or 0.0),
+                    "volume": float(row.get("volume") or 0.0),
+                }
+            )
+        return payload
+
+    def _replace_magellan_full_market_state(
+        self,
+        *,
+        session_id: str,
+        title: str,
+        status_text: str,
+        bars: pd.DataFrame,
+        indicator_ids: Sequence[str],
+    ) -> None:
+        overlays, panes, styles = compute_chart_indicators(bars, indicator_ids)
+        self.magellan.replace_bars(
+            session_id,
+            title=title,
+            status_text=status_text,
+            bars=self._magellan_bars_replacement_payload(bars),
+            replace_trade_markers=False,
+            timeout_ms=5000,
+        )
+        self.magellan.replace_series(
+            session_id,
+            title=title,
+            status_text=status_text,
+            overlay_series=series_replacement_payload(overlays, styles=styles),
+            pane_series=series_replacement_payload(panes, styles=styles),
+            replace_overlays=True,
+            replace_panes=True,
+            timeout_ms=5000,
+        )
+
+    @staticmethod
+    def _magellan_live_update_bar_index(
+        *,
+        bar_ts_ns: int,
+        fallback_index: int,
+        last_sent_bar_ts_ns: int,
+        last_sent_bar_index: int,
+    ) -> int | None:
+        if int(fallback_index) < 0:
+            return None
+        last_ts_ns = int(last_sent_bar_ts_ns)
+        last_bar_index = int(last_sent_bar_index)
+        if last_ts_ns <= 0 or last_bar_index < 0:
+            return int(fallback_index)
+        if int(bar_ts_ns) > last_ts_ns:
+            return last_bar_index + 1
+        if int(bar_ts_ns) == last_ts_ns:
+            return last_bar_index
+        return None
+
+    @staticmethod
+    def _live_monitor_bar_index_map_from_bars(bars: pd.DataFrame) -> dict[str, int]:
+        normalized = DashboardWindow._normalize_live_monitor_cached_bars(bars)
+        mapping: dict[str, int] = {}
+        for idx, timestamp in enumerate(normalized.index):
+            try:
+                ts_ns = int(pd.Timestamp(timestamp).tz_convert("UTC").value)
+            except Exception:
+                continue
+            mapping[str(ts_ns)] = int(idx)
+        return mapping
+
+    @staticmethod
+    def _live_monitor_bar_index_for_timestamp(
+        session_info: dict,
+        bars: pd.DataFrame,
+        timestamp: object,
+    ) -> int | None:
+        ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        ts_ns = int(pd.Timestamp(ts).tz_convert("UTC").value)
+        raw_mapping = session_info.get("bar_index_by_ts_ns")
+        mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+        if not mapping:
+            mapping = DashboardWindow._live_monitor_bar_index_map_from_bars(bars)
+            session_info["bar_index_by_ts_ns"] = mapping
+            if mapping:
+                session_info["next_live_bar_index"] = max(int(value) for value in mapping.values()) + 1
+        key = str(ts_ns)
+        if key in mapping:
+            try:
+                return int(mapping[key])
+            except Exception:
+                pass
+
+        normalized = DashboardWindow._normalize_live_monitor_cached_bars(bars)
+        source_index = -1
+        if not normalized.empty:
+            try:
+                loc = pd.DatetimeIndex(normalized.index).get_loc(pd.Timestamp(ts).tz_convert("UTC"))
+                if isinstance(loc, slice):
+                    source_index = int(loc.stop - 1)
+                elif isinstance(loc, np.ndarray):
+                    matches = np.flatnonzero(loc)
+                    source_index = int(matches[-1]) if len(matches) else -1
+                else:
+                    source_index = int(loc)
+            except Exception:
+                source_index = -1
+        used_indices: set[int] = set()
+        for value in mapping.values():
+            try:
+                used_indices.add(int(value))
+            except Exception:
+                continue
+        if source_index >= 0 and source_index not in used_indices:
+            bar_index = source_index
+        else:
+            try:
+                next_index = int(session_info.get("next_live_bar_index") or 0)
+            except Exception:
+                next_index = 0
+            bar_index = max(next_index, (max(used_indices) + 1) if used_indices else 0)
+        mapping[key] = int(bar_index)
+        session_info["bar_index_by_ts_ns"] = mapping
+        session_info["next_live_bar_index"] = max(int(bar_index) + 1, (max(used_indices) + 1) if used_indices else 0)
+        return int(bar_index)
+
+    def _start_charts_live_stream(self, symbol: str, *, force: bool = False) -> None:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        if force:
+            self.charts_live_paused_symbols.discard(cleaned)
+        elif self._charts_symbol_live_paused(cleaned):
+            self._update_charts_live_buttons()
+            return
+        if self._charts_symbol_stream_running(cleaned):
+            self._update_charts_live_buttons()
+            return
+        watch_worker = self.charts_watchlist_stream_workers.get(cleaned)
+        if watch_worker is not None and watch_worker.isRunning():
+            self._update_charts_live_buttons()
+            return
+        monitor_worker = self.live_monitor_chart_stream_workers.get(cleaned)
+        if monitor_worker is not None and monitor_worker.isRunning():
+            self._update_charts_live_buttons()
+            return
+        if self.charts_stream_worker and self.charts_stream_worker.isRunning():
+            worker_symbol = str(getattr(self.charts_stream_worker, "symbol", "") or "").strip().upper()
+            if worker_symbol == cleaned:
+                self._update_charts_live_buttons()
+                return
+            self._stop_charts_live_stream()
+        worker = ChartLiveStreamWorker(
+            symbol=cleaned,
+            store_path=self.live_market_store.db_path,
+            config=self._charts_ib_config(client_offset=41),
+            parent=self,
+        )
+        worker.bar_signal.connect(self._on_charts_live_bar)
+        worker.preview_bar_signal.connect(self._on_charts_live_preview_bar)
+        worker.status_signal.connect(lambda text: self.charts_status_label.setText(text))
+        worker.error_signal.connect(self._on_charts_worker_error)
+        worker.finished.connect(lambda: setattr(self, "charts_stream_worker", None))
+        worker.finished.connect(self._update_charts_live_buttons)
+        worker.finished.connect(worker.deleteLater)
+        self.charts_stream_worker = worker
+        worker.start()
+        self._update_charts_live_buttons()
+
+    def _stop_charts_live_stream(self, symbol: str | None = None, *, update_status: bool = True) -> None:
+        worker = getattr(self, "charts_stream_worker", None)
+        if worker is None:
+            self._update_charts_live_buttons()
+            return
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        if cleaned and str(getattr(worker, "symbol", "") or "").strip().upper() != cleaned:
+            self._update_charts_live_buttons()
+            return
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(2000)
+        self.charts_stream_worker = None
+        if update_status and hasattr(self, "charts_status_label"):
+            self.charts_status_label.setText("Live chart stream stopped.")
+        self._update_charts_live_buttons()
+
+    def _stop_selected_charts_live_stream(self) -> None:
+        symbol = _market_symbol_from_dataset_id(getattr(self, "charts_current_symbol", ""))
+        if not symbol:
+            return
+        self.charts_live_paused_symbols.add(symbol)
+        self._stop_charts_watchlist_stream(symbol)
+        self._stop_charts_live_stream(symbol, update_status=False)
+        self.charts_pending_open_after_first_bar = False
+        if hasattr(self, "charts_status_label"):
+            self.charts_status_label.setText(f"{symbol} live stream stopped.")
+        self._update_charts_live_buttons()
+
+    def _stop_all_charts_live_streams(self) -> None:
+        symbols: set[str] = set(getattr(self, "charts_watchlist_stream_workers", {}).keys())
+        current_symbol = _market_symbol_from_dataset_id(getattr(self, "charts_current_symbol", ""))
+        if current_symbol:
+            symbols.add(current_symbol)
+        worker = getattr(self, "charts_stream_worker", None)
+        worker_symbol = _market_symbol_from_dataset_id(getattr(worker, "symbol", "")) if worker is not None else ""
+        if worker_symbol:
+            symbols.add(worker_symbol)
+        try:
+            symbols.update(
+                normalized
+                for normalized in (_market_symbol_from_dataset_id(item) for item in self.live_market_store.load_watchlist())
+                if normalized
+            )
+        except sqlite3.Error:
+            pass
+        self.charts_live_paused_symbols.update(symbols)
+        self._stop_charts_live_stream(update_status=False)
+        self._stop_charts_watchlist_streams()
+        if hasattr(self, "charts_status_label"):
+            self.charts_status_label.setText("Charts live streams stopped. Deployment and strategy live feeds were left running.")
+        self._update_charts_live_buttons()
+
+    def _start_selected_charts_live_stream(self) -> None:
+        symbol = _market_symbol_from_dataset_id(getattr(self, "charts_current_symbol", ""))
+        if not symbol:
+            edit = getattr(self, "charts_symbol_edit", None)
+            symbol = _market_symbol_from_dataset_id(edit.text() if edit is not None else "")
+        if not symbol:
+            return
+        provider = str(self.charts_provider_combo.currentData() or DEFAULT_LIVE_PROVIDER)
+        if provider != DEFAULT_LIVE_PROVIDER:
+            self.charts_status_label.setText(f"{provider_display_name(provider)} live data is planned but not wired yet.")
+            return
+        self.charts_live_paused_symbols.discard(symbol)
+        self.charts_current_symbol = symbol
+        self.charts_symbol_edit.setText(symbol)
+        try:
+            watchlist = {
+                normalized
+                for normalized in (_market_symbol_from_dataset_id(item) for item in self.live_market_store.ensure_default_watchlist())
+                if normalized
+            }
+        except sqlite3.Error as exc:
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        if symbol in watchlist:
+            self._start_charts_watchlist_streams()
+        else:
+            self._start_charts_live_stream(symbol, force=True)
+        self.charts_status_label.setText(f"{symbol} live stream started.")
+        self._update_charts_live_buttons()
+
+    def _start_all_charts_live_streams(self) -> None:
+        provider = str(self.charts_provider_combo.currentData() or DEFAULT_LIVE_PROVIDER)
+        if provider != DEFAULT_LIVE_PROVIDER:
+            self.charts_status_label.setText(f"{provider_display_name(provider)} live data is planned but not wired yet.")
+            return
+        current_symbol = _market_symbol_from_dataset_id(getattr(self, "charts_current_symbol", ""))
+        if not current_symbol:
+            edit = getattr(self, "charts_symbol_edit", None)
+            current_symbol = _market_symbol_from_dataset_id(edit.text() if edit is not None else "")
+        try:
+            watchlist = {
+                normalized
+                for normalized in (_market_symbol_from_dataset_id(item) for item in self.live_market_store.ensure_default_watchlist())
+                if normalized
+            }
+        except sqlite3.Error as exc:
+            self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+            return
+        resume_symbols = set(watchlist)
+        if current_symbol:
+            resume_symbols.add(current_symbol)
+            self.charts_current_symbol = current_symbol
+            self.charts_symbol_edit.setText(current_symbol)
+        self.charts_live_paused_symbols.difference_update(resume_symbols)
+        self._start_charts_watchlist_streams()
+        if current_symbol and current_symbol not in watchlist:
+            self._start_charts_live_stream(current_symbol, force=True)
+        self.charts_status_label.setText("Charts live streams started.")
+        self._update_charts_live_buttons()
+
+    def _on_charts_live_preview_bar(self, record: object) -> None:
+        if not isinstance(record, dict):
+            return
+        symbol = _market_symbol_from_dataset_id(record.get("symbol"))
+        if not symbol:
+            return
+        if bool(record.get("is_partial")):
+            try:
+                self._send_live_monitor_magellan_update(symbol, record)
+            except Exception as exc:
+                self.status_label.setText(f"Unable to preview Live Monitor chart update for {symbol}: {exc}")
+            return
+        try:
+            self._send_live_monitor_magellan_update(symbol, record)
+        except Exception as exc:
+            self.status_label.setText(f"Unable to preview Live Monitor chart update for {symbol}: {exc}")
+
+    def _on_charts_live_bar(self, record: object) -> None:
+        if not isinstance(record, dict):
+            return
+        symbol = _market_symbol_from_dataset_id(record.get("symbol"))
+        if not symbol:
+            return
+        try:
+            self._process_live_deployment_bar(symbol, record)
+        except Exception as exc:
+            self.status_label.setText(f"Unable to evaluate live deployment for {symbol}: {exc}")
+        try:
+            self._refresh_charts_watchlist_table(preferred_symbol=self.charts_current_symbol or None)
+            self._update_charts_live_buttons()
+        except sqlite3.Error as exc:
+            if hasattr(self, "charts_status_label"):
+                self.charts_status_label.setText(f"Live market store unavailable: {exc}")
+        try:
+            self._send_live_monitor_magellan_update(symbol, record)
+        except Exception as exc:
+            self.status_label.setText(f"Unable to update Live Monitor chart for {symbol}: {exc}")
+        if symbol != _market_symbol_from_dataset_id(self.charts_current_symbol):
+            return
+        redraw_preview = self._charts_preview_redraw_due()
+        update_open_session = bool(
+            self.charts_pending_open_after_first_bar
+            or (
+                self.charts_current_session_id
+                and _market_symbol_from_dataset_id(self.charts_current_session_symbol) == symbol
+            )
+        )
+        if not redraw_preview and not update_open_session:
+            return
+        bars, _dataset_id, _note = self._build_charts_combined_bars(symbol)
+        self.charts_current_bars = bars
+        if redraw_preview:
+            self._draw_charts_preview(bars)
+        if self.charts_pending_open_after_first_bar:
+            self.charts_pending_open_after_first_bar = False
+            self._start_charts_magellan_session(symbol, status_text="Fresh IB bar received; live session ready.")
+        if self.charts_current_session_id and _market_symbol_from_dataset_id(self.charts_current_session_symbol) == symbol:
+            self._send_charts_magellan_live_update(symbol, record, bars)
+
+    def _send_charts_magellan_live_update(self, symbol: str, record: dict, bars: pd.DataFrame) -> None:
+        symbol = _market_symbol_from_dataset_id(symbol)
+        if not symbol:
+            return
+        if bars is None or bars.empty:
+            return
+        ts = pd.to_datetime(record.get("ts_utc"), utc=True, errors="coerce")
+        if pd.isna(ts):
+            return
+        source_bar_index = int(len(bars) - 1)
+        bar_row = bars.iloc[source_bar_index]
+        bar_ts = pd.Timestamp(bars.index[source_bar_index]).tz_convert("UTC")
+        bar_ts_ns = int(bar_ts.value)
+        bar_index = self._magellan_live_update_bar_index(
+            bar_ts_ns=bar_ts_ns,
+            fallback_index=source_bar_index,
+            last_sent_bar_ts_ns=int(getattr(self, "charts_current_session_last_sent_bar_ts_ns", 0) or 0),
+            last_sent_bar_index=int(getattr(self, "charts_current_session_last_sent_bar_index", -1)),
+        )
+        if bar_index is None:
+            return
+        overlays, panes, styles = compute_chart_indicators(bars, self._selected_chart_indicator_ids())
+        try:
+            self.magellan.send_live_update(
+                self.charts_current_session_id,
+                title=f"{symbol} {chart_timeframe_label(self._selected_charts_timeframe())}",
+                status_text=f"Last IB bar {pd.Timestamp(ts).tz_convert('America/New_York').strftime('%H:%M:%S')}",
+                bars=[
+                    {
+                        "timestamp_utc_ns": str(int(bar_ts.value)),
+                        "bar_index": bar_index,
+                        "open": float(bar_row.get("open") or 0.0),
+                        "high": float(bar_row.get("high") or 0.0),
+                        "low": float(bar_row.get("low") or 0.0),
+                        "close": float(bar_row.get("close") or 0.0),
+                        "volume": float(bar_row.get("volume") or 0.0),
+                    }
+                ],
+                overlay_series=incremental_series_payload(
+                    overlays,
+                    bar_index=bar_index,
+                    timestamp=bar_ts,
+                    styles=styles,
+                    source_bar_index=source_bar_index,
+                ),
+                pane_series=incremental_series_payload(
+                    panes,
+                    bar_index=bar_index,
+                    timestamp=bar_ts,
+                    styles=styles,
+                    source_bar_index=source_bar_index,
+                ),
+                timeout_ms=MAGELLAN_LIVE_UPDATE_TIMEOUT_MS,
+            )
+            self.charts_current_session_last_sent_bar_ts_ns = bar_ts_ns
+            self.charts_current_session_last_sent_bar_index = int(bar_index)
+        except Exception as exc:
+            self.charts_status_label.setText(f"Unable to send Magellan live update: {exc}")
+
     def _build_correlation_matrix_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         self.correlation_matrix_tab = panel
@@ -11633,7 +16934,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("Correlation Matrix")
         title.setObjectName("Title")
         subtitle = QtWidgets.QLabel(
-            "Compute on-demand covariance or correlation views for assets, sectors, strategies, and portfolio runs. Asset and sector views use local historical datasets; strategy and portfolio views reuse saved run artifacts."
+            "Compute on-demand covariance or correlation views for assets, strategies, and portfolio runs. Asset views use local historical datasets; strategy and portfolio views reuse saved run artifacts."
         )
         subtitle.setObjectName("Sub")
         subtitle.setWordWrap(True)
@@ -11648,9 +16949,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         controls.setSpacing(8)
         self.correlation_mode_combo = QtWidgets.QComboBox()
         self.correlation_mode_combo.addItem("Assets", "assets")
-        self.correlation_mode_combo.addItem("Sectors", "sectors")
         self.correlation_mode_combo.addItem("Strategies", "strategies")
         self.correlation_mode_combo.addItem("Portfolios", "portfolios")
+        self.correlation_mode_combo.currentIndexChanged.connect(self._on_correlation_mode_changed)
         controls.addWidget(self.correlation_mode_combo)
 
         self.correlation_matrix_type_combo = QtWidgets.QComboBox()
@@ -11662,16 +16963,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.correlation_universe_combo, 1)
 
         self.correlation_lookback_spin = QtWidgets.QSpinBox()
-        self.correlation_lookback_spin.setRange(20, 5000)
+        self.correlation_lookback_spin.setRange(20, 499999)
         self.correlation_lookback_spin.setValue(252)
         self.correlation_lookback_spin.setSuffix(" bars")
         controls.addWidget(self.correlation_lookback_spin)
 
-        self.correlation_max_series_spin = QtWidgets.QSpinBox()
-        self.correlation_max_series_spin.setRange(2, 30)
-        self.correlation_max_series_spin.setValue(8)
-        self.correlation_max_series_spin.setSuffix(" series")
-        controls.addWidget(self.correlation_max_series_spin)
+        self.correlation_group_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.correlation_group_threshold_spin.setRange(-1.0, 1.0)
+        self.correlation_group_threshold_spin.setSingleStep(0.01)
+        self.correlation_group_threshold_spin.setDecimals(2)
+        self.correlation_group_threshold_spin.setValue(0.01)
+        self.correlation_group_threshold_spin.setPrefix("Group r <= ")
+        controls.addWidget(self.correlation_group_threshold_spin)
 
         refresh_btn = QtWidgets.QPushButton("Refresh Sources")
         refresh_btn.clicked.connect(self._refresh_correlation_universe_options)
@@ -11681,10 +16984,35 @@ class DashboardWindow(QtWidgets.QMainWindow):
         compute_btn.clicked.connect(self._compute_selected_correlation_matrix)
         controls.addWidget(compute_btn)
 
-        screener_btn = QtWidgets.QPushButton("Use Screener Results")
-        screener_btn.clicked.connect(self._use_asset_screener_for_matrix)
-        controls.addWidget(screener_btn)
+        self.correlation_screener_btn = QtWidgets.QPushButton("Use Screener Results")
+        self.correlation_screener_btn.clicked.connect(self._use_asset_screener_for_matrix)
+        controls.addWidget(self.correlation_screener_btn)
         layout.addLayout(controls)
+
+        self.correlation_run_selector_group = QtWidgets.QGroupBox("Saved Runs")
+        run_selector_layout = QtWidgets.QVBoxLayout(self.correlation_run_selector_group)
+        run_selector_layout.setContentsMargins(10, 10, 10, 10)
+        run_selector_layout.setSpacing(8)
+        self.correlation_run_selector_summary = QtWidgets.QLabel("No saved runs loaded.")
+        self.correlation_run_selector_summary.setObjectName("Sub")
+        self.correlation_run_selector_summary.setWordWrap(True)
+        run_selector_layout.addWidget(self.correlation_run_selector_summary)
+        self.correlation_run_list = QtWidgets.QListWidget()
+        self.correlation_run_list.setAlternatingRowColors(True)
+        self.correlation_run_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.correlation_run_list.itemSelectionChanged.connect(self._on_correlation_run_selection_changed)
+        run_selector_layout.addWidget(self.correlation_run_list, 1)
+        run_buttons = QtWidgets.QHBoxLayout()
+        select_all_btn = QtWidgets.QPushButton("Select All")
+        select_all_btn.clicked.connect(self._select_all_correlation_runs)
+        clear_selection_btn = QtWidgets.QPushButton("Clear")
+        clear_selection_btn.clicked.connect(self._clear_correlation_run_selection)
+        run_buttons.addWidget(select_all_btn)
+        run_buttons.addWidget(clear_selection_btn)
+        run_buttons.addStretch(1)
+        run_selector_layout.addLayout(run_buttons)
+        self.correlation_run_selector_group.setVisible(False)
+        layout.addWidget(self.correlation_run_selector_group)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         split.setChildrenCollapsible(False)
@@ -11694,6 +17022,67 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.correlation_matrix_table.setAlternatingRowColors(True)
         self.correlation_matrix_table.verticalHeader().setVisible(False)
         self.correlation_matrix_table.horizontalHeader().setStretchLastSection(False)
+        self.correlation_matrix_table.setShowGrid(False)
+        self.correlation_matrix_table.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        table_palette = self.correlation_matrix_table.palette()
+        table_palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor(PALETTE["panel2"]))
+        table_palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor(PALETTE["panel2"]))
+        self.correlation_matrix_table.setPalette(table_palette)
+        self.correlation_matrix_table.viewport().setAutoFillBackground(True)
+        self.correlation_matrix_table.viewport().setPalette(table_palette)
+        header_palette = self.correlation_matrix_table.horizontalHeader().palette()
+        header_palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor(PALETTE["panel"]))
+        header_palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor(PALETTE["panel"]))
+        self.correlation_matrix_table.horizontalHeader().setPalette(header_palette)
+        self.correlation_matrix_table.horizontalHeader().setAutoFillBackground(True)
+        self.correlation_matrix_table.horizontalHeader().viewport().setAutoFillBackground(True)
+        self.correlation_matrix_table.horizontalHeader().viewport().setPalette(header_palette)
+        self.correlation_matrix_table.setStyleSheet(
+            f"""
+            QTableWidget {{
+                background: {PALETTE['panel2']};
+                alternate-background-color: {PALETTE['panel']};
+                color: {PALETTE['text']};
+                border: 0px;
+                gridline-color: {PALETTE['grid']};
+            }}
+            QTableWidget::viewport {{
+                background: {PALETTE['panel2']};
+            }}
+            QHeaderView {{
+                background: {PALETTE['panel']};
+            }}
+            QHeaderView::section {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['muted']};
+                border: 0px;
+                border-right: 1px solid rgba(154, 176, 208, 0.18);
+                border-bottom: 1px solid rgba(154, 176, 208, 0.18);
+                padding: 6px 8px;
+                font-weight: 600;
+            }}
+            QTableCornerButton::section {{
+                background: {PALETTE['panel']};
+                border: 0px;
+            }}
+            """
+        )
+        self.correlation_matrix_table.horizontalHeader().setStyleSheet(
+            f"""
+            QHeaderView {{
+                background: {PALETTE['panel']};
+            }}
+            QHeaderView::section {{
+                background: {PALETTE['panel']};
+                color: {PALETTE['muted']};
+                border: 0px;
+                border-right: 1px solid rgba(154, 176, 208, 0.18);
+                border-bottom: 1px solid rgba(154, 176, 208, 0.18);
+                padding: 6px 8px;
+                font-weight: 600;
+            }}
+            """
+        )
         self.correlation_matrix_table.setObjectName("Panel")
         split.addWidget(self.correlation_matrix_table)
 
@@ -11721,83 +17110,162 @@ class DashboardWindow(QtWidgets.QMainWindow):
         idx = self.correlation_universe_combo.findData(current)
         self.correlation_universe_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.correlation_universe_combo.blockSignals(False)
+        self._on_correlation_mode_changed()
 
-    def _preferred_dataset_id_by_symbol(self) -> dict[str, str]:
+    @staticmethod
+    def _matrix_dataset_source_rank(source: object) -> int:
+        normalized = str(source or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"interactive_brokers", "interactivebrokers", "ib"}:
+            return 0
+        if normalized == "massive":
+            return 1
+        return 2
+
+    def _matrix_dataset_frame(self) -> pd.DataFrame:
         datasets = self.catalog.load_acquisition_datasets(include_untracked_local=True)
         if datasets.empty:
-            return {}
+            return datasets
         working = datasets.copy()
+        working["dataset_id"] = working["dataset_id"].fillna("").astype(str)
         working["symbol"] = working["symbol"].fillna("").astype(str).str.upper()
-        working["ingested"] = working["ingested"].astype(bool)
+        working["source"] = working["source"].fillna("").astype(str)
         working["bar_count"] = pd.to_numeric(working["bar_count"], errors="coerce").fillna(0)
-        working["last_download_success_at"] = working["last_download_success_at"].fillna("")
-        working = working.sort_values(
-            ["symbol", "ingested", "last_download_success_at", "bar_count"],
-            ascending=[True, False, False, False],
-            kind="stable",
+        working["ingested"] = working["ingested"].fillna(False).astype(bool)
+        working["last_download_success_at"] = working["last_download_success_at"].fillna("").astype(str)
+        working["ticker"] = [
+            _infer_picker_ticker(dataset_id, symbol)
+            for dataset_id, symbol in zip(working["dataset_id"].tolist(), working["symbol"].tolist())
+        ]
+        working["source_rank"] = working["source"].apply(self._matrix_dataset_source_rank)
+        working["available"] = (
+            working["ingested"]
+            | (working["bar_count"] > 0)
+            | working["parquet_path"].fillna("").astype(str).str.strip().astype(bool)
         )
+        working = working[working["dataset_id"].astype(bool) & working["ticker"].astype(bool) & working["available"]]
+        return working.sort_values(
+            ["ticker", "source_rank", "ingested", "last_download_success_at", "bar_count", "dataset_id"],
+            ascending=[True, True, False, False, False, True],
+            kind="stable",
+        ).reset_index(drop=True)
+
+    def _preferred_dataset_id_by_symbol(self) -> dict[str, str]:
+        datasets = self._matrix_dataset_frame()
+        if datasets.empty:
+            return {}
         mapping: dict[str, str] = {}
-        for _, row in working.iterrows():
-            symbol = str(row.get("symbol") or "").strip().upper()
+        for _, row in datasets.iterrows():
+            symbol = str(row.get("ticker") or "").strip().upper()
             dataset_id = str(row.get("dataset_id") or "").strip()
             if symbol and dataset_id and symbol not in mapping:
                 mapping[symbol] = dataset_id
         return mapping
 
-    def _candidate_dataset_ids_for_matrix(self, source_id: str, *, max_items: int) -> list[str]:
+    def _ticker_for_matrix_dataset_id(self, dataset_id: object, *, frame: pd.DataFrame | None = None) -> str:
+        dataset_id_text = str(dataset_id or "").strip()
+        if not dataset_id_text:
+            return ""
+        resolved_frame = frame
+        if resolved_frame is None:
+            resolved_frame = self._matrix_dataset_frame()
+        if resolved_frame is not None and not resolved_frame.empty and "dataset_id" in resolved_frame.columns:
+            matches = resolved_frame[resolved_frame["dataset_id"].astype(str) == dataset_id_text]
+            if not matches.empty:
+                ticker = str(matches.iloc[0].get("ticker") or "").strip().upper()
+                if ticker:
+                    return ticker
+                symbol = str(matches.iloc[0].get("symbol") or "").strip().upper()
+                if symbol:
+                    return symbol
+        return _infer_picker_ticker(dataset_id_text)
+
+    def _candidate_dataset_ids_for_matrix(self, source_id: str) -> list[str]:
+        datasets = self._matrix_dataset_frame()
+        preferred_by_ticker: dict[str, str] = {}
+        if not datasets.empty:
+            for _, row in datasets.iterrows():
+                ticker = str(row.get("ticker") or "").strip().upper()
+                dataset_id = str(row.get("dataset_id") or "").strip()
+                if ticker and dataset_id and ticker not in preferred_by_ticker:
+                    preferred_by_ticker[ticker] = dataset_id
+
         dataset_ids: list[str] = []
+        seen_tickers: set[str] = set()
+
+        def add_ticker(ticker: object, *, fallback_dataset_id: object = "") -> None:
+            ticker_text = str(ticker or "").strip().upper()
+            fallback_text = str(fallback_dataset_id or "").strip()
+            if not ticker_text and fallback_text:
+                ticker_text = self._ticker_for_matrix_dataset_id(fallback_text, frame=datasets)
+            if not ticker_text or ticker_text in seen_tickers:
+                return
+            dataset_id = preferred_by_ticker.get(ticker_text) or fallback_text
+            if dataset_id and dataset_id not in dataset_ids:
+                dataset_ids.append(dataset_id)
+                seen_tickers.add(ticker_text)
+
         if source_id == "__screener__":
             frame = self.asset_screener_filtered_frame if not self.asset_screener_filtered_frame.empty else self.asset_screener_frame
             if frame.empty:
                 return []
-            dataset_map = self._preferred_dataset_id_by_symbol()
             for _, row in frame.iterrows():
-                dataset_id = str(row.get("latest_dataset_id") or "").strip()
-                if not dataset_id:
-                    dataset_id = dataset_map.get(str(row.get("symbol") or "").strip().upper(), "")
-                if dataset_id and dataset_id not in dataset_ids:
-                    dataset_ids.append(dataset_id)
-                if len(dataset_ids) >= max_items:
-                    break
+                add_ticker(row.get("symbol"), fallback_dataset_id=row.get("latest_dataset_id"))
             return dataset_ids
         if source_id == "__tracked__":
-            datasets = self.catalog.load_acquisition_datasets(include_untracked_local=True)
             if datasets.empty:
                 return []
-            working = datasets.copy()
-            working["ingested"] = working["ingested"].astype(bool)
-            working["bar_count"] = pd.to_numeric(working["bar_count"], errors="coerce").fillna(0)
-            working = working.sort_values(["ingested", "bar_count"], ascending=[False, False], kind="stable")
-            for dataset_id in working["dataset_id"].fillna("").astype(str).tolist():
-                if dataset_id and dataset_id not in dataset_ids:
-                    dataset_ids.append(dataset_id)
-                if len(dataset_ids) >= max_items:
-                    break
+            for _, row in datasets.iterrows():
+                add_ticker(row.get("ticker"), fallback_dataset_id=row.get("dataset_id"))
             return dataset_ids
         universe = self._find_universe(source_id)
         if universe is None:
             return []
         for dataset_id in [str(item).strip() for item in list(universe.get("dataset_ids") or []) if str(item).strip()]:
-            if dataset_id not in dataset_ids:
-                dataset_ids.append(dataset_id)
-            if len(dataset_ids) >= max_items:
-                return dataset_ids
-        dataset_map = self._preferred_dataset_id_by_symbol()
+            add_ticker(self._ticker_for_matrix_dataset_id(dataset_id, frame=datasets), fallback_dataset_id=dataset_id)
         for symbol in [str(item).strip().upper() for item in list(universe.get("symbols") or []) if str(item).strip()]:
-            dataset_id = dataset_map.get(symbol, "")
-            if dataset_id and dataset_id not in dataset_ids:
-                dataset_ids.append(dataset_id)
-            if len(dataset_ids) >= max_items:
-                break
+            add_ticker(symbol)
         return dataset_ids
 
-    def _load_asset_return_series(self, dataset_ids: Sequence[str], *, lookback_bars: int) -> dict[str, pd.Series]:
+    def _load_asset_return_series(
+        self,
+        dataset_ids: Sequence[str],
+        *,
+        lookback_bars: int,
+    ) -> tuple[dict[str, pd.Series], dict[str, str]]:
         series: dict[str, pd.Series] = {}
+        labels: dict[str, str] = {}
+        datasets = self._matrix_dataset_frame()
         duck = DuckDBStore()
         try:
             for dataset_id in list(dataset_ids or []):
+                label = self._ticker_for_matrix_dataset_id(dataset_id, frame=datasets) or str(dataset_id)
+                if label in series:
+                    continue
+                labels[str(dataset_id)] = label
                 try:
-                    bars = duck.load(str(dataset_id), columns=("timestamp", "close"))
+                    if lookback_bars > 0:
+                        path = duck.dataset_path(str(dataset_id))
+                        if not path.exists():
+                            raise FileNotFoundError(f"Parquet not found for dataset_id={dataset_id}")
+                        escaped_path = str(path).replace("'", "''")
+                        limit = max(3, int(lookback_bars) + 1)
+                        bars = duck.conn.execute(
+                            f"""
+                            SELECT timestamp, close
+                            FROM (
+                                SELECT timestamp, close
+                                FROM parquet_scan('{escaped_path}')
+                                ORDER BY timestamp DESC
+                                LIMIT {limit}
+                            )
+                            ORDER BY timestamp
+                            """
+                        ).df()
+                        if not bars.empty:
+                            bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True)
+                            bars = bars.set_index("timestamp")
+                    else:
+                        bars = duck.load(str(dataset_id), columns=("timestamp", "close"))
                 except Exception:
                     continue
                 if bars is None or bars.empty or "close" not in bars.columns:
@@ -11807,78 +17275,145 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 if lookback_bars > 0:
                     returns = returns.tail(int(lookback_bars))
                 if len(returns) >= 2:
-                    series[str(dataset_id)] = returns
+                    series[label] = returns.rename(label)
         finally:
             duck.close()
-        return series
+        return series, labels
 
-    def _build_sector_return_series(self, dataset_ids: Sequence[str], *, lookback_bars: int) -> dict[str, pd.Series]:
-        asset_series = self._load_asset_return_series(dataset_ids, lookback_bars=lookback_bars)
-        if not asset_series:
-            return {}
-        screener_frame = self.asset_screener_frame if not self.asset_screener_frame.empty else pd.DataFrame()
-        dataset_to_sector: dict[str, str] = {}
-        symbol_to_sector: dict[str, str] = {}
-        if not screener_frame.empty:
-            for _, row in screener_frame.iterrows():
-                dataset_id = str(row.get("latest_dataset_id") or "").strip()
-                sector = str(row.get("sector") or "").strip()
-                if dataset_id and sector and dataset_id not in dataset_to_sector:
-                    dataset_to_sector[dataset_id] = sector
-                symbol = str(row.get("symbol") or "").strip().upper()
-                if symbol and sector and symbol not in symbol_to_sector:
-                    symbol_to_sector[symbol] = sector
-        grouped: dict[str, list[pd.Series]] = {}
-        for dataset_id, returns in asset_series.items():
-            sector = dataset_to_sector.get(dataset_id, "")
-            if not sector:
-                sector = symbol_to_sector.get(self._symbol_from_dataset_id(dataset_id), "")
-            if not sector:
-                continue
-            grouped.setdefault(sector, []).append(returns.rename(dataset_id))
-        series: dict[str, pd.Series] = {}
-        for sector, items in grouped.items():
-            frame = pd.concat(items, axis=1).dropna(how="all")
-            if frame.empty:
-                continue
-            averaged = frame.mean(axis=1, skipna=True).dropna()
-            if len(averaged) >= 2:
-                series[sector] = averaged.rename(sector)
-        return series
-
-    def _latest_strategy_runs_for_matrix(self, *, max_items: int) -> list[RunRow]:
-        selected: list[RunRow] = []
-        seen: set[str] = set()
+    def _correlation_run_candidates(self, mode: str) -> list[RunRow]:
+        mode = str(mode or "").strip().lower()
+        candidates: list[RunRow] = []
+        seen: set[tuple[str, str, str]] = set()
         for run in self.catalog.load_runs():
             if str(run.status or "") != "finished":
                 continue
-            if str(run.engine_impl or "").lower() == "vectorized_portfolio":
+            is_portfolio = str(run.engine_impl or "").lower() == "vectorized_portfolio"
+            if mode == "strategies" and is_portfolio:
                 continue
-            label = f"{run.strategy}:{run.dataset_id}"
-            if label in seen:
+            if mode == "portfolios" and not is_portfolio:
                 continue
-            selected.append(run)
-            seen.add(label)
-            if len(selected) >= max_items:
-                break
-        return selected
+            key = (str(run.strategy or ""), str(run.dataset_id or ""), str(run.timeframe or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(run)
+        return candidates
 
-    def _latest_portfolio_runs_for_matrix(self, *, max_items: int) -> list[RunRow]:
-        selected: list[RunRow] = []
-        seen: set[str] = set()
-        for run in self.catalog.load_runs():
-            if str(run.status or "") != "finished":
-                continue
-            if str(run.engine_impl or "").lower() != "vectorized_portfolio":
-                continue
-            label = f"{run.strategy}:{run.dataset_id}"
-            if label in seen:
-                continue
-            selected.append(run)
-            seen.add(label)
-            if len(selected) >= max_items:
-                break
-        return selected
+    def _correlation_run_label(self, run: RunRow) -> str:
+        dataset_label = self._ticker_for_matrix_dataset_id(run.dataset_id) or str(run.dataset_id or "Dataset")
+        return f"{run.strategy} | {dataset_label} | {run.timeframe} | {run.end or 'open'} | {run.run_id[:8]}"
+
+    def _refresh_correlation_run_selector(self) -> None:
+        if not hasattr(self, "correlation_run_list"):
+            return
+        mode = str(self.correlation_mode_combo.currentData() or "assets") if hasattr(self, "correlation_mode_combo") else "assets"
+        if mode not in {"strategies", "portfolios"}:
+            self.correlation_run_list.clear()
+            self.correlation_run_selector_summary.setText("Asset mode uses the selected stock universe.")
+            self._correlation_run_selector_mode = mode
+            return
+
+        candidates = self._correlation_run_candidates(mode)
+        previous_selection = set(self._correlation_run_selection.get(mode, set()))
+        if self._correlation_run_selector_mode == mode:
+            previous_selection.update(
+                str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                for item in self.correlation_run_list.selectedItems()
+            )
+
+        self._correlation_run_selector_updating = True
+        self.correlation_run_list.blockSignals(True)
+        self.correlation_run_list.clear()
+        default_selection: set[str] = set()
+        if not previous_selection:
+            default_selection = {run.run_id for run in candidates[: min(8, len(candidates))]}
+        effective_selection = previous_selection or default_selection
+        for run in candidates:
+            item = QtWidgets.QListWidgetItem(self._correlation_run_label(run))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, run.run_id)
+            item.setToolTip(
+                "\n".join(
+                    [
+                        f"Run: {run.run_id}",
+                        f"Batch: {run.batch_id or '—'}",
+                        f"Strategy: {run.strategy}",
+                        f"Dataset: {run.dataset_id}",
+                        f"Window: {run.start or '—'} -> {run.end or '—'}",
+                    ]
+                )
+            )
+            self.correlation_run_list.addItem(item)
+            if run.run_id in effective_selection:
+                item.setSelected(True)
+        self.correlation_run_list.blockSignals(False)
+        self._correlation_run_selector_updating = False
+        self._correlation_run_selector_mode = mode
+        selected_count = len(self.correlation_run_list.selectedItems())
+        self._correlation_run_selection[mode] = {
+            str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            for item in self.correlation_run_list.selectedItems()
+            if str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+        }
+        noun = "strategy" if mode == "strategies" else "portfolio"
+        self.correlation_run_selector_summary.setText(
+            f"{selected_count} {noun} run{'s' if selected_count != 1 else ''} selected for comparison."
+        )
+
+    def _on_correlation_mode_changed(self) -> None:
+        if not hasattr(self, "correlation_mode_combo"):
+            return
+        mode = str(self.correlation_mode_combo.currentData() or "assets")
+        asset_mode = mode == "assets"
+        if hasattr(self, "correlation_universe_combo"):
+            self.correlation_universe_combo.setEnabled(asset_mode)
+        if hasattr(self, "correlation_screener_btn"):
+            self.correlation_screener_btn.setEnabled(asset_mode)
+        if hasattr(self, "correlation_run_selector_group"):
+            self.correlation_run_selector_group.setVisible(mode in {"strategies", "portfolios"})
+        self._refresh_correlation_run_selector()
+
+    def _on_correlation_run_selection_changed(self) -> None:
+        if self._correlation_run_selector_updating:
+            return
+        mode = str(self.correlation_mode_combo.currentData() or "")
+        if mode not in {"strategies", "portfolios"}:
+            return
+        selected = {
+            str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            for item in self.correlation_run_list.selectedItems()
+            if str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+        }
+        self._correlation_run_selection[mode] = selected
+        selected_count = len(selected)
+        noun = "strategy" if mode == "strategies" else "portfolio"
+        self.correlation_run_selector_summary.setText(
+            f"{selected_count} {noun} run{'s' if selected_count != 1 else ''} selected for comparison."
+        )
+
+    def _select_all_correlation_runs(self) -> None:
+        if not hasattr(self, "correlation_run_list"):
+            return
+        self.correlation_run_list.selectAll()
+
+    def _clear_correlation_run_selection(self) -> None:
+        if not hasattr(self, "correlation_run_list"):
+            return
+        self.correlation_run_list.clearSelection()
+
+    def _selected_correlation_runs(self, mode: str) -> list[RunRow]:
+        candidates = self._correlation_run_candidates(mode)
+        selected_ids: set[str] = set()
+        if hasattr(self, "correlation_run_list") and self._correlation_run_selector_mode == mode:
+            selected_ids = {
+                str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                for item in self.correlation_run_list.selectedItems()
+                if str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+            }
+        if not selected_ids:
+            selected_ids = set(self._correlation_run_selection.get(mode, set()))
+        if selected_ids:
+            return [run for run in candidates if run.run_id in selected_ids]
+        return []
 
     def _return_series_from_run(self, run: RunRow, *, lookback_bars: int) -> pd.Series | None:
         bars = RunChartDialog._load_bars_utc_static(run)
@@ -11905,11 +17440,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _matrix_item_color(value: float, *, max_abs: float) -> QtGui.QColor:
         if not np.isfinite(value) or max_abs <= 0:
-            return QtGui.QColor(PALETTE["panel"])
+            return QtGui.QColor(PALETTE["panel2"])
         ratio = min(1.0, abs(float(value)) / max_abs)
+        base = QtGui.QColor(PALETTE["panel2"])
         if value >= 0:
-            return QtGui.QColor(39, 208, 125, int(35 + (155 * ratio)))
-        return QtGui.QColor(255, 77, 109, int(35 + (155 * ratio)))
+            target = QtGui.QColor(39, 208, 125)
+        else:
+            target = QtGui.QColor(255, 77, 109)
+        mix = min(0.86, 0.14 + (0.72 * ratio))
+        red = int(round(base.red() * (1.0 - mix) + target.red() * mix))
+        green = int(round(base.green() * (1.0 - mix) + target.green() * mix))
+        blue = int(round(base.blue() * (1.0 - mix) + target.blue() * mix))
+        return QtGui.QColor(red, green, blue)
 
     def _render_correlation_matrix(self, matrix: pd.DataFrame, *, matrix_kind: str) -> None:
         self.correlation_matrix_table.clear()
@@ -11941,43 +17483,105 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.correlation_matrix_table.setItem(row_idx, col_idx, item)
         self.correlation_matrix_table.resizeColumnsToContents()
 
+    @staticmethod
+    def _pairwise_low_correlation_groups(
+        matrix: pd.DataFrame,
+        *,
+        threshold: float,
+        max_groups: int = 5,
+    ) -> list[tuple[list[str], float, float, float]]:
+        if matrix is None or matrix.empty or len(matrix.columns) < 2:
+            return []
+        columns = [str(col) for col in matrix.columns]
+        corr_matrix = matrix.reindex(index=columns, columns=columns)
+        for col in columns:
+            corr_matrix.loc[col, col] = np.nan
+        average_corr = corr_matrix.mean(axis=1, skipna=True).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        seeds = sorted(columns, key=lambda col: (float(average_corr.get(col, 1.0)), col))
+        groups: list[tuple[list[str], float, float, float]] = []
+        seen: set[tuple[str, ...]] = set()
+
+        for seed in seeds:
+            group = [seed]
+            candidates = [col for col in seeds if col != seed]
+            for candidate in candidates:
+                pair_values: list[float] = []
+                keep = True
+                for member in group:
+                    value = corr_matrix.loc[candidate, member]
+                    if pd.isna(value) or not np.isfinite(float(value)) or float(value) > threshold:
+                        keep = False
+                        break
+                    pair_values.append(float(value))
+                if keep and pair_values:
+                    group.append(candidate)
+            if len(group) < 2:
+                continue
+            key = tuple(sorted(group))
+            if key in seen:
+                continue
+            seen.add(key)
+            values: list[float] = []
+            for left_idx, left_name in enumerate(group):
+                for right_name in group[left_idx + 1 :]:
+                    value = corr_matrix.loc[left_name, right_name]
+                    if pd.notna(value) and np.isfinite(float(value)):
+                        values.append(float(value))
+            if not values:
+                continue
+            groups.append((group, min(values), max(values), float(np.mean(values))))
+
+        return sorted(groups, key=lambda item: (-len(item[0]), item[2], item[3], item[1], ", ".join(item[0])))[:max_groups]
+
     def _compute_selected_correlation_matrix(self) -> None:
         if not hasattr(self, "correlation_matrix_table"):
             return
         mode = str(self.correlation_mode_combo.currentData() or "assets")
         matrix_kind = str(self.correlation_matrix_type_combo.currentData() or "correlation")
         lookback_bars = int(self.correlation_lookback_spin.value())
-        max_items = int(self.correlation_max_series_spin.value())
+        group_threshold = float(self.correlation_group_threshold_spin.value())
         source_id = str(self.correlation_universe_combo.currentData() or "__screener__")
 
         series_map: dict[str, pd.Series] = {}
         notes: list[str] = []
         skipped: list[str] = []
 
+        def preview(items: Sequence[str], *, limit: int = 16) -> str:
+            values = [str(item) for item in list(items or []) if str(item).strip()]
+            if len(values) <= limit:
+                return ", ".join(values) if values else "None"
+            return ", ".join(values[:limit]) + f", ... (+{len(values) - limit})"
+
         if mode == "assets":
-            dataset_ids = self._candidate_dataset_ids_for_matrix(source_id, max_items=max_items)
-            notes.append(f"Datasets considered: {', '.join(dataset_ids) if dataset_ids else 'None'}")
-            series_map = self._load_asset_return_series(dataset_ids, lookback_bars=lookback_bars)
-            skipped.extend([dataset_id for dataset_id in dataset_ids if dataset_id not in series_map])
-        elif mode == "sectors":
-            dataset_ids = self._candidate_dataset_ids_for_matrix(source_id, max_items=max_items * 3)
-            notes.append(f"Dataset pool: {', '.join(dataset_ids) if dataset_ids else 'None'}")
-            series_map = self._build_sector_return_series(dataset_ids, lookback_bars=lookback_bars)
+            dataset_ids = self._candidate_dataset_ids_for_matrix(source_id)
+            series_map, dataset_labels = self._load_asset_return_series(dataset_ids, lookback_bars=lookback_bars)
+            dataset_notes = [
+                f"{dataset_labels.get(str(dataset_id), self._ticker_for_matrix_dataset_id(dataset_id))}: {dataset_id}"
+                for dataset_id in dataset_ids
+            ]
+            notes.append(f"Datasets considered ({len(dataset_ids)}): {preview(dataset_notes)}")
+            loaded_labels = set(series_map.keys())
+            for dataset_id in dataset_ids:
+                label = dataset_labels.get(str(dataset_id), self._ticker_for_matrix_dataset_id(dataset_id) or str(dataset_id))
+                if label not in loaded_labels:
+                    skipped.append(f"{label} ({dataset_id})")
         elif mode == "strategies":
-            runs = self._latest_strategy_runs_for_matrix(max_items=max_items)
-            notes.append(f"Strategy runs: {', '.join(f'{run.strategy}:{run.dataset_id}' for run in runs) if runs else 'None'}")
+            runs = self._selected_correlation_runs(mode)
+            notes.append(f"Strategy runs ({len(runs)}): {preview([self._correlation_run_label(run) for run in runs], limit=10)}")
             for run in runs:
-                label = f"{run.strategy}:{run.dataset_id}"
+                dataset_label = self._ticker_for_matrix_dataset_id(run.dataset_id) or str(run.dataset_id or "Dataset")
+                label = f"{run.strategy}:{dataset_label}:{run.run_id[:8]}"
                 returns = self._return_series_from_run(run, lookback_bars=lookback_bars)
                 if returns is None:
                     skipped.append(label)
                     continue
                 series_map[label] = returns.rename(label)
         else:
-            runs = self._latest_portfolio_runs_for_matrix(max_items=max_items)
-            notes.append(f"Portfolio runs: {', '.join(f'{run.strategy}:{run.dataset_id}' for run in runs) if runs else 'None'}")
+            runs = self._selected_correlation_runs(mode)
+            notes.append(f"Portfolio runs ({len(runs)}): {preview([self._correlation_run_label(run) for run in runs], limit=10)}")
             for run in runs:
-                label = f"{run.strategy}:{run.dataset_id}"
+                dataset_label = self._ticker_for_matrix_dataset_id(run.dataset_id) or str(run.dataset_id or "Portfolio")
+                label = f"{run.strategy}:{dataset_label}:{run.run_id[:8]}"
                 returns = self._return_series_from_portfolio_run(run, lookback_bars=lookback_bars)
                 if returns is None:
                     skipped.append(label)
@@ -11997,6 +17601,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             return
 
         aligned = pd.concat(series_map, axis=1).sort_index().dropna(how="all")
+        full_overlap = aligned.dropna(how="any")
         if aligned.empty:
             self.correlation_matrix_frame = pd.DataFrame()
             self._render_correlation_matrix(self.correlation_matrix_frame, matrix_kind=matrix_kind)
@@ -12004,7 +17609,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self.correlation_summary_label.setText("No overlapping observations were available for the matrix.")
             return
 
-        matrix = aligned.corr() if matrix_kind == "correlation" else aligned.cov()
+        matrix = aligned.corr(min_periods=2) if matrix_kind == "correlation" else aligned.cov(min_periods=2)
         self.correlation_matrix_frame = matrix
         self._render_correlation_matrix(matrix, matrix_kind=matrix_kind)
 
@@ -12016,24 +17621,44 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 if pd.isna(value):
                     continue
                 pairs.append((float(value), str(left_name), str(right_name)))
-        strongest = sorted(pairs, key=lambda item: abs(item[0]), reverse=True)[:8]
+        strongest = sorted(pairs, key=lambda item: item[0], reverse=True)[:8]
+        uncorrelated = sorted(pairs, key=lambda item: (item[0], item[1], item[2]))[:8]
         detail_lines = [
             f"Mode: {mode.title()}",
             f"Matrix Type: {matrix_kind.title()}",
+            f"Return Basis: {'close-to-close percent returns' if mode == 'assets' else 'equity-curve percent returns'}",
+            f"Method: {'Pearson correlation' if matrix_kind == 'correlation' else 'sample covariance'}",
+            "Normality Test: Not applied",
             f"Series: {len(series_map)}",
-            f"Observations: {len(aligned)}",
+            f"Nonempty Return Bars: {len(aligned)}",
+            f"Full-Overlap Observations: {len(full_overlap)}",
         ]
         if strongest:
             detail_lines.extend(["", "Strongest Pairs:"])
             for value, left_name, right_name in strongest:
                 detail_lines.append(f"{left_name} <> {right_name}: {value:.4f}")
+        if uncorrelated:
+            weak_label = "Strongest Uncorrelated Pairs (lowest raw r):" if matrix_kind == "correlation" else "Lowest Covariance Pairs:"
+            detail_lines.extend(["", weak_label])
+            for value, left_name, right_name in uncorrelated:
+                detail_lines.append(f"{left_name} <> {right_name}: {value:.4f}")
+        if matrix_kind == "correlation":
+            groups = self._pairwise_low_correlation_groups(matrix, threshold=group_threshold)
+            if groups:
+                detail_lines.extend(["", f"Low-Correlation Groups (all pairwise r <= {group_threshold:.2f}):"])
+                for idx, (group, min_r, max_r, avg_r) in enumerate(groups, start=1):
+                    detail_lines.append(
+                        f"Group {idx} ({len(group)}): {', '.join(group)} | min r={min_r:.4f}, max r={max_r:.4f}, avg r={avg_r:.4f}"
+                    )
+            else:
+                detail_lines.extend(["", f"Low-Correlation Groups: No group met the {group_threshold:.2f} raw-r threshold."])
         if notes:
             detail_lines.extend(["", *notes])
         if skipped:
             detail_lines.extend(["", f"Skipped: {', '.join(skipped)}"])
         self.correlation_detail.setPlainText("\n".join(detail_lines))
         self.correlation_summary_label.setText(
-            f"{matrix_kind.title()} matrix computed for {len(series_map)} {mode} series across {len(aligned)} observations."
+            f"{matrix_kind.title()} matrix computed for {len(series_map)} {mode} series across {len(aligned)} nonempty return bars."
         )
 
     def _use_asset_screener_for_matrix(self) -> None:
@@ -12136,7 +17761,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.universe_source_combo.addItem("Any Source", "")
         for provider in available_acquisition_providers():
             self.universe_source_combo.addItem(provider.label, provider.provider_id)
-        self.universe_source_combo.currentIndexChanged.connect(self._refresh_universe_acquisition_summary)
+        self.universe_source_combo.currentIndexChanged.connect(self._request_universe_acquisition_summary_refresh)
 
         self.universe_desc_edit = QtWidgets.QPlainTextEdit()
         self.universe_desc_edit.setPlaceholderText("Optional notes for this universe.")
@@ -12145,7 +17770,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.universe_symbols_edit = QtWidgets.QPlainTextEdit()
         self.universe_symbols_edit.setPlaceholderText("One symbol per line or comma-separated, e.g. SPY\\nQQQ\\nAAPL")
         self.universe_symbols_edit.setFixedHeight(180)
-        self.universe_symbols_edit.textChanged.connect(self._refresh_universe_acquisition_summary)
+        self.universe_symbols_edit.textChanged.connect(self._request_universe_acquisition_summary_refresh)
         symbols_wrap = QtWidgets.QWidget()
         symbols_layout = QtWidgets.QVBoxLayout(symbols_wrap)
         symbols_layout.setContentsMargins(0, 0, 0, 0)
@@ -12242,6 +17867,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "universe_table"):
             return
         current_id = self._editing_universe_id
+        selection_model = self.universe_table.selectionModel()
         self.universe_table.setRowCount(len(self.universes))
         selected_row = -1
         for row_idx, universe in enumerate(self.universes):
@@ -12268,8 +17894,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 selected_row = row_idx
         if selected_row >= 0:
             self.universe_table.selectRow(selected_row)
-        elif self.universe_table.rowCount() > 0 and not self.universe_table.selectedItems():
-            self.universe_table.selectRow(0)
+        elif selection_model is not None:
+            blocker = QtCore.QSignalBlocker(selection_model)
+            self.universe_table.clearSelection()
+            del blocker
 
     def _refresh_universe_options(self) -> None:
         options = [(str(item.get("universe_id", "")), str(item.get("name", ""))) for item in self.universes]
@@ -12295,6 +17923,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.download_universe_id = resolved_id
         self._refresh_correlation_universe_options()
         self._update_study_dataset_summary()
+        self._update_horizon_coverage_summary()
         self._update_ticker_summary()
 
     def _find_universe(self, universe_id: str) -> dict | None:
@@ -12309,14 +17938,25 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _new_universe(self) -> None:
         self._editing_universe_id = ""
         self._editing_universe_dataset_ids = []
+        if hasattr(self, "universe_table"):
+            selection_model = self.universe_table.selectionModel()
+            if selection_model is not None:
+                blockers = [QtCore.QSignalBlocker(selection_model)]
+                self.universe_table.clearSelection()
+                del blockers
         if hasattr(self, "universe_name_edit"):
+            blockers = [
+                QtCore.QSignalBlocker(self.universe_source_combo),
+                QtCore.QSignalBlocker(self.universe_symbols_edit),
+            ]
             self.universe_name_edit.clear()
             self.universe_source_combo.setCurrentIndex(0)
             self.universe_desc_edit.setPlainText("")
             self.universe_symbols_edit.setPlainText("")
-            self._clear_universe_datasets()
+            del blockers
+            self._refresh_universe_dataset_summary()
             self.universe_editor_status.setText("Create a new universe and save it when ready.")
-            self._refresh_universe_acquisition_summary()
+            self._request_universe_acquisition_summary_refresh(immediate=True)
 
     def _on_universe_table_selection_changed(self) -> None:
         if not hasattr(self, "universe_table"):
@@ -12337,20 +17977,37 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _load_universe_into_editor(self, universe: dict) -> None:
         self._editing_universe_id = str(universe.get("universe_id", ""))
+        blockers = [
+            QtCore.QSignalBlocker(self.universe_source_combo),
+            QtCore.QSignalBlocker(self.universe_symbols_edit),
+        ]
         self.universe_name_edit.setText(str(universe.get("name", "")))
         idx = self.universe_source_combo.findData(str(universe.get("source_preference") or ""))
         self.universe_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.universe_desc_edit.setPlainText(str(universe.get("description", "")))
         self.universe_symbols_edit.setPlainText("\n".join(list(universe.get("symbols") or [])))
+        del blockers
         self._editing_universe_dataset_ids = [
             str(item) for item in list(universe.get("dataset_ids") or []) if str(item).strip()
         ]
         self._refresh_universe_dataset_summary()
-        self._refresh_universe_acquisition_summary()
+        self._request_universe_acquisition_summary_refresh(immediate=True)
         self.universe_editor_status.setText(
             f"Editing universe '{universe.get('name', '')}' with "
             f"{len(list(universe.get('symbols') or []))} symbols and {len(self._editing_universe_dataset_ids)} datasets."
         )
+
+    def _request_universe_acquisition_summary_refresh(self, *_args, immediate: bool = False) -> None:
+        timer = getattr(self, "_universe_acquisition_summary_timer", None)
+        if timer is None:
+            if immediate:
+                self._refresh_universe_acquisition_summary()
+            return
+        if immediate:
+            timer.stop()
+            self._refresh_universe_acquisition_summary()
+            return
+        timer.start()
 
     def _parse_text_tokens(self, text: str, *, uppercase: bool = False) -> list[str]:
         tokens = [part.strip() for part in re.split(r"[\n,]+", str(text or "")) if part.strip()]
@@ -12532,17 +18189,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
             return
         self._editing_universe_dataset_ids = dlg.selected_datasets()
         self._refresh_universe_dataset_summary()
-        self._refresh_universe_acquisition_summary()
+        self._request_universe_acquisition_summary_refresh(immediate=True)
 
     def _clear_universe_datasets(self) -> None:
         self._editing_universe_dataset_ids = []
         self._refresh_universe_dataset_summary()
-        self._refresh_universe_acquisition_summary()
+        self._request_universe_acquisition_summary_refresh(immediate=True)
 
     def _use_current_study_datasets_for_universe(self) -> None:
         self._editing_universe_dataset_ids = list(self._selected_study_dataset_ids(manual_only=True))
         self._refresh_universe_dataset_summary()
-        self._refresh_universe_acquisition_summary()
+        self._request_universe_acquisition_summary_refresh(immediate=True)
 
     def _use_selected_tickers_for_universe(self) -> None:
         symbols = self.selected_tickers if not self.select_all_tickers else self.nasdaq_symbols
@@ -12631,6 +18288,111 @@ class DashboardWindow(QtWidgets.QMainWindow):
             default_source=DEFAULT_ACQUISITION_PROVIDER,
         )
 
+    @staticmethod
+    def _download_source_members(source: str | None) -> tuple[str, ...]:
+        try:
+            return expand_acquisition_source(source)
+        except Exception:
+            return (DEFAULT_ACQUISITION_PROVIDER,)
+
+    def _download_row_key_for(self, ticker: str, source: str | None, *, composite: bool | None = None) -> str:
+        symbol = str(ticker or "").strip().upper()
+        normalized_source = str(source or "").strip().lower()
+        if composite is None:
+            active_source = str(self._active_download_source or self._resolved_download_source() or "")
+            composite = is_composite_acquisition_provider(active_source)
+        if composite and normalized_source:
+            return f"{symbol}::{normalized_source}"
+        return symbol
+
+    def _download_job_payload(self, ticker: str, source: str, *, composite: bool) -> dict:
+        symbol = str(ticker or "").strip().upper()
+        provider = get_acquisition_provider(source)
+        return {
+            "ticker": symbol,
+            "source": provider.provider_id,
+            "row_key": self._download_row_key_for(symbol, provider.provider_id, composite=composite),
+        }
+
+    def _build_download_jobs(self, symbols: Sequence[str], source: str) -> list[dict]:
+        composite = is_composite_acquisition_provider(source)
+        jobs: list[dict] = []
+        seen: set[str] = set()
+        for raw_symbol in list(symbols or []):
+            symbol = str(raw_symbol or "").strip().upper()
+            if not symbol:
+                continue
+            for member_source in self._download_source_members(source):
+                job = self._download_job_payload(symbol, member_source, composite=composite)
+                key = str(job.get("row_key") or "")
+                if key and key not in seen:
+                    seen.add(key)
+                    jobs.append(job)
+        return jobs
+
+    def _download_job_from_item(self, item: object, *, default_source: str | None = None) -> dict | None:
+        active_source = str(default_source or self._active_download_source or self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
+        composite = is_composite_acquisition_provider(active_source)
+        if isinstance(item, dict):
+            ticker = str(item.get("ticker") or "").strip().upper()
+            source = str(item.get("source") or "").strip().lower()
+            row_key = str(item.get("row_key") or "").strip()
+            if not ticker:
+                return None
+            if not source:
+                members = self._download_source_members(active_source)
+                source = members[0] if members else DEFAULT_ACQUISITION_PROVIDER
+            if not row_key:
+                row_key = self._download_row_key_for(ticker, source, composite=composite)
+            return {"ticker": ticker, "source": source, "row_key": row_key}
+        ticker = str(item or "").strip().upper()
+        if not ticker:
+            return None
+        members = self._download_source_members(active_source)
+        source = members[0] if members else DEFAULT_ACQUISITION_PROVIDER
+        return self._download_job_payload(ticker, source, composite=composite)
+
+    @staticmethod
+    def _download_job_from_meta(meta: dict | None) -> dict | None:
+        if not isinstance(meta, dict):
+            return None
+        ticker = str(meta.get("ticker") or "").strip().upper()
+        source = str(meta.get("source") or "").strip().lower()
+        row_key = str(meta.get("row_key") or "").strip()
+        if not ticker:
+            return None
+        if not row_key:
+            row_key = ticker
+        return {"ticker": ticker, "source": source, "row_key": row_key}
+
+    def _download_row_label(self, ticker: str, source: str | None, row_key: str | None = None) -> str:
+        symbol = str(ticker or "").strip().upper()
+        if row_key and str(row_key) != symbol and source:
+            return f"{symbol} | {provider_display_name(source)}"
+        return symbol
+
+    def _download_force_refresh_enabled(self) -> bool:
+        return bool(getattr(self, "force_refresh_chk", None) and self.force_refresh_chk.isChecked())
+
+    def _stale_only_download_enabled(self) -> bool:
+        if hasattr(self, "stale_only_chk"):
+            return bool(self.stale_only_chk.isChecked()) and not self._download_force_refresh_enabled()
+        return not self._download_force_refresh_enabled()
+
+    def _on_force_refresh_toggled(self, checked: bool) -> None:
+        if hasattr(self, "stale_only_chk"):
+            self.stale_only_chk.blockSignals(True)
+            self.stale_only_chk.setChecked(not bool(checked))
+            self.stale_only_chk.blockSignals(False)
+        self._update_ticker_summary()
+
+    def _on_stale_only_toggled(self, checked: bool) -> None:
+        if hasattr(self, "force_refresh_chk"):
+            self.force_refresh_chk.blockSignals(True)
+            self.force_refresh_chk.setChecked(not bool(checked))
+            self.force_refresh_chk.blockSignals(False)
+        self._update_ticker_summary()
+
     def _provider_runtime_environment(self, provider_id: str, meta: dict | None = None) -> dict[str, str]:
         normalized = str(provider_id or "").strip().lower()
         if normalized != "interactive_brokers":
@@ -12709,10 +18471,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self._refresh_asset_information_tab(announce=False)
 
     def _build_heatmap_tab(self) -> QtWidgets.QWidget:
-        return self._build_heatmap_panel()
+        panel = self._build_heatmap_panel()
+        self.heatmap_tab = panel
+        return panel
 
     def _build_optimization_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
+        self.optimization_tab = panel
         panel.setObjectName("Panel")
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -12759,6 +18524,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _build_walk_forward_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
+        self.walk_forward_tab = panel
         panel.setObjectName("Panel")
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -12929,6 +18695,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _build_monte_carlo_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
+        self.monte_carlo_tab = panel
         panel.setObjectName("Panel")
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -13032,6 +18799,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _build_deployment_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
+        self.deployment_tab = panel
         panel.setObjectName("Panel")
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -13060,6 +18828,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         source_layout = QtWidgets.QVBoxLayout(source_panel)
         source_layout.setContentsMargins(8, 8, 8, 8)
         source_layout.setSpacing(8)
+        source_panel.setMinimumWidth(620)
 
         validated_group = QtWidgets.QGroupBox("Validated Candidates")
         validated_layout = QtWidgets.QVBoxLayout(validated_group)
@@ -13071,14 +18840,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         target_row.addWidget(self.deployment_candidate_target_combo, 1)
         target_row.addWidget(QtWidgets.QLabel("Sizing"))
         self.deployment_candidate_sizing_type_combo = QtWidgets.QComboBox()
-        self.deployment_candidate_sizing_type_combo.addItem("Fixed", "fixed")
-        self.deployment_candidate_sizing_type_combo.addItem("Cash", "cash")
-        self.deployment_candidate_sizing_type_combo.addItem("Percent Equity", "percent_equity")
+        self.deployment_candidate_sizing_type_combo.addItem("Percent Equity %", "percent_equity")
+        self.deployment_candidate_sizing_type_combo.addItem("Cash $", "cash")
+        self.deployment_candidate_sizing_type_combo.addItem("Fixed Shares", "shares")
         target_row.addWidget(self.deployment_candidate_sizing_type_combo)
         self.deployment_candidate_sizing_value_spin = QtWidgets.QDoubleSpinBox()
         self.deployment_candidate_sizing_value_spin.setDecimals(4)
         self.deployment_candidate_sizing_value_spin.setRange(0.0, 1_000_000_000.0)
-        self.deployment_candidate_sizing_value_spin.setValue(100.0)
+        self.deployment_candidate_sizing_value_spin.setValue(5.0)
         self.deployment_candidate_sizing_value_spin.setSingleStep(1.0)
         target_row.addWidget(self.deployment_candidate_sizing_value_spin)
         validated_layout.addLayout(target_row)
@@ -13104,12 +18873,16 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.deployment_candidate_table.setAlternatingRowColors(True)
         self.deployment_candidate_table.horizontalHeader().setStretchLastSection(True)
         self.deployment_candidate_table.verticalHeader().setVisible(False)
+        self.deployment_candidate_table.setMinimumHeight(230)
+        self.deployment_candidate_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.deployment_candidate_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.deployment_candidate_table.setObjectName("Panel")
         self.deployment_candidate_table.itemSelectionChanged.connect(self._refresh_deployment_candidate_details)
         validated_layout.addWidget(self.deployment_candidate_table, 1)
         self.deployment_candidate_details = QtWidgets.QPlainTextEdit()
         self.deployment_candidate_details.setReadOnly(True)
-        self.deployment_candidate_details.setMaximumHeight(160)
+        self.deployment_candidate_details.setMinimumHeight(160)
+        self.deployment_candidate_details.setMaximumHeight(420)
         self.deployment_candidate_details.setObjectName("Panel")
         validated_layout.addWidget(self.deployment_candidate_details)
         source_layout.addWidget(validated_group, 1)
@@ -13146,14 +18919,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.manual_deployment_target_combo = QtWidgets.QComboBox()
         form.addRow("Target", self.manual_deployment_target_combo)
         self.manual_deployment_sizing_type_combo = QtWidgets.QComboBox()
-        self.manual_deployment_sizing_type_combo.addItem("Fixed", "fixed")
-        self.manual_deployment_sizing_type_combo.addItem("Cash", "cash")
-        self.manual_deployment_sizing_type_combo.addItem("Percent Equity", "percent_equity")
+        self.manual_deployment_sizing_type_combo.addItem("Percent Equity %", "percent_equity")
+        self.manual_deployment_sizing_type_combo.addItem("Cash $", "cash")
+        self.manual_deployment_sizing_type_combo.addItem("Fixed Shares", "shares")
         form.addRow("Sizing Type", self.manual_deployment_sizing_type_combo)
         self.manual_deployment_sizing_value_spin = QtWidgets.QDoubleSpinBox()
         self.manual_deployment_sizing_value_spin.setDecimals(4)
         self.manual_deployment_sizing_value_spin.setRange(0.0, 1_000_000_000.0)
-        self.manual_deployment_sizing_value_spin.setValue(100.0)
+        self.manual_deployment_sizing_value_spin.setValue(5.0)
         self.manual_deployment_sizing_value_spin.setSingleStep(1.0)
         form.addRow("Sizing Value", self.manual_deployment_sizing_value_spin)
         manual_layout.addLayout(form)
@@ -13184,7 +18957,13 @@ class DashboardWindow(QtWidgets.QMainWindow):
         manual_actions.addStretch(1)
         manual_layout.addLayout(manual_actions)
         source_layout.addWidget(manual_group, 1)
-        split.addWidget(source_panel)
+        source_scroll = QtWidgets.QScrollArea()
+        source_scroll.setWidgetResizable(True)
+        source_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        source_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        source_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        source_scroll.setWidget(source_panel)
+        split.addWidget(source_scroll)
 
         deployment_panel = QtWidgets.QWidget()
         deployment_panel.setObjectName("Panel")
@@ -13217,6 +18996,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.deployment_open_dashboard_btn = QtWidgets.QPushButton("Open External Dashboard")
         self.deployment_open_dashboard_btn.clicked.connect(self._open_selected_deployment_dashboard)
         deployment_actions.addWidget(self.deployment_open_dashboard_btn)
+        self.deployment_delete_btn = QtWidgets.QPushButton("Delete")
+        self.deployment_delete_btn.clicked.connect(self._delete_selected_deployment)
+        deployment_actions.addWidget(self.deployment_delete_btn)
         deployment_actions.addStretch(1)
         self.deployment_table = QtWidgets.QTableWidget(0, 7)
         self.deployment_table.setHorizontalHeaderLabels(
@@ -13246,6 +19028,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _build_live_monitor_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
+        self.live_monitor_tab = panel
         panel.setObjectName("Panel")
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -13265,6 +19048,21 @@ class DashboardWindow(QtWidgets.QMainWindow):
         layout.addWidget(subtitle)
         layout.addWidget(self.live_monitor_summary_label)
 
+        engine_row = QtWidgets.QHBoxLayout()
+        engine_row.addWidget(QtWidgets.QLabel("External Engine URL"))
+        self.live_monitor_engine_url_edit = QtWidgets.QLineEdit()
+        self.live_monitor_engine_url_edit.setPlaceholderText("http://192.168.1.20")
+        engine_row.addWidget(self.live_monitor_engine_url_edit, 1)
+        engine_row.addWidget(QtWidgets.QLabel("Webhook Secret"))
+        self.live_monitor_engine_secret_edit = QtWidgets.QLineEdit()
+        self.live_monitor_engine_secret_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.live_monitor_engine_secret_edit.setPlaceholderText("Required for Arm")
+        engine_row.addWidget(self.live_monitor_engine_secret_edit, 1)
+        self.live_monitor_save_engine_url_btn = QtWidgets.QPushButton("Save Target Settings")
+        self.live_monitor_save_engine_url_btn.clicked.connect(self._save_live_monitor_engine_url)
+        engine_row.addWidget(self.live_monitor_save_engine_url_btn)
+        layout.addLayout(engine_row)
+
         actions = QtWidgets.QHBoxLayout()
         self.live_monitor_arm_btn = QtWidgets.QPushButton("Arm")
         self.live_monitor_arm_btn.clicked.connect(lambda: self._set_selected_live_monitor_status("armed"))
@@ -13281,6 +19079,18 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.live_monitor_open_dashboard_btn = QtWidgets.QPushButton("Open External Dashboard")
         self.live_monitor_open_dashboard_btn.clicked.connect(self._open_selected_live_monitor_dashboard)
         actions.addWidget(self.live_monitor_open_dashboard_btn)
+        actions.addWidget(QtWidgets.QLabel("Chart Lookback"))
+        self.live_monitor_chart_lookback_combo = QtWidgets.QComboBox()
+        for label, value in (("5D", "5d"), ("1M", "1mo"), ("3M", "3mo"), ("1Y", "1y"), ("All", "all")):
+            self.live_monitor_chart_lookback_combo.addItem(label, value)
+        self.live_monitor_chart_lookback_combo.setCurrentIndex(2)
+        actions.addWidget(self.live_monitor_chart_lookback_combo)
+        self.live_monitor_open_charts_btn = QtWidgets.QPushButton("Open Magellan Charts")
+        self.live_monitor_open_charts_btn.clicked.connect(self._open_live_monitor_charts)
+        actions.addWidget(self.live_monitor_open_charts_btn)
+        self.live_monitor_close_charts_btn = QtWidgets.QPushButton("Close Charts")
+        self.live_monitor_close_charts_btn.clicked.connect(self._close_live_monitor_charts)
+        actions.addWidget(self.live_monitor_close_charts_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
 
@@ -13288,7 +19098,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         split.setChildrenCollapsible(False)
         layout.addWidget(split, 1)
 
-        self.live_monitor_table = QtWidgets.QTableWidget(0, 12)
+        self.live_monitor_table = QtWidgets.QTableWidget(0, 14)
         self.live_monitor_table.setHorizontalHeaderLabels(
             [
                 "Deployment ID",
@@ -13297,6 +19107,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 "Scope",
                 "Target",
                 "Status",
+                "Equity",
+                "Buying Power",
                 "Realized PnL",
                 "Open PnL",
                 "Trades",
@@ -13314,11 +19126,30 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.live_monitor_table.itemSelectionChanged.connect(self._refresh_live_monitor_details)
         split.addWidget(self.live_monitor_table)
 
+        bottom_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        bottom_split.setChildrenCollapsible(False)
         self.live_monitor_details = QtWidgets.QPlainTextEdit()
         self.live_monitor_details.setReadOnly(True)
         self.live_monitor_details.setObjectName("Panel")
-        split.addWidget(self.live_monitor_details)
-        split.setSizes([420, 240])
+        bottom_split.addWidget(self.live_monitor_details)
+
+        equity_panel = QtWidgets.QWidget()
+        equity_panel.setObjectName("Panel")
+        equity_layout = QtWidgets.QVBoxLayout(equity_panel)
+        equity_layout.setContentsMargins(8, 8, 8, 8)
+        equity_layout.setSpacing(6)
+        equity_title = QtWidgets.QLabel("Equity Curve")
+        equity_title.setObjectName("Title")
+        equity_layout.addWidget(equity_title)
+        self.live_monitor_equity_figure = Figure(figsize=(5.5, 2.4), facecolor=PALETTE["panel2"])
+        self.live_monitor_equity_canvas = FigureCanvasQTAgg(self.live_monitor_equity_figure)
+        self.live_monitor_equity_canvas.setMinimumHeight(180)
+        equity_layout.addWidget(self.live_monitor_equity_canvas, 1)
+        bottom_split.addWidget(equity_panel)
+        bottom_split.setStretchFactor(0, 5)
+        bottom_split.setStretchFactor(1, 6)
+        split.addWidget(bottom_split)
+        split.setSizes([420, 260])
         return panel
 
     def _build_heatmap_panel(self) -> QtWidgets.QWidget:
@@ -13436,9 +19267,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.download_source_note.setWordWrap(True)
         left_layout.addWidget(self.download_source_note)
 
+        self.stale_only_chk = QtWidgets.QCheckBox("Auto-skip fresh datasets (queue stale/missing/gappy only)")
+        self.stale_only_chk.setChecked(True)
+        self.stale_only_chk.toggled.connect(self._on_stale_only_toggled)
+        left_layout.addWidget(self.stale_only_chk)
+
         self.force_refresh_chk = QtWidgets.QCheckBox("Force refresh even if local data looks fresh")
         self.force_refresh_chk.setChecked(False)
-        self.force_refresh_chk.toggled.connect(self._update_ticker_summary)
+        self.force_refresh_chk.toggled.connect(self._on_force_refresh_toggled)
         left_layout.addWidget(self.force_refresh_chk)
 
         ticker_label = QtWidgets.QLabel("Tickers (NASDAQ + Other Listed)")
@@ -13574,6 +19410,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         controls_row = QtWidgets.QHBoxLayout()
         self.download_start_btn = QtWidgets.QPushButton("Start Download")
         self.download_start_btn.clicked.connect(self._start_download)
+        self.download_stale_btn = QtWidgets.QPushButton("Queue Stale Now")
+        self.download_stale_btn.clicked.connect(self._queue_stale_downloads_now)
         self.download_pause_btn = QtWidgets.QPushButton("Pause")
         self.download_pause_btn.clicked.connect(self._pause_download)
         self.download_resume_btn = QtWidgets.QPushButton("Resume")
@@ -13581,6 +19419,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.download_stop_btn = QtWidgets.QPushButton("Stop")
         self.download_stop_btn.clicked.connect(self._stop_download)
         controls_row.addWidget(self.download_start_btn)
+        controls_row.addWidget(self.download_stale_btn)
         controls_row.addWidget(self.download_pause_btn)
         controls_row.addWidget(self.download_resume_btn)
         controls_row.addWidget(self.download_stop_btn)
@@ -13618,7 +19457,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.concurrency_spin.setRange(1, 50)
         self.concurrency_spin.setValue(1)
         self.concurrency_spin.setToolTip(
-            "Controls how many ticker downloads run at the same time across all providers."
+            "Controls concurrent Interactive Brokers/provider jobs. Massive is always limited to one ticker at a time."
         )
         concurrency_row.addWidget(QtWidgets.QLabel("Concurrent Downloads"))
         concurrency_row.addWidget(self.concurrency_spin)
@@ -13804,7 +19643,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
             if NASDAQ_SYMBOLS_PATH.exists():
                 backup_dir = NASDAQ_SYMBOLS_PATH.parent / "nasdaq_symbols_backups"
                 backup_dir.mkdir(parents=True, exist_ok=True)
-                backup_id = f"{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                backup_id = f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
                 backup_path = backup_dir / f"all_symbols_{backup_id}.txt"
                 backup_path.write_text(NASDAQ_SYMBOLS_PATH.read_text(encoding="utf-8"), encoding="utf-8")
             with urllib.request.urlopen(NASDAQ_LISTED_URL, timeout=20) as resp:
@@ -13813,7 +19652,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 other_raw = resp.read().decode("utf-8", errors="ignore")
             raw_dir = NASDAQ_SYMBOLS_PATH.parent / "nasdaq_symbols_raw"
             raw_dir.mkdir(parents=True, exist_ok=True)
-            raw_id = f"{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            raw_id = f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
             (raw_dir / f"nasdaqlisted_{raw_id}.txt").write_text(nasdaq_raw, encoding="utf-8")
             (raw_dir / f"otherlisted_{raw_id}.txt").write_text(other_raw, encoding="utf-8")
             symbols = sorted(set(self._parse_symbols(nasdaq_raw) + self._parse_symbols(other_raw)))
@@ -13833,13 +19672,38 @@ class DashboardWindow(QtWidgets.QMainWindow):
     def _update_ticker_summary(self) -> None:
         resolved_source = self._resolved_download_source()
         source_label = provider_display_name(resolved_source)
-        provider = get_acquisition_provider(resolved_source)
-        settings_status = self._provider_settings_status_text(resolved_source)
-        refresh_note = " Force refresh is enabled." if getattr(self, "force_refresh_chk", None) and self.force_refresh_chk.isChecked() else ""
-        source_details = (
-            f"{source_label} | defaults {provider.default_resolution}, {provider.default_history_window} | "
-            f"{provider.description or 'No provider description.'} Settings: {settings_status}.{refresh_note}"
-        )
+        if self._download_force_refresh_enabled():
+            refresh_note = " Force refresh is enabled."
+        elif self._stale_only_download_enabled():
+            refresh_note = " Fresh datasets are skipped; stale, missing, or gappy datasets are queued for update."
+        else:
+            refresh_note = ""
+        if is_composite_acquisition_provider(resolved_source):
+            member_bits = []
+            for member_source in self._download_source_members(resolved_source):
+                provider = get_acquisition_provider(member_source)
+                settings_status = self._provider_settings_status_text(member_source)
+                limit_note = (
+                    "selected concurrency"
+                    if member_source == "interactive_brokers"
+                    else "single-symbol"
+                    if member_source == "massive"
+                    else "provider limit"
+                )
+                member_bits.append(
+                    f"{provider.label}: {provider.default_resolution}, {provider.default_history_window}, {limit_note}, {settings_status}"
+                )
+            source_details = (
+                f"{source_label} | runs provider-specific datasets side by side | "
+                f"{'; '.join(member_bits)}.{refresh_note}"
+            )
+        else:
+            provider = get_acquisition_provider(resolved_source)
+            settings_status = self._provider_settings_status_text(resolved_source)
+            source_details = (
+                f"{source_label} | defaults {provider.default_resolution}, {provider.default_history_window} | "
+                f"{provider.description or 'No provider description.'} Settings: {settings_status}.{refresh_note}"
+            )
         universe = self._selected_download_universe()
         if universe is not None:
             symbols = [str(sym) for sym in list(universe.get("symbols") or []) if str(sym).strip()]
@@ -13949,24 +19813,58 @@ class DashboardWindow(QtWidgets.QMainWindow):
         )
 
     def _known_download_tickers(self) -> set[str]:
-        known = {str(item).strip().upper() for item in list(self.download_queue) if str(item).strip()}
-        known.update(str(item).strip().upper() for item in list(self.download_progress_rows.keys()) if str(item).strip())
+        known: set[str] = set()
+        for item in list(self.download_queue):
+            job = self._download_job_from_item(item)
+            if job:
+                known.add(str(job.get("ticker") or "").strip().upper())
+        for row_info in list(self.download_progress_rows.values()):
+            ticker = str(row_info.get("ticker") or "").strip().upper()
+            if ticker:
+                known.add(ticker)
         for meta in list(self.download_proc_meta.values()):
             ticker = str(meta.get("ticker") or "").strip().upper()
             if ticker:
                 known.add(ticker)
-        for ticker in list(self.download_policy_metas.keys()):
-            symbol = str(ticker or "").strip().upper()
+        for meta in list(self.download_policy_metas.values()):
+            symbol = str(meta.get("ticker") or "").strip().upper()
             if symbol:
                 known.add(symbol)
-        for ticker in list(self.download_finalize_metas.keys()):
-            symbol = str(ticker or "").strip().upper()
+        for meta in list(self.download_finalize_metas.values()):
+            symbol = str(meta.get("ticker") or "").strip().upper()
             if symbol:
                 known.add(symbol)
         for meta in list(self._paused_download_launch_metas):
             ticker = str(meta.get("ticker") or "").strip().upper()
             if ticker:
                 known.add(ticker)
+        return known
+
+    def _known_download_row_keys(self) -> set[str]:
+        known: set[str] = set()
+        for item in list(self.download_queue):
+            job = self._download_job_from_item(item)
+            if job:
+                key = str(job.get("row_key") or "").strip()
+                if key:
+                    known.add(key)
+        known.update(str(item).strip() for item in list(self.download_progress_rows.keys()) if str(item).strip())
+        for meta in list(self.download_proc_meta.values()):
+            key = str(meta.get("row_key") or "").strip()
+            if key:
+                known.add(key)
+        for key in list(self.download_policy_metas.keys()):
+            text = str(key or "").strip()
+            if text:
+                known.add(text)
+        for meta in list(self.download_finalize_metas.values()):
+            key = str(meta.get("row_key") or "").strip()
+            if key:
+                known.add(key)
+        for meta in list(self._paused_download_launch_metas):
+            key = str(meta.get("row_key") or "").strip()
+            if key:
+                known.add(key)
         return known
 
     def _retry_download_symbols(self, symbols: Sequence[str], *, source: str = "") -> tuple[int, str]:
@@ -13995,7 +19893,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._update_ticker_summary()
         self._open_automate_tab()
         if self._has_active_download_session():
-            if normalized_source and active_source and normalized_source != active_source:
+            active_members = set(self._download_source_members(active_source))
+            if normalized_source and active_source and normalized_source != active_source and normalized_source not in active_members:
                 return (
                     len(normalized),
                     (
@@ -14004,20 +19903,28 @@ class DashboardWindow(QtWidgets.QMainWindow):
                         f"{provider_display_name(normalized_source)}. Finish or stop the current session, then start the retry batch."
                     ),
                 )
-            existing = self._known_download_tickers()
+            existing = self._known_download_row_keys()
             added = 0
             for ticker in normalized:
-                if ticker in existing:
-                    continue
-                self.download_queue.append(ticker)
-                existing.add(ticker)
-                self._ensure_progress_row(ticker)
-                self._update_progress_row(
-                    ticker,
-                    status="paused" if self.download_paused else "queued",
-                    tooltip="Queued from failed-attempt retry.",
-                )
-                added += 1
+                retry_source = normalized_source or active_source or self._resolved_download_source()
+                retry_jobs = self._build_download_jobs([ticker], retry_source)
+                for job in retry_jobs:
+                    key = str(job.get("row_key") or "").strip()
+                    if not key or key in existing:
+                        continue
+                    self.download_queue.append(dict(job))
+                    existing.add(key)
+                    self._ensure_progress_row(
+                        str(job.get("ticker") or ""),
+                        source=str(job.get("source") or ""),
+                        row_key=key,
+                    )
+                    self._update_progress_row(
+                        key,
+                        status="paused" if self.download_paused else "queued",
+                        tooltip="Queued from failed-attempt retry.",
+                    )
+                    added += 1
             self._persist_download_session_state()
             if not self.download_paused:
                 self._maybe_start_downloads()
@@ -14056,7 +19963,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
             "source": source,
             "resolution": provider.default_resolution,
             "history": provider.default_history_window,
-            "force_refresh": bool(self.force_refresh_chk.isChecked()),
+            "concurrency": max(1, int(self.concurrency_spin.value())) if hasattr(self, "concurrency_spin") else 1,
+            "force_refresh": self._download_force_refresh_enabled(),
+            "only_stale": self._stale_only_download_enabled(),
             "schedule": schedule,
         }
         rc = ResultCatalog(self.catalog.db_path)
@@ -14072,7 +19981,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
             self,
             "Scheduled",
             f"Scheduled {scope_label} ({frequency}) using {provider_display_name(source)}."
-            f"{' Force refresh is enabled.' if self.force_refresh_chk.isChecked() else ''}",
+            f"{' Force refresh is enabled.' if self._download_force_refresh_enabled() else ''}"
+            f"{' Fresh datasets will be skipped.' if self._stale_only_download_enabled() else ''}",
         )
 
     def _load_tasks(self) -> None:
@@ -14084,7 +19994,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
     def _refresh_tasks_table(self) -> None:
         self.tasks_table.setRowCount(0)
-        now = pd.Timestamp.utcnow()
+        now = pd.Timestamp.now(tz='UTC')
         for idx, task in enumerate(self.scheduled_tasks):
             row = self.tasks_table.rowCount()
             self.tasks_table.insertRow(row)
@@ -14167,7 +20077,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         status = str(task.get("status") or "active")
         rc = ResultCatalog(self.catalog.db_path)
         rc.upsert_task(task_id, payload, schedule, status=status)
-        next_run = self._compute_next_run(schedule, pd.Timestamp.utcnow())
+        next_run = self._compute_next_run(schedule, pd.Timestamp.now(tz='UTC'))
         rc.update_task_run_info(
             task_id,
             task.get("last_run_at"),
@@ -14461,9 +20371,27 @@ WantedBy=default.target
     def _append_download_log(self, log_path: Path | None, text: str) -> None:
         if log_path is None or not text:
             return
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(text)
+        path_text = str(log_path)
+        self._pending_download_log_chunks.setdefault(path_text, []).append(str(text))
+        if sum(len(chunk) for chunk in self._pending_download_log_chunks[path_text]) >= 65536:
+            self._flush_pending_download_logs()
+            return
+        if not self._download_log_flush_timer.isActive():
+            self._download_log_flush_timer.start(250)
+
+    def _flush_pending_download_logs(self) -> None:
+        pending = dict(self._pending_download_log_chunks)
+        self._pending_download_log_chunks.clear()
+        for path_text, chunks in pending.items():
+            if not chunks:
+                continue
+            path = Path(path_text)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write("".join(chunks))
+            except Exception:
+                continue
 
     def _write_download_artifact_state(self, meta: dict, status: str, **extra: object) -> None:
         out_path = str(meta.get("out_path") or "").strip()
@@ -14476,6 +20404,7 @@ WantedBy=default.target
             "status": str(status or "").strip().lower(),
             "updated_at": pd.Timestamp.now("UTC").isoformat(),
             "ticker": str(meta.get("ticker") or "").strip().upper(),
+            "row_key": str(meta.get("row_key") or "").strip(),
             "source": str(meta.get("source") or "").strip().lower(),
             "history_window": str(meta.get("history_window") or "").strip().lower(),
             "resolution": str(meta.get("resolution") or "").strip().lower(),
@@ -14515,7 +20444,9 @@ WantedBy=default.target
         rows_item = self.progress_table.item(row, 3)
         bar: QtWidgets.QProgressBar = row_info["bar"]
         return {
-            "ticker": str(ticker),
+            "ticker": str(row_info.get("ticker") or ticker),
+            "source": str(row_info.get("source") or ""),
+            "row_key": str(row_info.get("row_key") or ticker),
             "row": row,
             "status": str(status_item.text() if status_item is not None else ""),
             "pages_text": str(pages_item.text() if pages_item is not None else ""),
@@ -14542,8 +20473,35 @@ WantedBy=default.target
                 recoverable.append(str(ticker).strip().upper())
         return recoverable
 
-    def _retain_download_rows(self, tickers: Sequence[str]) -> None:
-        normalized = [str(item).strip().upper() for item in list(tickers or []) if str(item).strip()]
+    def _recoverable_download_jobs(self) -> list[dict]:
+        recoverable: list[dict] = []
+        seen: set[str] = set()
+        for row_key, row_info in sorted(self.download_progress_rows.items(), key=lambda item: int(item[1].get("row") or 0)):
+            row = int(row_info.get("row") or 0)
+            status_item = self.progress_table.item(row, 1)
+            status = str(status_item.text() if status_item is not None else "").strip().lower()
+            if status not in _DOWNLOAD_RECOVERABLE_STATUSES:
+                continue
+            job = {
+                "ticker": str(row_info.get("ticker") or row_key).strip().upper(),
+                "source": str(row_info.get("source") or "").strip().lower(),
+                "row_key": str(row_info.get("row_key") or row_key).strip(),
+            }
+            key = str(job.get("row_key") or "").strip()
+            if key and key not in seen:
+                seen.add(key)
+                recoverable.append(job)
+        return recoverable
+
+    def _retain_download_rows(self, tickers: Sequence[object]) -> None:
+        normalized: list[str] = []
+        for item in list(tickers or []):
+            if isinstance(item, dict):
+                key = str(item.get("row_key") or item.get("ticker") or "").strip()
+            else:
+                key = str(item or "").strip()
+            if key and key not in normalized:
+                normalized.append(key)
         if not normalized:
             self.progress_table.setRowCount(0)
             self.download_progress_rows = {}
@@ -14566,7 +20524,7 @@ WantedBy=default.target
             or self.download_proc_meta
             or self.download_finalize_metas
             or self._paused_download_launch_metas
-            or self._recoverable_download_tickers()
+            or self._recoverable_download_jobs()
         )
 
     def _build_download_session_payload(self) -> dict | None:
@@ -14580,39 +20538,52 @@ WantedBy=default.target
             or self.download_finalize_metas
             or self._paused_download_launch_metas
         )
-        recoverable_tickers = self._recoverable_download_tickers()
-        retained_tickers = set(recoverable_tickers) if (recoverable_tickers and not has_active_work) else None
+        recoverable_jobs = self._recoverable_download_jobs()
+        retained_keys = {
+            str(job.get("row_key") or "").strip()
+            for job in recoverable_jobs
+            if str(job.get("row_key") or "").strip()
+        } if (recoverable_jobs and not has_active_work) else None
         row_payloads = []
         for ticker, row_info in sorted(self.download_progress_rows.items(), key=lambda item: int(item[1].get("row") or 0)):
-            if retained_tickers is not None and str(ticker).strip().upper() not in retained_tickers:
+            row_key = str(row_info.get("row_key") or ticker).strip()
+            if retained_keys is not None and row_key not in retained_keys:
                 continue
             snapshot = self._download_row_snapshot(ticker)
             if snapshot is not None:
                 row_payloads.append(snapshot)
-        resume_tickers: list[str] = []
+        resume_jobs: list[dict] = []
+
+        def add_resume_job(job: dict | None) -> None:
+            if not job:
+                return
+            key = str(job.get("row_key") or "").strip()
+            if not key or any(str(item.get("row_key") or "").strip() == key for item in resume_jobs):
+                return
+            resume_jobs.append(dict(job))
+
         for meta in list(self.download_proc_meta.values()):
-            ticker = str(meta.get("ticker") or "").strip().upper()
-            if ticker and ticker not in resume_tickers:
-                resume_tickers.append(ticker)
-        for ticker in list(self.download_policy_metas.keys()):
-            symbol = str(ticker or "").strip().upper()
-            if symbol and symbol not in resume_tickers:
-                resume_tickers.append(symbol)
+            add_resume_job(self._download_job_from_meta(meta))
+        for meta in list(self.download_policy_metas.values()):
+            add_resume_job(self._download_job_from_meta(meta))
         for ticker in list(self.download_finalize_metas.keys()):
-            symbol = str(ticker or "").strip().upper()
-            if symbol and symbol not in resume_tickers:
-                resume_tickers.append(symbol)
+            add_resume_job(self._download_job_from_meta(self.download_finalize_metas.get(ticker)))
         for meta in list(self._paused_download_launch_metas):
-            ticker = str(meta.get("ticker") or "").strip().upper()
-            if ticker and ticker not in resume_tickers:
-                resume_tickers.append(ticker)
-        if not resume_tickers and recoverable_tickers:
-            resume_tickers.extend(recoverable_tickers)
-        queued_tickers: list[str] = []
-        for ticker in list(self.download_queue):
-            symbol = str(ticker or "").strip().upper()
-            if symbol and symbol not in queued_tickers and symbol not in resume_tickers:
-                queued_tickers.append(symbol)
+            add_resume_job(self._download_job_from_meta(meta))
+        if not resume_jobs and recoverable_jobs:
+            for job in recoverable_jobs:
+                add_resume_job(job)
+        queued_jobs: list[dict] = []
+        resume_keys = {str(job.get("row_key") or "").strip() for job in resume_jobs}
+        for item in list(self.download_queue):
+            job = self._download_job_from_item(item)
+            if not job:
+                continue
+            key = str(job.get("row_key") or "").strip()
+            if key and key not in resume_keys and all(str(existing.get("row_key") or "").strip() != key for existing in queued_jobs):
+                queued_jobs.append(job)
+        resume_tickers = [str(job.get("ticker") or "").strip().upper() for job in resume_jobs if str(job.get("ticker") or "").strip()]
+        queued_tickers = [str(job.get("ticker") or "").strip().upper() for job in queued_jobs if str(job.get("ticker") or "").strip()]
         return {
             "version": 1,
             "saved_at": pd.Timestamp.now("UTC").isoformat(),
@@ -14624,10 +20595,13 @@ WantedBy=default.target
             "selected_tickers": [str(item).strip().upper() for item in list(self.selected_tickers or []) if str(item).strip()],
             "select_all_tickers": bool(self.select_all_tickers),
             "resume_enabled": bool(getattr(self, "resume_chk", None).isChecked()) if hasattr(self, "resume_chk") else True,
-            "force_refresh": bool(getattr(self, "force_refresh_chk", None).isChecked()) if hasattr(self, "force_refresh_chk") else False,
-            "download_paused": bool(self.download_paused or (recoverable_tickers and not has_active_work)),
+            "force_refresh": self._download_force_refresh_enabled(),
+            "only_stale": self._stale_only_download_enabled(),
+            "download_paused": bool(self.download_paused or (recoverable_jobs and not has_active_work)),
             "download_active_ticker": str(self.download_active_ticker or ""),
             "download_status_text": str(self.download_status.text() or "") if hasattr(self, "download_status") else "",
+            "resume_jobs": resume_jobs,
+            "queued_jobs": queued_jobs,
             "resume_tickers": resume_tickers,
             "queued_tickers": queued_tickers,
             "rows": row_payloads,
@@ -14641,23 +20615,30 @@ WantedBy=default.target
                 return
             except Exception:
                 return
+            self._last_download_session_payload_text = ""
             return
         payload = self._build_download_session_payload()
         if payload is None:
             self._persist_download_session_state(clear=True)
             return
+        serialized = json.dumps(payload, indent=2, sort_keys=True)
+        if serialized == self._last_download_session_payload_text and ACTIVE_DOWNLOAD_SESSION_PATH.exists():
+            return
         ACTIVE_DOWNLOAD_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ACTIVE_DOWNLOAD_SESSION_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        ACTIVE_DOWNLOAD_SESSION_PATH.write_text(serialized, encoding="utf-8")
+        self._last_download_session_payload_text = serialized
 
     def _load_download_session_state(self) -> dict | None:
         if not ACTIVE_DOWNLOAD_SESSION_PATH.exists():
             return None
         try:
-            payload = json.loads(ACTIVE_DOWNLOAD_SESSION_PATH.read_text(encoding="utf-8"))
+            raw = ACTIVE_DOWNLOAD_SESSION_PATH.read_text(encoding="utf-8")
+            payload = json.loads(raw)
         except Exception:
             return None
         if not isinstance(payload, dict):
             return None
+        self._last_download_session_payload_text = raw
         return dict(payload)
 
     @staticmethod
@@ -14729,14 +20710,24 @@ WantedBy=default.target
         if not states:
             return None
         sources = [str(item.get("source") or "").strip().lower() for item in states if str(item.get("source") or "").strip()]
-        source_effective = sources[0] if sources else str(self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
+        unique_sources = set(sources)
+        combined_members = set(self._download_source_members(COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER))
+        if len(unique_sources) > 1 and unique_sources.issubset(combined_members):
+            source_effective = COMBINED_MASSIVE_INTERACTIVE_BROKERS_PROVIDER
+        else:
+            source_effective = sources[0] if sources else str(self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
         rows: list[dict] = []
-        resume_tickers: list[str] = []
+        resume_jobs: list[dict] = []
         for row_idx, payload in enumerate(states):
             ticker = str(payload.get("ticker") or "").strip().upper()
             if not ticker:
                 continue
             source = str(payload.get("source") or "").strip().lower()
+            row_key = self._download_row_key_for(
+                ticker,
+                source,
+                composite=is_composite_acquisition_provider(source_effective),
+            )
             status = str(payload.get("status") or "").strip().lower()
             log_path = str(payload.get("log_path") or "").strip()
             last_error = str(payload.get("last_error") or "").strip()
@@ -14756,6 +20747,8 @@ WantedBy=default.target
             rows.append(
                 {
                     "ticker": ticker,
+                    "source": source,
+                    "row_key": row_key,
                     "row": row_idx,
                     "status": display_status,
                     "pages_text": "0",
@@ -14772,9 +20765,10 @@ WantedBy=default.target
                     "progress_format": "",
                 }
             )
-            resume_tickers.append(ticker)
-        if not resume_tickers:
+            resume_jobs.append({"ticker": ticker, "source": source, "row_key": row_key})
+        if not resume_jobs:
             return None
+        resume_tickers = [str(job.get("ticker") or "") for job in resume_jobs]
         return {
             "version": 1,
             "saved_at": pd.Timestamp.now("UTC").isoformat(),
@@ -14786,10 +20780,13 @@ WantedBy=default.target
             "selected_tickers": list(resume_tickers),
             "select_all_tickers": False,
             "resume_enabled": bool(getattr(self, "resume_chk", None).isChecked()) if hasattr(self, "resume_chk") else True,
-            "force_refresh": bool(getattr(self, "force_refresh_chk", None).isChecked()) if hasattr(self, "force_refresh_chk") else False,
+            "force_refresh": self._download_force_refresh_enabled(),
+            "only_stale": self._stale_only_download_enabled(),
             "download_paused": True,
             "download_active_ticker": "",
             "download_status_text": "Recoverable download checkpoints were found. Click Resume to continue from the saved state.",
+            "resume_jobs": resume_jobs,
+            "queued_jobs": [],
             "resume_tickers": list(resume_tickers),
             "queued_tickers": [],
             "rows": rows,
@@ -14799,9 +20796,11 @@ WantedBy=default.target
         ticker = str(snapshot.get("ticker") or "").strip().upper()
         if not ticker:
             return
+        source = str(snapshot.get("source") or "").strip().lower()
+        row_key = str(snapshot.get("row_key") or "").strip() or self._download_row_key_for(ticker, source)
         log_path = str(snapshot.get("log_path") or "").strip()
-        self._ensure_progress_row(ticker, Path(log_path) if log_path else None)
-        row_info = self.download_progress_rows[ticker]
+        self._ensure_progress_row(ticker, Path(log_path) if log_path else None, source=source, row_key=row_key)
+        row_info = self.download_progress_rows[row_key]
         row = int(row_info.get("row") or 0)
         row_info["progress_mode"] = str(snapshot.get("progress_mode") or "indeterminate")
         row_info["progress_total_steps"] = int(snapshot.get("progress_total_steps") or 0)
@@ -14830,7 +20829,7 @@ WantedBy=default.target
             bar.setValue(int(snapshot.get("progress_value") or 0))
         bar.setFormat(str(snapshot.get("progress_format") or ""))
 
-    def _restore_download_session_if_available(self) -> bool:
+    def _restore_download_session_if_available(self, *, auto_resume: bool = False) -> bool:
         if self.download_procs or self.download_policy_workers or self.download_finalize_workers or self.download_queue:
             return False
         state = self._load_download_session_state()
@@ -14838,29 +20837,61 @@ WantedBy=default.target
             state = self._build_download_session_payload_from_artifact_states()
         if not state:
             return False
-        resume_tickers = [str(item).strip().upper() for item in list(state.get("resume_tickers") or []) if str(item).strip()]
-        queued_tickers = [str(item).strip().upper() for item in list(state.get("queued_tickers") or []) if str(item).strip()]
-        combined_queue: list[str] = []
-        for ticker in resume_tickers + queued_tickers:
-            if ticker and ticker not in combined_queue:
-                combined_queue.append(ticker)
+        source_choice = str(state.get("download_source_choice") or "").strip().lower()
+        source_effective = str(state.get("download_source_effective") or "").strip().lower()
+        default_source = source_effective or source_choice or str(self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
+        resume_jobs = [
+            job
+            for job in (self._download_job_from_item(item, default_source=default_source) for item in list(state.get("resume_jobs") or []))
+            if job
+        ]
+        queued_jobs = [
+            job
+            for job in (self._download_job_from_item(item, default_source=default_source) for item in list(state.get("queued_jobs") or []))
+            if job
+        ]
+        if not resume_jobs and not queued_jobs:
+            resume_tickers = [str(item).strip().upper() for item in list(state.get("resume_tickers") or []) if str(item).strip()]
+            queued_tickers = [str(item).strip().upper() for item in list(state.get("queued_tickers") or []) if str(item).strip()]
+            resume_jobs = [
+                job
+                for job in (self._download_job_from_item(item, default_source=default_source) for item in resume_tickers)
+                if job
+            ]
+            queued_jobs = [
+                job
+                for job in (self._download_job_from_item(item, default_source=default_source) for item in queued_tickers)
+                if job
+            ]
+        combined_queue: list[dict] = []
+        seen_queue_keys: set[str] = set()
+        for job in resume_jobs + queued_jobs:
+            key = str(job.get("row_key") or "").strip()
+            if key and key not in seen_queue_keys:
+                seen_queue_keys.add(key)
+                combined_queue.append(dict(job))
         if not combined_queue:
             artifact_state = self._build_download_session_payload_from_artifact_states()
             if artifact_state is None:
                 self._persist_download_session_state(clear=True)
                 return False
             state = artifact_state
-            resume_tickers = [str(item).strip().upper() for item in list(state.get("resume_tickers") or []) if str(item).strip()]
-            queued_tickers = [str(item).strip().upper() for item in list(state.get("queued_tickers") or []) if str(item).strip()]
+            source_choice = str(state.get("download_source_choice") or "").strip().lower()
+            source_effective = str(state.get("download_source_effective") or "").strip().lower()
+            default_source = source_effective or source_choice or str(self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
             combined_queue = []
-            for ticker in resume_tickers + queued_tickers:
-                if ticker and ticker not in combined_queue:
-                    combined_queue.append(ticker)
+            seen_queue_keys = set()
+            for item in list(state.get("resume_jobs") or []) + list(state.get("queued_jobs") or []):
+                job = self._download_job_from_item(item, default_source=default_source)
+                if not job:
+                    continue
+                key = str(job.get("row_key") or "").strip()
+                if key and key not in seen_queue_keys:
+                    seen_queue_keys.add(key)
+                    combined_queue.append(dict(job))
             if not combined_queue:
                 self._persist_download_session_state(clear=True)
                 return False
-        source_choice = str(state.get("download_source_choice") or "").strip().lower()
-        source_effective = str(state.get("download_source_effective") or "").strip().lower()
         if hasattr(self, "download_source_combo"):
             source_index = self.download_source_combo.findData(source_choice)
             if source_index < 0 and source_effective:
@@ -14885,7 +20916,16 @@ WantedBy=default.target
         if hasattr(self, "resume_chk"):
             self.resume_chk.setChecked(bool(state.get("resume_enabled", True)))
         if hasattr(self, "force_refresh_chk"):
+            self.force_refresh_chk.blockSignals(True)
             self.force_refresh_chk.setChecked(bool(state.get("force_refresh", False)))
+            self.force_refresh_chk.blockSignals(False)
+        if hasattr(self, "stale_only_chk"):
+            self.stale_only_chk.blockSignals(True)
+            restored_force_refresh = bool(state.get("force_refresh", False))
+            self.stale_only_chk.setChecked(
+                bool(state.get("only_stale", not restored_force_refresh)) and not restored_force_refresh
+            )
+            self.stale_only_chk.blockSignals(False)
         self._update_ticker_summary()
         self.progress_table.setRowCount(0)
         self.download_progress_rows = {}
@@ -14899,16 +20939,21 @@ WantedBy=default.target
         for snapshot in sorted(list(state.get("rows") or []), key=lambda item: int(item.get("row") or 0)):
             if isinstance(snapshot, dict):
                 self._apply_progress_row_snapshot(dict(snapshot))
-        for ticker in combined_queue:
-            if ticker not in self.download_progress_rows:
-                self._ensure_progress_row(ticker)
+        for job in combined_queue:
+            row_key = str(job.get("row_key") or "").strip()
+            if row_key and row_key not in self.download_progress_rows:
+                self._ensure_progress_row(
+                    str(job.get("ticker") or ""),
+                    source=str(job.get("source") or ""),
+                    row_key=row_key,
+                )
         self.current_acquisition_run_id = str(state.get("current_acquisition_run_id") or "").strip() or None
         self.current_acquisition_attempts = {
-            str(key).strip().upper(): str(value)
+            str(key).strip(): str(value)
             for key, value in dict(state.get("current_acquisition_attempts") or {}).items()
             if str(key).strip()
         }
-        self.download_queue = list(combined_queue)
+        self.download_queue = [dict(job) for job in combined_queue]
         self.download_paused = bool(state.get("download_paused"))
         self._download_stop_requested = False
         self.download_active_ticker = str(state.get("download_active_ticker") or "").strip() or None
@@ -14918,13 +20963,23 @@ WantedBy=default.target
         if self.download_paused:
             self.download_status.setText(restored_status_text or "Interrupted download session restored in paused state.")
         else:
-            self.download_status.setText(restored_status_text or "Interrupted download session restored. Resuming downloads…")
-            QtCore.QTimer.singleShot(0, self._maybe_start_downloads)
+            if auto_resume:
+                self.download_status.setText(
+                    restored_status_text or "Interrupted download session restored. Resuming downloads…"
+                )
+                QtCore.QTimer.singleShot(0, self._maybe_start_downloads)
+            else:
+                self.download_paused = True
+                self.download_status.setText(
+                    restored_status_text
+                    or "Interrupted download session restored in paused state. Click Resume to continue."
+                )
         return True
 
     def _prepare_download_session_for_shutdown(self) -> None:
         if not self._download_session_has_work():
             return
+        self._flush_pending_download_logs()
         for worker in list(self.download_policy_workers.values()):
             try:
                 worker.requestInterruption()
@@ -14965,6 +21020,7 @@ WantedBy=default.target
         return self.download_proc_meta.get(id(proc))
 
     def _open_download_log(self, ticker: str) -> None:
+        self._flush_pending_download_logs()
         info = self.download_progress_rows.get(ticker)
         if not info:
             QtWidgets.QMessageBox.information(self, "Log", f"No download row exists for {ticker}.")
@@ -15131,8 +21187,9 @@ WantedBy=default.target
         payload["meta"] = dict(meta or {})
         payload["context"] = dict(context or {})
         worker = DownloadFinalizeWorker(payload, self)
-        self.download_finalize_workers[str(ticker or "")] = worker
-        self.download_finalize_metas[str(ticker or "")] = dict(meta or {})
+        row_key = str(meta.get("row_key") or ticker or "").strip()
+        self.download_finalize_workers[row_key] = worker
+        self.download_finalize_metas[row_key] = dict(meta or {})
         self._write_download_artifact_state(
             dict(meta or {}),
             "finalizing",
@@ -15148,10 +21205,12 @@ WantedBy=default.target
         ticker = str(payload.get("ticker") or "")
         meta = dict(payload.get("meta") or {})
         context = dict(payload.get("context") or {})
+        row_key = str(meta.get("row_key") or ticker or "").strip()
+        progress_key = row_key or ticker
         artifact = payload.get("artifact")
         error = str(payload.get("error") or "").strip()
-        worker = self.download_finalize_workers.pop(ticker, None)
-        self.download_finalize_metas.pop(ticker, None)
+        worker = self.download_finalize_workers.pop(row_key, None)
+        self.download_finalize_metas.pop(row_key, None)
         if worker is not None:
             worker.deleteLater()
         if self._closing:
@@ -15161,7 +21220,7 @@ WantedBy=default.target
             if artifact is not None:
                 tooltip = f"Ingested existing CSV -> {artifact.dataset_id}\nPlan: {meta.get('policy_plan_type') or '—'}\nLog: {meta.get('log_path') or '—'}"
                 self.download_status.setText(f"Ingested existing CSV for {ticker}.")
-                self._update_progress_row(ticker, status="ingested", rows=artifact.bar_count, done=True, tooltip=tooltip)
+                self._update_progress_row(progress_key, status="ingested", rows=artifact.bar_count, done=True, tooltip=tooltip)
                 self._record_acquisition_attempt_result(
                     ticker=ticker,
                     meta=meta,
@@ -15178,7 +21237,7 @@ WantedBy=default.target
             else:
                 summary = error or "Existing CSV ingestion failed."
                 self.download_status.setText(f"{ticker} CSV found but ingest failed: {summary}")
-                self._update_progress_row(ticker, status="ingest_error", tooltip=summary)
+                self._update_progress_row(progress_key, status="ingest_error", tooltip=summary)
                 self._record_acquisition_attempt_result(
                     ticker=ticker,
                     meta=meta,
@@ -15228,16 +21287,16 @@ WantedBy=default.target
                         context={"branch": "gap_fill_only", "decision": decision},
                     )
                     return
-                    if not self.download_paused:
-                        self._launch_download_process_for_meta(meta)
-                    else:
-                        self._paused_download_launch_metas.append(dict(meta))
-                        self._write_download_artifact_state(meta, "paused")
-                        self._persist_download_session_state()
+                if not self.download_paused:
+                    self._launch_download_process_for_meta(meta)
+                else:
+                    self._paused_download_launch_metas.append(dict(meta))
+                    self._write_download_artifact_state(meta, "paused")
+                    self._persist_download_session_state()
                 return
             summary = error or "Secondary gap-fill pre-step failed."
             self.download_status.setText(f"{ticker} secondary gap fill failed: {summary}")
-            self._update_progress_row(ticker, status="gap_fill_error", tooltip=summary)
+            self._update_progress_row(progress_key, status="gap_fill_error", tooltip=summary)
             self._record_acquisition_attempt_result(
                 ticker=ticker,
                 meta=meta,
@@ -15265,7 +21324,7 @@ WantedBy=default.target
                     f"Gap-filled {ticker} from {getattr(decision, 'secondary_source', '') or 'secondary source'}."
                 )
                 self._update_progress_row(
-                    ticker,
+                    progress_key,
                     status="gap_filled",
                     rows=artifact.bar_count,
                     done=True,
@@ -15291,7 +21350,7 @@ WantedBy=default.target
             else:
                 summary = error or "Cross-source gap fill failed."
                 self.download_status.setText(f"{ticker} gap fill failed: {summary}")
-                self._update_progress_row(ticker, status="gap_fill_error", tooltip=summary)
+                self._update_progress_row(progress_key, status="gap_fill_error", tooltip=summary)
                 self._record_acquisition_attempt_result(
                     ticker=ticker,
                     meta=meta,
@@ -15307,8 +21366,67 @@ WantedBy=default.target
             self._persist_download_session_state()
             self._maybe_start_downloads()
             return
+        if branch == "partial_download_ingest":
+            recovery_reason = str(context.get("download_error") or meta.get("last_error") or "").strip()
+            if artifact is not None:
+                summary = (
+                    f"Recovered and ingested a saved partial download checkpoint after provider error: {recovery_reason}"
+                    if recovery_reason
+                    else "Recovered and ingested a saved partial download checkpoint."
+                )
+                self.download_status.setText(
+                    f"{ticker} partially downloaded but ingested {artifact.bar_count} recovered bars."
+                )
+                self._update_progress_row(
+                    progress_key,
+                    status="ingested",
+                    rows=artifact.bar_count,
+                    done=True,
+                    tooltip=(
+                        f"Recovered partial checkpoint -> {artifact.dataset_id}\n"
+                        f"Provider Error: {recovery_reason or '—'}\n"
+                        f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                        f"Merge With Existing: {'yes' if meta.get('merge_with_existing') else 'no'}\n"
+                        f"Log: {meta.get('log_path') or '—'}"
+                    ),
+                )
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="ingested",
+                    summary=summary,
+                    parquet_path=artifact.parquet_path,
+                    coverage_start=artifact.start,
+                    coverage_end=artifact.end,
+                    bar_count=artifact.bar_count,
+                    ingested=True,
+                    quality_snapshot=artifact.quality_snapshot,
+                )
+                self._clear_download_artifact_state(meta)
+            else:
+                recovery_failure = str(error or "Partial download recovery ingest failed.").strip()
+                summary = recovery_reason or "Provider download failed."
+                if recovery_failure:
+                    summary = f"{summary} Partial recovery ingest failed: {recovery_failure}".strip()
+                self.download_status.setText(f"{ticker} failed after partial download: {summary}")
+                self._update_progress_row(progress_key, status="error", tooltip=summary)
+                self._record_acquisition_attempt_result(
+                    ticker=ticker,
+                    meta=meta,
+                    status="download_error",
+                    summary=summary,
+                    parquet_path=None,
+                    coverage_start=None,
+                    coverage_end=None,
+                    bar_count=int(meta.get("rows") or 0),
+                    ingested=False,
+                )
+                self._write_download_artifact_state(meta, "interrupted", last_error=summary)
+            self._persist_download_session_state()
+            self._maybe_start_downloads()
+            return
         if branch == "post_download_ingest":
-            row_info = self.download_progress_rows.get(ticker, {})
+            row_info = self.download_progress_rows.get(progress_key, {})
             request_windows = list(meta.get("request_windows") or [(None, None)])
             window_total = len(request_windows)
             window_index = int(meta.get("window_index") or 0)
@@ -15328,7 +21446,7 @@ WantedBy=default.target
                         f"Finished {ticker} window {window_index + 1}/{window_total}; continuing…"
                     )
                     self._update_progress_row(
-                        ticker,
+                        progress_key,
                         status="running",
                         rows=artifact.bar_count,
                         tooltip=(
@@ -15352,7 +21470,7 @@ WantedBy=default.target
                     summary = f"{summary} Completed {window_total} request windows.".strip()
                 self.download_status.setText(f"Finished {ticker} and ingested {artifact.bar_count} bars.")
                 self._update_progress_row(
-                    ticker,
+                    progress_key,
                     status="ingested",
                     rows=artifact.bar_count,
                     done=True,
@@ -15380,7 +21498,7 @@ WantedBy=default.target
             else:
                 summary = error or "Download completed but ingestion failed."
                 self.download_status.setText(f"{ticker} downloaded but ingest failed: {summary}")
-                self._update_progress_row(ticker, status="ingest_error", tooltip=summary)
+                self._update_progress_row(progress_key, status="ingest_error", tooltip=summary)
                 self._record_acquisition_attempt_result(
                     ticker=ticker,
                     meta=meta,
@@ -15493,9 +21611,10 @@ WantedBy=default.target
         return total_steps or None
 
     def _configure_progress_tracking(self, ticker: str, meta: dict) -> None:
-        if ticker not in self.download_progress_rows:
+        row_key = str(meta.get("row_key") or ticker or "").strip()
+        if row_key not in self.download_progress_rows:
             return
-        row_info = self.download_progress_rows[ticker]
+        row_info = self.download_progress_rows[row_key]
         bar: QtWidgets.QProgressBar = row_info["bar"]
         planned_steps = self._estimate_download_step_total(meta)
         row_info["progress_mode"] = "steps" if planned_steps else "indeterminate"
@@ -15517,6 +21636,7 @@ WantedBy=default.target
     def _launch_download_process_for_meta(self, meta: dict) -> None:
         source = str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER)
         ticker = str(meta.get("ticker") or "")
+        row_key = str(meta.get("row_key") or ticker or "").strip()
         request_windows = list(meta.get("request_windows") or [(None, None)])
         window_index = int(meta.get("window_index") or 0)
         window_total = len(request_windows)
@@ -15531,6 +21651,8 @@ WantedBy=default.target
             extra_args.extend(["--start", window_start])
         if window_end:
             extra_args.extend(["--end", window_end])
+        if str(source).strip().lower() == "massive" and window_total > 1:
+            extra_args.append("--merge-output")
         args = build_provider_fetch_command(
             source,
             python_executable=sys.executable,
@@ -15574,12 +21696,13 @@ WantedBy=default.target
         self.download_proc = proc
         self.download_procs.append(proc)
         self._write_download_artifact_state(meta, "running")
+        self.download_active_ticker = row_key
         self.download_status.setText(
             f"Downloading {ticker} window {window_index + 1}/{window_total}…"
         )
-        self._refresh_download_header_progress(ticker)
+        self._refresh_download_header_progress(row_key)
         self._update_progress_row(
-            ticker,
+            row_key,
             status="running",
             tooltip=(
                 f"Window {window_index + 1}/{window_total}\n"
@@ -15622,8 +21745,8 @@ WantedBy=default.target
             symbol=ticker,
             dataset_id=dataset_id,
             status=status,
-            started_at=str(meta.get("attempt_started_at") or pd.Timestamp.utcnow().isoformat()),
-            finished_at=pd.Timestamp.utcnow().isoformat(),
+            started_at=str(meta.get("attempt_started_at") or pd.Timestamp.now(tz='UTC').isoformat()),
+            finished_at=pd.Timestamp.now(tz='UTC').isoformat(),
             csv_path=str(meta.get("out_path") or ""),
             parquet_path=parquet_path,
             coverage_start=coverage_start,
@@ -15637,7 +21760,8 @@ WantedBy=default.target
             history_window=str(meta.get("history_window") or provider.default_history_window),
             quality_snapshot=quality_snapshot,
         )
-        self.current_acquisition_attempts[ticker] = status
+        attempt_key = str(meta.get("row_key") or ticker).strip() or ticker
+        self.current_acquisition_attempts[attempt_key] = status
         if ingested and parquet_path:
             self._refresh_dataset_options()
         self._invalidate_picker_snapshot()
@@ -15663,7 +21787,7 @@ WantedBy=default.target
             status = "success"
         ResultCatalog(self.catalog.db_path).finish_acquisition_run(
             run_id,
-            finished_at=pd.Timestamp.utcnow().isoformat(),
+            finished_at=pd.Timestamp.now(tz='UTC').isoformat(),
             status=status,
             success_count=success_count,
             failed_count=failed_count,
@@ -15690,7 +21814,7 @@ WantedBy=default.target
             source=source,
             universe_id=str(selected_universe.get("universe_id", "") or "") or None,
             universe_name=str(selected_universe.get("name", "") or "") or None,
-            started_at=pd.Timestamp.utcnow().isoformat(),
+            started_at=pd.Timestamp.now(tz='UTC').isoformat(),
             status="running",
             symbol_count=max(0, int(symbol_count or 0)),
             notes=note,
@@ -15700,17 +21824,20 @@ WantedBy=default.target
         ticker = str(meta.get("ticker") or "").strip().upper()
         if not ticker:
             return
+        row_key = str(meta.get("row_key") or ticker).strip()
         payload = {
             "ticker": ticker,
+            "row_key": row_key,
             "source": str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER),
             "resolution": str(meta.get("resolution") or ""),
             "history_window": str(meta.get("history_window") or ""),
             "catalog_path": str(self.catalog.db_path),
-            "force_refresh": bool(self.force_refresh_chk.isChecked()),
+            "force_refresh": self._download_force_refresh_enabled(),
+            "only_stale": self._stale_only_download_enabled(),
         }
         worker = AcquisitionPolicyWorker(payload, self)
-        self.download_policy_workers[ticker] = worker
-        self.download_policy_metas[ticker] = dict(meta)
+        self.download_policy_workers[row_key] = worker
+        self.download_policy_metas[row_key] = dict(meta)
         worker.result_signal.connect(self._on_download_policy_result)
         worker.finished.connect(worker.deleteLater)
         worker.start()
@@ -15718,8 +21845,9 @@ WantedBy=default.target
     def _on_download_policy_result(self, result: object) -> None:
         payload = dict(result or {}) if isinstance(result, dict) else {}
         ticker = str(payload.get("ticker") or "").strip().upper()
-        worker = self.download_policy_workers.pop(ticker, None)
-        meta = self.download_policy_metas.pop(ticker, None)
+        row_key = str(payload.get("row_key") or ticker).strip()
+        worker = self.download_policy_workers.pop(row_key, None)
+        meta = self.download_policy_metas.pop(row_key, None)
         if worker is not None:
             worker.deleteLater()
         if meta is None:
@@ -15732,7 +21860,7 @@ WantedBy=default.target
             summary = error or "Acquisition policy planning failed."
             meta["last_error"] = summary
             self.download_status.setText(f"{ticker} planning failed: {summary}")
-            self._update_progress_row(ticker, status="error", tooltip=summary)
+            self._update_progress_row(str(meta.get("row_key") or row_key), status="error", tooltip=summary)
             if self.current_acquisition_run_id and ticker:
                 self._record_acquisition_attempt_result(
                     ticker=ticker,
@@ -15752,6 +21880,7 @@ WantedBy=default.target
 
     def _handle_download_policy_decision(self, meta: dict, decision: object) -> None:
         ticker = str(meta.get("ticker") or "").strip().upper()
+        row_key = str(meta.get("row_key") or ticker).strip()
         meta.update(
             {
                 "rows": int(getattr(decision, "bar_count", 0) or 0),
@@ -15810,7 +21939,7 @@ WantedBy=default.target
                 f"Coverage: {getattr(decision, 'coverage_start', None) or '—'} → {getattr(decision, 'coverage_end', None) or '—'}\nLog: {meta['log_path']}"
             )
             self.download_status.setText(f"Skipping {ticker}: dataset is already fresh.")
-            self._update_progress_row(ticker, status="skipped", rows=getattr(decision, "bar_count", None), done=True, tooltip=tooltip)
+            self._update_progress_row(row_key, status="skipped", rows=getattr(decision, "bar_count", None), done=True, tooltip=tooltip)
             self._record_acquisition_attempt_result(
                 ticker=ticker,
                 meta=meta,
@@ -15828,7 +21957,7 @@ WantedBy=default.target
             return
         if getattr(decision, "action", "") == ACQUISITION_ACTION_INGEST_EXISTING:
             self.download_status.setText(f"Ingesting existing CSV for {ticker}…")
-            self._update_progress_row(ticker, status="ingesting", tooltip=f"Ingesting existing CSV\nLog: {meta['log_path']}")
+            self._update_progress_row(row_key, status="ingesting", tooltip=f"Ingesting existing CSV\nLog: {meta['log_path']}")
             self._start_download_finalize_worker(
                 ticker=ticker,
                 meta=meta,
@@ -15850,7 +21979,7 @@ WantedBy=default.target
         if getattr(decision, "secondary_dataset_id", None) and self._decision_secondary_request_windows(decision):
             self.download_status.setText(f"Running secondary gap fill for {ticker}…")
             self._update_progress_row(
-                ticker,
+                row_key,
                 status="gap_fill",
                 tooltip=f"Secondary gap fill pre-step\nLog: {meta['log_path']}",
             )
@@ -15875,7 +22004,7 @@ WantedBy=default.target
         if getattr(decision, "action", "") == ACQUISITION_ACTION_GAP_FILL_SECONDARY:
             self.download_status.setText(f"Gap filling {ticker} from {getattr(decision, 'secondary_source', None) or 'secondary source'}…")
             self._update_progress_row(
-                ticker,
+                row_key,
                 status="gap_fill",
                 tooltip=f"Gap filling from {getattr(decision, 'secondary_source', None) or 'secondary source'}\nLog: {meta['log_path']}",
             )
@@ -15900,7 +22029,7 @@ WantedBy=default.target
         if self.download_paused:
             self.download_status.setText(f"Download paused before launching {ticker}.")
             self._update_progress_row(
-                ticker,
+                row_key,
                 status="paused",
                 tooltip=(
                     f"Acquisition plan ready; provider launch is waiting for resume.\n"
@@ -15927,9 +22056,12 @@ WantedBy=default.target
             QtWidgets.QMessageBox.warning(self, "No tickers", "Select at least one ticker or a universe with symbols.")
             return
         source = self._resolved_download_source()
-        provider = get_acquisition_provider(source)
+        jobs = self._build_download_jobs(symbols, source)
+        if not jobs:
+            QtWidgets.QMessageBox.warning(self, "No tickers", "No provider download jobs could be built for the current selection.")
+            return
         self._active_download_source = source
-        self.download_queue = list(symbols)
+        self.download_queue = list(jobs)
         self.download_progress_rows = {}
         self.download_policy_workers = {}
         self.download_policy_metas = {}
@@ -15945,16 +22077,28 @@ WantedBy=default.target
         self.download_status.setText("Starting downloads…")
         self.download_procs = []
         selected_universe = self._selected_download_universe() or {}
+        policy_mode = (
+            "stale/missing/gappy update policy"
+            if self._stale_only_download_enabled()
+            else "force refresh policy"
+        )
         self._ensure_acquisition_run(
             source=source,
             symbol_count=len(self.download_queue),
-            note=f"Interactive download request launched from Data Collection tab using {provider_display_name(source)}.",
+            note=f"Interactive download request launched from Data Collection tab using {provider_display_name(source)} with {policy_mode}.",
         )
         self._persist_download_session_state()
         self._maybe_start_downloads()
 
-    def _start_next_download(self) -> None:
-        if not self.download_queue:
+    def _queue_stale_downloads_now(self) -> None:
+        if hasattr(self, "stale_only_chk"):
+            self.stale_only_chk.setChecked(True)
+        if hasattr(self, "force_refresh_chk"):
+            self.force_refresh_chk.setChecked(False)
+        self._start_download()
+
+    def _start_next_download(self, job: dict | None = None) -> None:
+        if job is None and not self.download_queue:
             if (
                 not self.download_policy_workers
                 and not self.download_procs
@@ -15966,9 +22110,16 @@ WantedBy=default.target
                 self.download_progress.setVisible(False)
                 self.download_active_ticker = None
             return
-        ticker = self.download_queue.pop(0)
-        self.download_active_ticker = ticker
-        source = str(self._active_download_source or self._resolved_download_source())
+        if job is None:
+            job = self._download_job_from_item(self.download_queue.pop(0))
+        else:
+            job = self._download_job_from_item(job)
+        if not job:
+            return
+        ticker = str(job.get("ticker") or "").strip().upper()
+        source = str(job.get("source") or DEFAULT_ACQUISITION_PROVIDER).strip().lower()
+        row_key = str(job.get("row_key") or ticker).strip()
+        self.download_active_ticker = row_key
         provider = get_acquisition_provider(source)
         out_path = build_download_csv_path(
             ticker,
@@ -15977,15 +22128,16 @@ WantedBy=default.target
             resolution=provider.default_resolution,
         )
         log_path = self._create_download_log_path(ticker)
-        self._ensure_progress_row(ticker, log_path)
+        self._ensure_progress_row(ticker, log_path, source=source, row_key=row_key)
         meta = {
             "ticker": ticker,
+            "row_key": row_key,
             "log_path": str(log_path),
             "buffer": "",
             "last_error": "",
             "rows": 0,
             "out_path": str(out_path),
-            "attempt_started_at": pd.Timestamp.utcnow().isoformat(),
+            "attempt_started_at": pd.Timestamp.now(tz='UTC').isoformat(),
             "source": source,
             "history_window": provider.default_history_window,
             "resolution": provider.default_resolution,
@@ -16015,7 +22167,7 @@ WantedBy=default.target
         self._append_download_log(log_path, launch_text + "\n")
         self.download_status.setText(f"Evaluating acquisition plan for {ticker}…")
         self._update_progress_row(
-            ticker,
+            row_key,
             status="planning",
             tooltip=f"Evaluating acquisition policy in a worker thread\nLog: {log_path}",
         )
@@ -16042,48 +22194,57 @@ WantedBy=default.target
 
     def _process_download_output_line(self, meta: dict, line: str) -> None:
         ticker = str(meta.get("ticker", ""))
+        row_key = str(meta.get("row_key") or ticker).strip()
         try:
             payload = json.loads(line)
         except Exception:
             if "Traceback" in line or "Error" in line or "Exception" in line or "No module named" in line:
                 meta["last_error"] = line
-                self._update_progress_row(ticker, status="error", tooltip=line)
+                self._update_progress_row(row_key, status="error", tooltip=line)
             return
         if payload.get("type") == "progress":
             pages = payload.get("pages")
             rows = payload.get("rows")
             meta["rows"] = int(rows or 0)
             meta["current_window_pages"] = int(pages or 0)
-            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
+            now = time.monotonic()
+            last_ui = float(meta.get("last_progress_ui_monotonic") or 0.0)
+            if last_ui > 0.0 and now - last_ui < 0.25:
+                return
+            meta["last_progress_ui_monotonic"] = now
+            self.download_active_ticker = row_key
             self.download_status.setText(
                 f"Downloading {payload.get('ticker')}… pages={pages} rows={rows}"
             )
-            self._update_progress_row(payload.get("ticker"), pages=pages, rows=rows)
-            self._refresh_download_header_progress(payload.get("ticker"))
+            self._update_progress_row(row_key, pages=pages, rows=rows)
+            self._refresh_download_header_progress(row_key)
         elif payload.get("type") == "start":
-            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
+            self.download_active_ticker = row_key
             self.download_status.setText(
                 f"Downloading {payload.get('ticker')}… {payload.get('start')} → {payload.get('end')}"
             )
-            self._update_progress_row(payload.get("ticker"), status="running")
-            self._refresh_download_header_progress(payload.get("ticker"))
+            self._update_progress_row(row_key, status="running")
+            self._refresh_download_header_progress(row_key)
             self._persist_download_session_state()
         elif payload.get("type") == "done":
             meta["rows"] = int(payload.get("rows") or 0)
-            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
+            self.download_active_ticker = row_key
             self.download_status.setText(
                 f"Finished {payload.get('ticker')} ({payload.get('rows')} bars)"
             )
-            self._update_progress_row(payload.get("ticker"), status="done", rows=payload.get("rows"), done=True)
-            self._refresh_download_header_progress(payload.get("ticker"))
+            request_windows = list(meta.get("request_windows") or [(None, None)])
+            window_index = int(meta.get("window_index") or 0)
+            final_window = window_index + 1 >= len(request_windows)
+            self._update_progress_row(row_key, status="done", rows=payload.get("rows"), done=final_window)
+            self._refresh_download_header_progress(row_key)
             self._persist_download_session_state()
         elif payload.get("type") == "error":
             message = str(payload.get("message") or payload.get("details") or "Unknown download error")
             meta["last_error"] = message
-            self.download_active_ticker = str(payload.get("ticker") or ticker or "")
+            self.download_active_ticker = row_key
             self.download_status.setText(f"{payload.get('ticker')} failed: {message}")
-            self._update_progress_row(payload.get("ticker"), status="error", tooltip=message)
-            self._refresh_download_header_progress(payload.get("ticker"))
+            self._update_progress_row(row_key, status="error", tooltip=message)
+            self._refresh_download_header_progress(row_key)
             self._write_download_artifact_state(meta, "interrupted", last_error=message)
             self._persist_download_session_state()
 
@@ -16095,17 +22256,42 @@ WantedBy=default.target
         if meta is None:
             return
         ticker = str(meta.get("ticker", ""))
+        row_key = str(meta.get("row_key") or ticker).strip()
         message = f"Process error: {getattr(error, 'name', str(error))}"
         meta["last_error"] = message
         self.download_status.setText(f"{ticker} failed: {message}")
-        self._update_progress_row(ticker, status="error", tooltip=message)
+        self._update_progress_row(row_key, status="error", tooltip=message)
         self._write_download_artifact_state(meta, "interrupted", last_error=message)
         self._persist_download_session_state()
+
+    @staticmethod
+    def _download_message_has_partial_progress(message: object) -> bool:
+        return "partial progress was saved to" in str(message or "").strip().lower()
+
+    def _should_finalize_partial_download(self, meta: dict, summary: str | None = None) -> bool:
+        out_path = Path(str(meta.get("out_path") or "")).expanduser()
+        if not out_path.exists():
+            return False
+        if self._download_message_has_partial_progress(summary) or self._download_message_has_partial_progress(
+            meta.get("last_error")
+        ):
+            return True
+        log_path = Path(str(meta.get("log_path") or "")).expanduser()
+        if not log_path.exists():
+            return False
+        try:
+            return self._download_message_has_partial_progress(log_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
 
     def _download_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus) -> None:
         proc = self.sender()
         meta = self._download_meta(proc) if isinstance(proc, QtCore.QProcess) else None
         ticker = str(meta.get("ticker", "")) if meta else ""
+        row_key = str(meta.get("row_key") or ticker).strip() if meta else ticker
+        launch_next_window_meta: dict | None = None
+        partial_finalize_job: dict | None = None
+        partial_finalize_context: dict | None = None
         if meta:
             source = str(meta.get("source") or DEFAULT_ACQUISITION_PROVIDER)
             provider = get_acquisition_provider(source)
@@ -16124,40 +22310,22 @@ WantedBy=default.target
             if exit_code != 0 or exit_status != QtCore.QProcess.ExitStatus.NormalExit:
                 if not summary:
                     summary = f"Process exited with code {exit_code}"
-                self.download_status.setText(f"{ticker} failed: {summary}")
-                self._update_progress_row(ticker, status="error", tooltip=summary)
-                self._write_download_artifact_state(meta, "interrupted", last_error=summary)
-                if self.current_acquisition_run_id and ticker:
-                    self._record_acquisition_attempt_result(
-                        ticker=ticker,
-                        meta=meta,
-                        status="download_error",
-                        summary=summary,
-                        parquet_path=None,
-                        coverage_start=None,
-                        coverage_end=None,
-                        bar_count=int(meta.get("rows") or 0),
-                        ingested=False,
+                if self._should_finalize_partial_download(meta, str(meta.get("last_error") or summary)):
+                    request_windows = list(meta.get("request_windows") or [(None, None)])
+                    window_total = len(request_windows)
+                    window_index = int(meta.get("window_index") or 0)
+                    self.download_status.setText(f"{ticker} partially downloaded; ingesting recovered bars…")
+                    self._update_progress_row(
+                        row_key,
+                        status="ingesting",
+                        tooltip=(
+                            "Recovered partial download checkpoint; ingesting saved rows.\n"
+                            f"Provider Error: {summary}\n"
+                            f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                            f"Log: {log_path}"
+                        ),
                     )
-            elif ticker:
-                self._write_download_artifact_state(meta, "downloaded")
-                self.download_status.setText(f"Ingesting {ticker} and analyzing dataset quality…")
-                self._update_progress_row(
-                    ticker,
-                    status="ingesting",
-                    tooltip=(
-                        f"Ingesting downloaded CSV and computing dataset quality\n"
-                        f"Plan: {meta.get('policy_plan_type') or '—'}\n"
-                        f"Log: {log_path}"
-                    ),
-                )
-                request_windows = list(meta.get("request_windows") or [(None, None)])
-                window_total = len(request_windows)
-                window_index = int(meta.get("window_index") or 0)
-                self._start_download_finalize_worker(
-                    ticker=ticker,
-                    meta=meta,
-                    job={
+                    partial_finalize_job = {
                         "mode": "ingest_csv",
                         "out_path": Path(str(meta.get("out_path") or "")),
                         "dataset_id": build_download_dataset_id(
@@ -16168,19 +22336,108 @@ WantedBy=default.target
                         ),
                         "merge_existing": bool(meta.get("merge_with_existing") or window_index > 0 or window_total > 1),
                         "resolution": str(meta.get("resolution") or provider.default_resolution),
-                    },
-                    context={"branch": "post_download_ingest"},
-                )
+                    }
+                    partial_finalize_context = {
+                        "branch": "partial_download_ingest",
+                        "download_error": summary,
+                    }
+                else:
+                    self.download_status.setText(f"{ticker} failed: {summary}")
+                    self._update_progress_row(row_key, status="error", tooltip=summary)
+                    self._write_download_artifact_state(meta, "interrupted", last_error=summary)
+                    if self.current_acquisition_run_id and ticker:
+                        self._record_acquisition_attempt_result(
+                            ticker=ticker,
+                            meta=meta,
+                            status="download_error",
+                            summary=summary,
+                            parquet_path=None,
+                            coverage_start=None,
+                            coverage_end=None,
+                            bar_count=int(meta.get("rows") or 0),
+                            ingested=False,
+                        )
+            elif ticker:
+                self._write_download_artifact_state(meta, "downloaded")
+                request_windows = list(meta.get("request_windows") or [(None, None)])
+                window_total = len(request_windows)
+                window_index = int(meta.get("window_index") or 0)
+                if window_index + 1 < window_total:
+                    row_info = self.download_progress_rows.get(row_key, {})
+                    current_window_pages = int(meta.get("current_window_pages") or 0)
+                    if row_info:
+                        row_info["progress_completed_steps"] = int(row_info.get("progress_completed_steps") or 0) + current_window_pages
+                        row_info["progress_current_steps"] = 0
+                    meta["window_index"] = window_index + 1
+                    meta["last_error"] = ""
+                    self.download_status.setText(
+                        f"Finished {ticker} window {window_index + 1}/{window_total}; continuing download before final ingest…"
+                    )
+                    self._update_progress_row(
+                        row_key,
+                        status="running",
+                        rows=meta.get("rows"),
+                        tooltip=(
+                            f"Completed download window {window_index + 1}/{window_total}; final ingest runs after all windows finish.\n"
+                            f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                            f"Log: {log_path}"
+                        ),
+                    )
+                    if self.download_paused:
+                        self._paused_download_launch_metas.append(dict(meta))
+                        self._write_download_artifact_state(meta, "paused")
+                    else:
+                        self._write_download_artifact_state(meta, "running")
+                        launch_next_window_meta = dict(meta)
+                else:
+                    self.download_status.setText(f"Ingesting {ticker} and analyzing dataset quality…")
+                    self._update_progress_row(
+                        row_key,
+                        status="ingesting",
+                        tooltip=(
+                            f"Ingesting downloaded CSV and computing dataset quality\n"
+                            f"Plan: {meta.get('policy_plan_type') or '—'}\n"
+                            f"Log: {log_path}"
+                        ),
+                    )
+                    self._start_download_finalize_worker(
+                        ticker=ticker,
+                        meta=meta,
+                        job={
+                            "mode": "ingest_csv",
+                            "out_path": Path(str(meta.get("out_path") or "")),
+                            "dataset_id": build_download_dataset_id(
+                                ticker,
+                                source=source,
+                                history_window=str(meta.get("history_window") or provider.default_history_window),
+                                resolution=str(meta.get("resolution") or provider.default_resolution),
+                            ),
+                            "merge_existing": bool(meta.get("merge_with_existing") or window_index > 0 or window_total > 1),
+                            "resolution": str(meta.get("resolution") or provider.default_resolution),
+                        },
+                        context={"branch": "post_download_ingest"},
+                    )
         if isinstance(proc, QtCore.QProcess) and proc in self.download_procs:
             self.download_procs.remove(proc)
         if isinstance(proc, QtCore.QProcess):
             self.download_proc_meta.pop(id(proc), None)
         self.download_proc = self.download_procs[0] if self.download_procs else None
-        if ticker and str(self.download_active_ticker or "") == ticker:
+        if row_key and str(self.download_active_ticker or "") == row_key:
             next_meta = self.download_proc_meta.get(id(self.download_proc)) if self.download_proc is not None else None
-            self.download_active_ticker = str(next_meta.get("ticker") or "") if next_meta else None
+            self.download_active_ticker = str(next_meta.get("row_key") or next_meta.get("ticker") or "") if next_meta else None
         self._refresh_download_header_progress(self.download_active_ticker)
         self._persist_download_session_state()
+        if launch_next_window_meta is not None:
+            self._launch_download_process_for_meta(launch_next_window_meta)
+            return
+        if partial_finalize_job is not None and partial_finalize_context is not None and meta is not None:
+            self._start_download_finalize_worker(
+                ticker=ticker,
+                meta=meta,
+                job=partial_finalize_job,
+                context=partial_finalize_context,
+            )
+            return
         if self.download_paused:
             return
         self._maybe_start_downloads()
@@ -16204,7 +22461,7 @@ WantedBy=default.target
 
     def _resume_download(self) -> None:
         if not self.download_procs and not self.download_policy_workers and not self._paused_download_launch_metas and not self.download_queue:
-            restored = self._restore_download_session_if_available()
+            restored = self._restore_download_session_if_available(auto_resume=True)
             if not restored and (not self.download_queue and not self.download_procs and not self.download_policy_workers and not self._paused_download_launch_metas):
                 QtWidgets.QMessageBox.information(
                     self,
@@ -16232,9 +22489,16 @@ WantedBy=default.target
         self.download_status.setText("Download resumed.")
         for ticker in list(self.download_progress_rows.keys()):
             self._update_progress_row(ticker, status="running")
-        concurrency = max(1, int(self.concurrency_spin.value()))
-        while self._paused_download_launch_metas and self._active_download_slot_count() < concurrency:
-            meta = self._paused_download_launch_metas.pop(0)
+        while self._paused_download_launch_metas:
+            launch_idx = -1
+            for idx, meta in enumerate(list(self._paused_download_launch_metas)):
+                source = str(meta.get("source") or "").strip().lower()
+                if self._active_download_slot_count(source) < self._download_provider_slot_limit(source):
+                    launch_idx = idx
+                    break
+            if launch_idx < 0:
+                break
+            meta = self._paused_download_launch_metas.pop(launch_idx)
             self._launch_download_process_for_meta(meta)
         self._persist_download_session_state()
         self._maybe_start_downloads()
@@ -16247,20 +22511,7 @@ WantedBy=default.target
             self._write_download_artifact_state(meta, "finalizing", last_error="Dashboard stop requested during finalization.")
         for meta in list(self._paused_download_launch_metas):
             self._write_download_artifact_state(meta, "stopped", last_error="Download stopped by the user.")
-        for proc in list(self.download_procs):
-            if proc.state() != QtCore.QProcess.ProcessState.NotRunning:
-                proc.kill()
-        for worker in list(self.download_policy_workers.values()):
-            try:
-                worker.requestInterruption()
-            except Exception:
-                continue
-        self.download_policy_workers = {}
-        self.download_policy_metas = {}
-        self.download_procs = []
-        self.download_proc = None
-        self.download_proc_meta = {}
-        self.download_finalize_metas = {}
+        self._shutdown_download_activity(wait_ms=15000)
         self.download_queue = []
         self._paused_download_launch_metas = []
         self.download_active_ticker = None
@@ -16272,14 +22523,78 @@ WantedBy=default.target
             self._update_progress_row(ticker, status="stopped")
         self._persist_download_session_state(clear=True)
 
-    def _ensure_progress_row(self, ticker: str, log_path: Path | None = None) -> None:
-        if ticker in self.download_progress_rows:
+    def _shutdown_download_activity(self, *, wait_ms: int = 15000) -> bool:
+        remaining_procs: list[QtCore.QProcess] = []
+        remaining_proc_meta: dict[int, dict] = {}
+        for proc in list(getattr(self, "download_procs", []) or []):
+            try:
+                if proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+                    proc.kill()
+                    proc.waitForFinished(3000)
+                if proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+                    remaining_procs.append(proc)
+                    meta = self.download_proc_meta.get(id(proc))
+                    if meta is not None:
+                        remaining_proc_meta[id(proc)] = dict(meta)
+            except Exception:
+                remaining_procs.append(proc)
+        remaining_policy_workers: dict[str, AcquisitionPolicyWorker] = {}
+        remaining_policy_metas: dict[str, dict] = {}
+        for key, worker in list(getattr(self, "download_policy_workers", {}).items()):
+            try:
+                worker.requestInterruption()
+                worker.quit()
+                worker.wait(max(1000, int(wait_ms)))
+                if worker.isRunning():
+                    remaining_policy_workers[key] = worker
+                    meta = self.download_policy_metas.get(key)
+                    if meta is not None:
+                        remaining_policy_metas[key] = dict(meta)
+            except Exception:
+                remaining_policy_workers[key] = worker
+        remaining_finalize_workers: dict[str, DownloadFinalizeWorker] = {}
+        remaining_finalize_metas: dict[str, dict] = {}
+        for key, worker in list(getattr(self, "download_finalize_workers", {}).items()):
+            try:
+                worker.requestInterruption()
+                worker.quit()
+                worker.wait(max(1000, int(wait_ms)))
+                if worker.isRunning():
+                    remaining_finalize_workers[key] = worker
+                    meta = self.download_finalize_metas.get(key)
+                    if meta is not None:
+                        remaining_finalize_metas[key] = dict(meta)
+            except Exception:
+                remaining_finalize_workers[key] = worker
+        self.download_policy_workers = remaining_policy_workers
+        self.download_policy_metas = remaining_policy_metas
+        self.download_finalize_workers = remaining_finalize_workers
+        self.download_finalize_metas = remaining_finalize_metas
+        self.download_procs = remaining_procs
+        self.download_proc = remaining_procs[0] if remaining_procs else None
+        self.download_proc_meta = remaining_proc_meta
+        return not remaining_procs and not remaining_policy_workers and not remaining_finalize_workers
+
+    def _ensure_progress_row(
+        self,
+        ticker: str,
+        log_path: Path | None = None,
+        *,
+        source: str | None = None,
+        row_key: str | None = None,
+    ) -> None:
+        key = str(row_key or ticker or "").strip()
+        symbol = str(ticker or "").strip().upper()
+        normalized_source = str(source or "").strip().lower()
+        if key in self.download_progress_rows:
             if log_path is not None:
-                self.download_progress_rows[ticker]["log_path"] = str(log_path)
+                self.download_progress_rows[key]["log_path"] = str(log_path)
+            if normalized_source:
+                self.download_progress_rows[key]["source"] = normalized_source
             return
         row = self.progress_table.rowCount()
         self.progress_table.insertRow(row)
-        self.progress_table.setItem(row, 0, QtWidgets.QTableWidgetItem(ticker))
+        self.progress_table.setItem(row, 0, QtWidgets.QTableWidgetItem(self._download_row_label(symbol, normalized_source, key)))
         self.progress_table.setItem(row, 1, QtWidgets.QTableWidgetItem("queued"))
         self.progress_table.setItem(row, 2, QtWidgets.QTableWidgetItem("0"))
         self.progress_table.setItem(row, 3, QtWidgets.QTableWidgetItem("0"))
@@ -16307,9 +22622,12 @@ WantedBy=default.target
         )
         self.progress_table.setCellWidget(row, 4, bar)
         log_btn = QtWidgets.QPushButton("Log")
-        log_btn.clicked.connect(lambda _, sym=ticker: self._open_download_log(sym))
+        log_btn.clicked.connect(lambda _, sym=key: self._open_download_log(sym))
         self.progress_table.setCellWidget(row, 5, log_btn)
-        self.download_progress_rows[ticker] = {
+        self.download_progress_rows[key] = {
+            "ticker": symbol,
+            "source": normalized_source,
+            "row_key": key,
             "row": row,
             "bar": bar,
             "log_path": str(log_path) if log_path else None,
@@ -16396,8 +22714,8 @@ WantedBy=default.target
         except RuntimeError:
             return
         if running:
-            batches = self.catalog.load_batches()
             runs = self.catalog.load_runs()
+            batches = self.catalog.load_batches(runs=runs)
             self._render_batches(batches)
             self._update_metrics(runs)
 
@@ -16426,6 +22744,7 @@ WantedBy=default.target
     def _on_picker_snapshot_loaded(self, frame: object) -> None:
         self._picker_snapshot_worker = None
         self._picker_snapshot_frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+        self._update_horizon_coverage_summary()
         if self._picker_snapshot_refresh_pending:
             self._picker_snapshot_refresh_pending = False
             self._request_picker_snapshot_refresh(force=True)
@@ -16436,29 +22755,66 @@ WantedBy=default.target
             self._picker_snapshot_refresh_pending = False
             self._request_picker_snapshot_refresh(force=True)
 
-    def _active_download_slot_count(self) -> int:
-        return len(self.download_policy_workers) + len(self.download_procs) + len(self.download_finalize_workers)
+    def _active_download_slot_count(self, source: str | None = None) -> int:
+        normalized_source = str(source or "").strip().lower()
+        metas: list[dict] = []
+        metas.extend(dict(meta or {}) for meta in self.download_policy_metas.values())
+        metas.extend(dict(meta or {}) for meta in self.download_proc_meta.values())
+        metas.extend(dict(meta or {}) for meta in self.download_finalize_metas.values())
+        if not normalized_source:
+            return len(metas)
+        return sum(1 for meta in metas if str(meta.get("source") or "").strip().lower() == normalized_source)
+
+    def _download_provider_slot_limit(self, source: str | None) -> int:
+        normalized_source = str(source or "").strip().lower()
+        selected_concurrency = max(1, int(self.concurrency_spin.value()))
+        if normalized_source == "massive":
+            return 1
+        return selected_concurrency
+
+    def _can_start_download_job(self, job: object) -> bool:
+        normalized_job = self._download_job_from_item(job)
+        if not normalized_job:
+            return False
+        source = str(normalized_job.get("source") or "").strip().lower()
+        return self._active_download_slot_count(source) < self._download_provider_slot_limit(source)
+
+    def _pop_next_startable_download_job(self) -> dict | None:
+        for idx, item in enumerate(list(self.download_queue)):
+            job = self._download_job_from_item(item)
+            if not job:
+                try:
+                    self.download_queue.pop(idx)
+                except Exception:
+                    pass
+                continue
+            if self._can_start_download_job(job):
+                self.download_queue.pop(idx)
+                return job
+        return None
 
     def _maybe_start_downloads(self) -> None:
         if self._closing:
             return
         if self.download_paused:
             return
-        concurrency = max(1, int(self.concurrency_spin.value()))
-        while self.download_queue and self._active_download_slot_count() < concurrency:
-            self._start_next_download()
+        while self.download_queue:
+            job = self._pop_next_startable_download_job()
+            if job is None:
+                break
+            self._start_next_download(job)
         if self._download_stop_requested:
             if not self.download_procs and not self.download_finalize_workers:
                 self.download_active_ticker = None
             return
         if not self.download_queue and not self.download_policy_workers and not self.download_procs and not self.download_finalize_workers:
             recovery_source = str(self._active_download_source or self._resolved_download_source() or DEFAULT_ACQUISITION_PROVIDER)
-            recoverable_tickers = self._recoverable_download_tickers()
+            recoverable_jobs = self._recoverable_download_jobs()
             self._finish_current_acquisition_run()
-            if recoverable_tickers:
+            if recoverable_jobs:
                 self._active_download_source = recovery_source
-                self._retain_download_rows(recoverable_tickers)
-                self.download_queue = list(recoverable_tickers)
+                self._retain_download_rows(recoverable_jobs)
+                self.download_queue = [dict(job) for job in recoverable_jobs]
                 self.download_paused = True
                 self.download_active_ticker = None
                 self.download_progress.setVisible(False)
@@ -16485,32 +22841,10 @@ WantedBy=default.target
         if hasattr(self, "tasks_table"):
             self._refresh_tasks_table()
         runs = self.catalog.load_runs()
-        batches = self.catalog.load_batches()
+        batches = self.catalog.load_batches(runs=runs)
         self._render_batches(batches)
         self._update_metrics(runs)
-        if (
-            hasattr(self, "tabs")
-            and (
-                self.tabs.currentWidget() is getattr(self, "asset_information_tab", None)
-                or self.asset_catalog_frame.empty
-            )
-        ):
-            self._refresh_asset_information_tab()
-        if (
-            hasattr(self, "tabs")
-            and (
-                self.tabs.currentWidget() is getattr(self, "asset_screener_tab", None)
-                or self.asset_screener_frame.empty
-            )
-        ):
-            self._refresh_asset_screener_tab()
-        self._update_optimization_panel()
-        self._update_walk_forward_panel()
-        self._update_monte_carlo_panel()
-        self._update_deployment_panel()
-        self._update_live_monitor_panel()
-        if refresh_heatmap:
-            self._update_heatmap()
+        self._refresh_visible_dashboard_panels(refresh_heatmap=refresh_heatmap)
         status = f"DB: {self.catalog.db_path} ({len(runs)} runs, {len(batches)} batches)"
         self.status_label.setText(status)
 
@@ -17314,6 +23648,95 @@ WantedBy=default.target
             return "—"
 
     @staticmethod
+    def _deployment_status_counts(frame: pd.DataFrame) -> dict[str, int]:
+        if frame is None or frame.empty or "status" not in frame.columns:
+            return {key: 0 for key in ("draft", "armed", "live", "paused", "stopped", "error")}
+        statuses = frame["status"].fillna("draft").astype(str).str.strip().str.lower()
+        statuses = statuses.where(statuses.ne(""), "draft")
+        return {
+            key: int(statuses.eq(key).sum())
+            for key in ("draft", "armed", "live", "paused", "stopped", "error")
+        }
+
+    @staticmethod
+    def _equity_curve_series_from_points(points) -> pd.Series:
+        rows: list[tuple[pd.Timestamp, float]] = []
+        for point in list(points or []):
+            if not isinstance(point, dict):
+                continue
+            raw_ts = (
+                point.get("ts")
+                or point.get("updated_ts")
+                or point.get("timestamp")
+                or point.get("timestamp_utc")
+                or point.get("time")
+            )
+            raw_equity = point.get("equity")
+            if raw_equity is None:
+                raw_equity = point.get("value")
+            try:
+                equity = float(raw_equity)
+            except Exception:
+                continue
+            if not np.isfinite(equity):
+                continue
+            numeric_ts: float | None = None
+            try:
+                numeric_ts = float(raw_ts)
+            except Exception:
+                numeric_ts = None
+            if numeric_ts is not None and np.isfinite(numeric_ts):
+                if numeric_ts > 1_000_000_000_000_000:
+                    timestamp = pd.to_datetime(int(numeric_ts), unit="ns", utc=True, errors="coerce")
+                elif numeric_ts > 1_000_000_000_000:
+                    timestamp = pd.to_datetime(numeric_ts, unit="ms", utc=True, errors="coerce")
+                else:
+                    timestamp = pd.to_datetime(numeric_ts, unit="s", utc=True, errors="coerce")
+            else:
+                timestamp = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+            if pd.isna(timestamp):
+                continue
+            rows.append((pd.Timestamp(timestamp).tz_convert("UTC"), equity))
+        if not rows:
+            return pd.Series(dtype=float, name="equity")
+        frame = pd.DataFrame(rows, columns=["timestamp", "equity"]).drop_duplicates("timestamp", keep="last")
+        frame = frame.sort_values("timestamp")
+        return pd.Series(frame["equity"].to_numpy(dtype=float), index=pd.DatetimeIndex(frame["timestamp"]), name="equity")
+
+    def _draw_live_monitor_equity_curve(self, equity_curve: pd.Series) -> None:
+        if not hasattr(self, "live_monitor_equity_figure"):
+            return
+        self.live_monitor_equity_figure.clear()
+        ax = self.live_monitor_equity_figure.add_subplot(111)
+        ax.set_facecolor(PALETTE["panel2"])
+        for spine in ax.spines.values():
+            spine.set_color(PALETTE["grid"])
+        ax.tick_params(colors=PALETTE["muted"], labelsize=8)
+        ax.grid(True, color=PALETTE["grid"], alpha=0.35)
+        series = pd.to_numeric(equity_curve, errors="coerce").dropna() if equity_curve is not None else pd.Series(dtype=float)
+        if series.empty:
+            ax.text(
+                0.5,
+                0.5,
+                "No external equity curve",
+                color=PALETTE["muted"],
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+        else:
+            if series.index.tz is None:
+                display_index = series.index.tz_localize("UTC").tz_convert("America/New_York")
+            else:
+                display_index = series.index.tz_convert("America/New_York")
+            ax.plot(display_index, series.to_numpy(dtype=float), color=PALETTE["blue"], linewidth=1.5)
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: f"${value:,.0f}"))
+            self.live_monitor_equity_figure.autofmt_xdate(rotation=0, ha="center")
+        self.live_monitor_equity_figure.tight_layout(pad=1.0)
+        self.live_monitor_equity_canvas.draw_idle()
+
+    @staticmethod
     def _deployment_construction_config_from_batch_params(params: dict) -> dict:
         return {
             "allocation_ownership": str(params.get("_portfolio_allocation_ownership", ALLOCATION_OWNERSHIP_STRATEGY)),
@@ -17328,6 +23751,210 @@ WantedBy=default.target
             "rebalance_every_n_bars": int(params.get("_portfolio_rebalance_every_n_bars", 20) or 20),
             "rebalance_weight_drift_threshold": float(params.get("_portfolio_rebalance_drift_threshold", 0.05) or 0.05),
         }
+
+    @staticmethod
+    def _deployment_execution_config_payload(raw: object) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        payload = dict(raw)
+        if "min_position_shares" not in payload and "min_shares" in payload:
+            payload["min_position_shares"] = payload.get("min_shares")
+        if not DEPLOYMENT_EXECUTION_CONFIG_KEYS.intersection(payload):
+            return {}
+        return _backtest_sizing_kwargs(payload)
+
+    @staticmethod
+    def _deployment_execution_config_from_batch_params(params: dict) -> dict:
+        if not isinstance(params, dict):
+            return {}
+        direct = DashboardWindow._deployment_execution_config_payload(params.get("_execution_config"))
+        if direct:
+            return direct
+        legacy = {}
+        for key in DEPLOYMENT_EXECUTION_CONFIG_KEYS:
+            legacy_key = f"_{key}"
+            if legacy_key in params:
+                legacy[key] = params.get(legacy_key)
+        return DashboardWindow._deployment_execution_config_payload(legacy)
+
+    @staticmethod
+    def _deployment_execution_config_summary(execution_config: dict | None) -> str:
+        config = DashboardWindow._deployment_execution_config_payload(execution_config)
+        if not config:
+            return "No execution sizing config was captured with this source."
+        model = normalize_position_sizing_model(config.get("position_sizing_model"))
+        margin = bool(config.get("margin_enabled", False))
+        max_lev = float(config.get("max_gross_leverage", 1.0) or 1.0)
+        max_vol_mult = float(config.get("max_volatility_multiplier", 2.0) or 2.0)
+        window = int(config.get("annual_vol_window", 252) or 252)
+        min_periods = int(config.get("annual_vol_min_periods", 20) or 20)
+        floor = float(config.get("annual_vol_floor", 0.05) or 0.05)
+        min_shares = float(config.get("min_position_shares", 0.0) or 0.0)
+        return (
+            f"model={model}; margin={'on' if margin else 'off'}; max_lev={max_lev:g}; "
+            f"max_vol_mult={max_vol_mult:g}; vol_window={window}; vol_min={min_periods}; "
+            f"vol_floor={floor:g}; min_shares={min_shares:g}"
+        )
+
+    def _current_live_deployment_execution_config(self) -> dict:
+        return _backtest_sizing_kwargs(self._collect_backtest_settings())
+
+    def _deployment_sizing_payload(
+        self,
+        qty_type: str,
+        qty_value: float,
+        *,
+        execution_config: dict | None = None,
+    ) -> dict:
+        resolved_config = self._deployment_execution_config_payload(execution_config)
+        if not resolved_config:
+            resolved_config = self._current_live_deployment_execution_config()
+        payload = {
+            "qty_type": str(qty_type or "fixed"),
+            "qty_value": float(qty_value),
+            "execution_config": resolved_config,
+        }
+        min_shares = float(resolved_config.get("min_position_shares", 0.0) or 0.0)
+        if min_shares > 0.0:
+            payload["min_shares"] = min_shares
+        return payload
+
+    def _resolved_live_deployment_sizing_payload(self, deployment_row: dict) -> tuple[dict, str]:
+        sizing = self._decode_json_dict(deployment_row.get("sizing_json"))
+        direct = self._deployment_execution_config_payload(sizing.get("execution_config"))
+        if direct:
+            sizing["execution_config"] = direct
+            if "min_shares" not in sizing:
+                sizing["min_shares"] = float(direct.get("min_position_shares", 0.0) or 0.0)
+            return sizing, "deployment"
+
+        params_payload = self._decode_json_dict(deployment_row.get("params_json"))
+        params_config = self._deployment_execution_config_payload(params_payload.get("execution_config"))
+        if params_config:
+            sizing["execution_config"] = params_config
+            sizing.setdefault("min_shares", float(params_config.get("min_position_shares", 0.0) or 0.0))
+            return sizing, "params"
+
+        structure_payload = self._decode_json_dict(deployment_row.get("structure_json"))
+        structure_config = self._deployment_execution_config_payload(structure_payload.get("execution_config"))
+        if structure_config:
+            sizing["execution_config"] = structure_config
+            sizing.setdefault("min_shares", float(structure_config.get("min_position_shares", 0.0) or 0.0))
+            return sizing, "structure"
+
+        validation_refs = self._decode_json_dict(deployment_row.get("validation_refs_json"))
+        batch_candidates = [
+            str(validation_refs.get("batch_id") or ""),
+            str(validation_refs.get("study_id") or ""),
+            str(deployment_row.get("source_id") or ""),
+        ]
+        for batch_id in batch_candidates:
+            if not batch_id:
+                continue
+            batch = ResultCatalog(self.catalog.db_path).fetch_batch(batch_id)
+            if batch is None:
+                continue
+            batch_config = self._deployment_execution_config_from_batch_params(dict(batch.params or {}))
+            if batch_config:
+                sizing["execution_config"] = batch_config
+                sizing.setdefault("min_shares", float(batch_config.get("min_position_shares", 0.0) or 0.0))
+                return sizing, "source_batch"
+
+        fallback = self._current_live_deployment_execution_config()
+        sizing["execution_config"] = fallback
+        sizing.setdefault("min_shares", float(fallback.get("min_position_shares", 0.0) or 0.0))
+        return sizing, "dashboard_backtest_settings"
+
+    @staticmethod
+    def _deployment_sizing_config_summary(sizing: dict, execution_config: dict | None = None) -> str:
+        payload = dict(sizing or {})
+        config = DashboardWindow._deployment_execution_config_payload(execution_config or payload.get("execution_config"))
+        qty_type = str(payload.get("qty_type") or "—")
+        try:
+            qty_value = float(payload.get("qty_value"))
+            qty_text = f"{qty_value:g}"
+        except Exception:
+            qty_text = "—"
+        model = normalize_position_sizing_model(config.get("position_sizing_model")) if config else "none"
+        margin = bool(config.get("margin_enabled", False)) if config else False
+        max_lev = float(config.get("max_gross_leverage", 1.0) or 1.0) if config else 1.0
+        max_vol_mult = float(config.get("max_volatility_multiplier", 2.0) or 2.0) if config else 2.0
+        window = int(config.get("annual_vol_window", 252) or 252) if config else 252
+        min_periods = int(config.get("annual_vol_min_periods", 20) or 20) if config else 20
+        floor = float(config.get("annual_vol_floor", 0.05) or 0.05) if config else 0.05
+        return (
+            f"{qty_type} {qty_text}; model={model}; margin={'on' if margin else 'off'}; "
+            f"max_lev={max_lev:g}; max_vol_mult={max_vol_mult:g}; "
+            f"vol_window={window}; vol_min={min_periods}; vol_floor={floor:g}"
+        )
+
+    @staticmethod
+    def _duckdb_interval_for_chart_timeframe(timeframe: str) -> str:
+        normalized = normalize_chart_timeframe(timeframe)
+        try:
+            if normalized.endswith("m"):
+                value = max(1, int(normalized[:-1] or "1"))
+                unit = "minute" if value == 1 else "minutes"
+                return f"{value} {unit}"
+            if normalized.endswith("h"):
+                value = max(1, int(normalized[:-1] or "1"))
+                unit = "hour" if value == 1 else "hours"
+                return f"{value} {unit}"
+            if normalized.endswith("d"):
+                value = max(1, int(normalized[:-1] or "1"))
+                unit = "day" if value == 1 else "days"
+                return f"{value} {unit}"
+        except Exception:
+            pass
+        return "1 minute"
+
+    @staticmethod
+    def _live_deployment_strategy_warmup_days(params: dict, timeframe: str) -> int:
+        if not isinstance(params, dict):
+            return 5
+        bars_per_day = 1.0
+        normalized = normalize_chart_timeframe(timeframe)
+        try:
+            if normalized.endswith("m"):
+                minutes = max(1, int(normalized[:-1] or "1"))
+                bars_per_day = max(1.0, (6.5 * 60.0) / float(minutes))
+            elif normalized.endswith("h"):
+                hours = max(1, int(normalized[:-1] or "1"))
+                bars_per_day = max(1.0, 6.5 / float(hours))
+        except Exception:
+            bars_per_day = 1.0
+        warmup_bars = 0
+        hints = ("lookback", "window", "period", "length", "len", "slow", "fast")
+        for key, value in params.items():
+            name = str(key or "").strip().lower()
+            if not name or not any(token in name for token in hints):
+                continue
+            try:
+                parsed = int(float(value))
+            except Exception:
+                continue
+            if 0 < parsed <= 10_000:
+                warmup_bars = max(warmup_bars, parsed)
+        if warmup_bars <= 0:
+            return 5
+        return max(5, int(np.ceil(warmup_bars / max(bars_per_day, 1.0))) + 5)
+
+    @staticmethod
+    def _live_deployment_history_lookback_days(context: dict) -> int:
+        sizing = dict(context.get("sizing") or {})
+        execution_config = DashboardWindow._deployment_execution_config_payload(sizing.get("execution_config"))
+        params = dict(context.get("params") or {})
+        timeframe = normalize_chart_timeframe(str(context.get("timeframe") or LIVE_BAR_TIMEFRAME))
+        strategy_days = DashboardWindow._live_deployment_strategy_warmup_days(params, timeframe)
+        required = strategy_days
+        model = normalize_position_sizing_model(execution_config.get("position_sizing_model"))
+        if model == POSITION_SIZING_ANNUAL_VOLATILITY:
+            window_days = max(
+                int(execution_config.get("annual_vol_window", 252) or 252),
+                int(execution_config.get("annual_vol_min_periods", 20) or 20),
+            )
+            required = max(required, int(np.ceil(window_days * 1.6)) + 7)
+        return max(5, required)
 
     @staticmethod
     def _dataset_ids_from_strategy_blocks(strategy_blocks: Sequence[dict]) -> list[str]:
@@ -17465,6 +24092,17 @@ WantedBy=default.target
                 source_label = "Fixed Portfolio Definition"
             elif is_portfolio_study:
                 source_label = "Portfolio Study"
+            execution_config = self._deployment_execution_config_from_batch_params(batch_params)
+            execution_config_source = "source_batch" if execution_config else ""
+            if not execution_config:
+                execution_config = self._deployment_execution_config_payload(params_payload.get("execution_config"))
+                execution_config_source = "candidate_params" if execution_config else ""
+            if not execution_config:
+                execution_config = self._deployment_execution_config_payload(structure_payload.get("execution_config"))
+                execution_config_source = "candidate_structure" if execution_config else ""
+            if not execution_config:
+                execution_config_source = "not_captured"
+            source_batch_summary = self._deployment_source_batch_summary(batch_id, batch_row, batch_params, execution_config)
 
             rows.append(
                 {
@@ -17480,6 +24118,10 @@ WantedBy=default.target
                     "notes": str(candidate_row.get("notes", "") or ""),
                     "params_json": str(candidate_row.get("params_json", "") or "{}"),
                     "structure_json": json.dumps(structure_payload or {}, sort_keys=True),
+                    "execution_config": execution_config,
+                    "execution_config_source": execution_config_source,
+                    "source_batch_summary": source_batch_summary,
+                    "source_batch_params_json": json.dumps(batch_params or {}, sort_keys=True),
                     "validation_refs_json": json.dumps(
                         {
                             "candidate_id": str(candidate_row.get("candidate_id", "") or ""),
@@ -17495,6 +24137,38 @@ WantedBy=default.target
             )
         rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
         return rows
+
+    def _deployment_source_batch_summary(
+        self,
+        batch_id: str,
+        batch_row: BatchRow | None,
+        batch_params: dict,
+        execution_config: dict,
+    ) -> str:
+        if not batch_id:
+            return "No source batch was linked to this candidate."
+        lines = [f"Batch ID: {batch_id}"]
+        if batch_row is not None:
+            lines.extend(
+                [
+                    f"Batch Strategy: {batch_row.strategy or '—'}",
+                    f"Batch Dataset: {batch_row.dataset_id or '—'}",
+                    f"Batch Timeframes: {batch_row.timeframes or '—'}",
+                    f"Batch Horizons: {batch_row.horizons or '—'}",
+                    f"Batch Status: {batch_row.status or '—'}",
+                ]
+            )
+        lines.append(f"Execution Sizing: {self._deployment_execution_config_summary(execution_config)}")
+        strategy_param_keys = [
+            str(key)
+            for key in sorted((batch_params or {}).keys())
+            if str(key) and not str(key).startswith("_")
+        ]
+        if strategy_param_keys:
+            lines.append("Strategy Param Grid: " + ", ".join(strategy_param_keys))
+        if not execution_config:
+            lines.append("Deployment creation will fall back to the current dashboard backtest sizing settings unless you update the source.")
+        return "\n".join(lines)
 
     def _selected_deployment_candidate_source(self) -> dict | None:
         if not hasattr(self, "deployment_candidate_table"):
@@ -17516,6 +24190,15 @@ WantedBy=default.target
         if not selected:
             self.deployment_candidate_details.clear()
             return
+        params_payload = self._decode_json_dict(selected.get("params_json"))
+        execution_config = self._deployment_execution_config_payload(selected.get("execution_config"))
+        execution_source = str(selected.get("execution_config_source") or "")
+        execution_source_label = {
+            "source_batch": "source batch",
+            "candidate_params": "candidate params",
+            "candidate_structure": "candidate structure",
+            "not_captured": "not captured",
+        }.get(execution_source, execution_source or "not captured")
         notes = [
             f"Kind: {self._deployment_kind_label(str(selected.get('deployment_kind', '') or ''))}",
             f"Strategy: {selected.get('strategy', '') or '—'}",
@@ -17523,6 +24206,16 @@ WantedBy=default.target
             f"Timeframe: {selected.get('timeframe', '') or '—'}",
             f"Source: {selected.get('source_label', '') or '—'}",
             f"Candidate ID: {selected.get('candidate_id', '') or '—'}",
+            f"Study ID: {selected.get('study_id', '') or '—'}",
+            f"Batch ID: {selected.get('batch_id', '') or '—'}",
+            f"Execution Config Source: {execution_source_label}",
+            f"Execution Sizing: {self._deployment_execution_config_summary(execution_config)}",
+            "",
+            "Candidate Params:",
+            json.dumps(params_payload, indent=2, sort_keys=True) if params_payload else "{}",
+            "",
+            "Source Batch Settings:",
+            str(selected.get("source_batch_summary") or "No source batch settings were found."),
             "",
             str(selected.get("notes", "") or "No candidate notes."),
         ]
@@ -17565,10 +24258,10 @@ WantedBy=default.target
         target_id = str(self.manual_deployment_target_combo.currentData() or "")
         if not target_id:
             raise ValueError("Choose a deployment target first.")
-        sizing_payload = {
-            "qty_type": str(self.manual_deployment_sizing_type_combo.currentData() or "fixed"),
-            "qty_value": float(self.manual_deployment_sizing_value_spin.value()),
-        }
+        sizing_payload = self._deployment_sizing_payload(
+            str(self.manual_deployment_sizing_type_combo.currentData() or "fixed"),
+            float(self.manual_deployment_sizing_value_spin.value()),
+        )
         if kind != "single_strategy" and dataset_scope and "portfolio_dataset_ids" not in structure_payload:
             structure_payload["portfolio_dataset_ids"] = list(dataset_scope)
         return {
@@ -17672,10 +24365,11 @@ WantedBy=default.target
             structure_json=self._decode_json_dict(selected.get("structure_json")),
             validation_refs_json=self._decode_json_dict(selected.get("validation_refs_json")),
             target_id=target_id,
-            sizing_json={
-                "qty_type": str(self.deployment_candidate_sizing_type_combo.currentData() or "fixed"),
-                "qty_value": float(self.deployment_candidate_sizing_value_spin.value()),
-            },
+            sizing_json=self._deployment_sizing_payload(
+                str(self.deployment_candidate_sizing_type_combo.currentData() or "fixed"),
+                float(self.deployment_candidate_sizing_value_spin.value()),
+                execution_config=selected.get("execution_config"),
+            ),
             notes=str(selected.get("notes", "")),
         )
 
@@ -17700,6 +24394,9 @@ WantedBy=default.target
     ) -> None:
         target_row = self._deployment_targets_by_id().get(str(target_id), {})
         mode = str(target_row.get("mode", "") or "")
+        parent_dataset_id = dataset_ids[0] if len(dataset_ids) == 1 else ""
+        parent_symbol_source = str(symbol or parent_dataset_id or "").strip()
+        parent_symbol = self._symbol_from_dataset_id(parent_symbol_source) if parent_symbol_source else ""
         parent_id = self.catalog.save_deployment(
             deployment_kind=str(deployment_kind),
             source_type=str(source_type),
@@ -17707,8 +24404,8 @@ WantedBy=default.target
             candidate_id=str(candidate_id or ""),
             strategy=str(strategy),
             strategy_version=str(strategy_version or ""),
-            dataset_id=dataset_ids[0] if len(dataset_ids) == 1 else "",
-            symbol=str(symbol or ""),
+            dataset_id=parent_dataset_id,
+            symbol=parent_symbol,
             timeframe=str(timeframe or ""),
             params_json=params_json or {},
             structure_json=structure_json or {},
@@ -17734,6 +24431,7 @@ WantedBy=default.target
                             if str(asset.get("dataset_id") or "").strip()
                         ]
                     for dataset_id in block_dataset_ids:
+                        child_symbol = self._symbol_from_dataset_id(dataset_id) or dataset_id
                         child_id = self.catalog.save_deployment(
                             parent_deployment_id=parent_id,
                             deployment_kind="single_strategy",
@@ -17743,7 +24441,7 @@ WantedBy=default.target
                             strategy=block_strategy,
                             strategy_version=str(strategy_version or ""),
                             dataset_id=dataset_id,
-                            symbol=dataset_id,
+                            symbol=child_symbol,
                             timeframe=str(timeframe or ""),
                             params_json=block_params,
                             structure_json={},
@@ -17759,12 +24457,13 @@ WantedBy=default.target
                             child_deployment_id=child_id,
                             child_role="strategy_block_asset",
                             dataset_id=dataset_id,
-                            symbol=dataset_id,
+                            symbol=child_symbol,
                             strategy_block_id=block_id,
                         )
             else:
                 portfolio_dataset_ids = [str(item) for item in list(structure_json.get("portfolio_dataset_ids") or dataset_ids) if str(item).strip()]
                 for dataset_id in portfolio_dataset_ids:
+                    child_symbol = self._symbol_from_dataset_id(dataset_id) or dataset_id
                     child_id = self.catalog.save_deployment(
                         parent_deployment_id=parent_id,
                         deployment_kind="single_strategy",
@@ -17774,7 +24473,7 @@ WantedBy=default.target
                         strategy=str(strategy),
                         strategy_version=str(strategy_version or ""),
                         dataset_id=dataset_id,
-                        symbol=dataset_id,
+                        symbol=child_symbol,
                         timeframe=str(timeframe or ""),
                         params_json=params_json or {},
                         structure_json={},
@@ -17790,11 +24489,15 @@ WantedBy=default.target
                         child_deployment_id=child_id,
                         child_role="asset_leg",
                         dataset_id=dataset_id,
-                        symbol=dataset_id,
+                        symbol=child_symbol,
                         strategy_block_id="",
                     )
         self.refresh(refresh_heatmap=False)
         self.status_label.setText(f"Deployment draft {parent_id[:10]} created.")
+
+    def _on_candidate_catalog_changed(self) -> None:
+        self._update_deployment_panel()
+        self._update_live_monitor_panel()
 
     def _update_deployment_panel(self) -> None:
         if not hasattr(self, "deployment_candidate_table") or not hasattr(self, "deployment_table"):
@@ -17875,11 +24578,13 @@ WantedBy=default.target
                     self.deployment_table.setItem(row_idx, col_idx, item)
             if self.deployment_table.rowCount() > 0 and not self.deployment_table.selectedItems():
                 self.deployment_table.selectRow(0)
-            live_count = int(parent_deployments["status"].fillna("").astype(str).eq("live").sum())
-            paused_count = int(parent_deployments["status"].fillna("").astype(str).eq("paused").sum())
+            status_counts = self._deployment_status_counts(parent_deployments)
             portfolio_count = int(parent_deployments["deployment_kind"].fillna("").astype(str).str.startswith("portfolio_").sum())
             self.deployment_table_summary_label.setText(
-                f"Deployments: {len(parent_deployments)} | Portfolio: {portfolio_count} | Live: {live_count} | Paused: {paused_count}"
+                f"Deployments: {len(parent_deployments)} | Portfolio: {portfolio_count} | "
+                f"Draft: {status_counts['draft']} | Armed: {status_counts['armed']} | "
+                f"Live: {status_counts['live']} | Paused: {status_counts['paused']} | "
+                f"Stopped: {status_counts['stopped']} | Error: {status_counts['error']}"
             )
             latest = parent_deployments.iloc[0]
             self.deployment_summary_label.setText(
@@ -17925,6 +24630,9 @@ WantedBy=default.target
         if not selected:
             self.deployment_details.clear()
             return
+        sizing = self._decode_json_dict(selected.get("sizing_json"))
+        sizing_config = self._deployment_execution_config_payload(sizing.get("execution_config"))
+        sizing_line = self._deployment_sizing_config_summary(sizing, sizing_config)
         metric_match = self.deployment_metric_snapshots_frame.loc[
             self.deployment_metric_snapshots_frame["deployment_id"].fillna("").astype(str)
             == str(selected.get("deployment_id", "") or "")
@@ -17946,6 +24654,9 @@ WantedBy=default.target
             f"Target: {target_row.get('name', '') or selected.get('target_id', '') or '—'}",
             f"Mode: {selected.get('mode', '') or '—'}",
             f"Status: {selected.get('status', '') or 'draft'}",
+            f"Status Reason: {selected.get('status_reason', '') or '—'}",
+            f"Last Signal: {selected.get('last_signal_at', '') or '—'}",
+            f"Sizing: {sizing_line}",
             f"Child legs: {len(child_links)}",
             f"Last Sync: {selected.get('last_sync_at', '') or metric_row.get('snapshot_ts') or '—'}",
             f"Open PnL: {self._deployment_fmt_money(metric_row.get('open_pnl'))}",
@@ -17953,6 +24664,7 @@ WantedBy=default.target
             f"Problem Orders: {int(health.get('problem_orders', 0) or 0)}",
             f"Open Positions: {len(matched_positions)}",
             f"Account Equity: {self._deployment_fmt_money(account.get('equity'))}",
+            f"Buying Power: {self._deployment_fmt_money(account.get('buying_power'))}",
             "",
             f"Notes: {selected.get('notes', '') or 'None'}",
         ]
@@ -17969,20 +24681,58 @@ WantedBy=default.target
         if not selected:
             QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
             return
-        timestamp = pd.Timestamp.utcnow().isoformat()
-        update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
         if status == "armed":
-            update_kwargs["armed_at"] = timestamp
-        elif status == "stopped":
+            ok, message = self._activate_live_deployment(selected)
+            self.refresh(refresh_heatmap=False)
+            if not ok:
+                QtWidgets.QMessageBox.warning(self, "Live Deployment", message)
+            self.status_label.setText(message)
+            return
+        timestamp = pd.Timestamp.now(tz='UTC').isoformat()
+        update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
+        if status in {"paused", "stopped"}:
+            self._deactivate_live_deployment(str(selected.get("deployment_id", "") or ""))
+        if status == "stopped":
             update_kwargs["stopped_at"] = timestamp
-        self.catalog.update_deployment_status(str(selected.get("deployment_id", "")), **update_kwargs)
-        related_children = self.deployment_child_links_frame.loc[
-            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == str(selected.get("deployment_id", "") or "")
-        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
-        for _, row in related_children.iterrows():
-            self.catalog.update_deployment_status(str(row.get("child_deployment_id", "") or ""), **update_kwargs)
+        self._update_deployment_status_tree(str(selected.get("deployment_id", "")), **update_kwargs)
         self.refresh(refresh_heatmap=False)
         self.status_label.setText(f"Deployment status updated to {status}.")
+
+    def _delete_selected_deployment(self) -> None:
+        selected = self._selected_deployment_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        deployment_id = str(selected.get("deployment_id", "") or "")
+        if not deployment_id:
+            return
+        child_links = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == deployment_id
+        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
+        child_count = len(child_links)
+        message = (
+            f"Delete deployment {deployment_id[:10]}?"
+            if child_count == 0
+            else f"Delete deployment {deployment_id[:10]} and {child_count} child leg{'s' if child_count != 1 else ''}?"
+        )
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Deployment",
+            message + "\n\nThis removes the deployment records, child links, and saved monitor snapshots from this dashboard database.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._close_live_monitor_charts(silent=True)
+            self._deactivate_live_deployment(deployment_id)
+            deleted = self.catalog.delete_deployment(deployment_id)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Delete Deployment", f"Unable to delete deployment: {exc}")
+            return
+        self.refresh(refresh_heatmap=False)
+        self.status_label.setText(f"Deleted {deleted} deployment record{'s' if deleted != 1 else ''}.")
 
     def _deployment_dashboard_url(self, deployment_row: dict) -> str:
         target_row = self._deployment_targets_by_id().get(str(deployment_row.get("target_id", "") or ""), {})
@@ -18044,8 +24794,9 @@ WantedBy=default.target
         for _, row in datasets.iterrows():
             dataset_id = str(row.get("dataset_id") or "").strip()
             symbol = str(row.get("symbol") or "").strip().upper()
-            if dataset_id and symbol and dataset_id not in mapping:
-                mapping[dataset_id] = symbol
+            if dataset_id and symbol:
+                for key in {dataset_id, dataset_id.upper(), dataset_id.lower()}:
+                    mapping.setdefault(key, symbol)
         return mapping
 
     def _symbol_from_dataset_id(self, dataset_id: str) -> str:
@@ -18055,16 +24806,13 @@ WantedBy=default.target
         mapped = self._dataset_symbol_map().get(dataset_id, "")
         if mapped:
             return mapped
-        parts = [part.strip() for part in dataset_id.split(":") if part.strip()]
-        if len(parts) >= 2:
-            return parts[1].upper()
-        return dataset_id.upper()
+        return _market_symbol_from_dataset_id(dataset_id)
 
     def _deployment_symbol_scope(self, deployment_row: dict) -> set[str]:
         symbols: set[str] = set()
-        direct_symbol = str(deployment_row.get("symbol", "") or "").strip().upper()
+        direct_symbol = str(deployment_row.get("symbol", "") or "").strip()
         if direct_symbol:
-            symbols.add(direct_symbol)
+            symbols.add(self._symbol_from_dataset_id(direct_symbol))
         dataset_id = str(deployment_row.get("dataset_id", "") or "").strip()
         if dataset_id:
             resolved = self._symbol_from_dataset_id(dataset_id)
@@ -18088,7 +24836,7 @@ WantedBy=default.target
             for _, row in child_rows.iterrows():
                 symbol = str(row.get("symbol") or "").strip().upper()
                 if symbol:
-                    symbols.add(symbol)
+                    symbols.add(self._symbol_from_dataset_id(symbol))
                 scoped_dataset = str(row.get("dataset_id") or "").strip()
                 if scoped_dataset:
                     resolved = self._symbol_from_dataset_id(scoped_dataset)
@@ -18151,53 +24899,1127 @@ WantedBy=default.target
                 if self._table_exists(conn, "fills")
                 else []
             )
+            recent_trades = (
+                [dict(row) for row in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 1000").fetchall()]
+                if self._table_exists(conn, "trades")
+                else []
+            )
             positions = (
                 [dict(row) for row in conn.execute(f"SELECT * FROM {positions_table} ORDER BY symbol ASC").fetchall()]
                 if self._table_exists(conn, positions_table)
                 else []
             )
             account_row = conn.execute(account_query).fetchone() if ("account" in account_query or self._table_exists(conn, "account_snapshots")) else None
+            curve_rows = (
+                [dict(row) for row in conn.execute("SELECT updated_ts, equity FROM account_snapshots ORDER BY updated_ts ASC, id ASC").fetchall()]
+                if self._table_exists(conn, "account_snapshots")
+                else []
+            )
+        if len(curve_rows) > 1500:
+            stride = max(1, int(np.ceil(len(curve_rows) / 1500)))
+            curve_rows = curve_rows[::stride]
+        equity_curve = [
+            {"ts": int(row.get("updated_ts") or 0), "equity": float(row.get("equity") or 0.0)}
+            for row in curve_rows
+            if row.get("updated_ts") is not None and row.get("equity") is not None
+        ]
+        if not equity_curve and normalized_scope in {"paper"} and account_row is not None:
+            exit_trades = [
+                row
+                for row in sorted(recent_trades, key=lambda item: (int(item.get("ts") or 0), int(item.get("id") or 0)))
+                if str(row.get("action") or "").strip().upper() == "EXIT"
+            ]
+            try:
+                current_equity = float(account_row["equity"])
+            except Exception:
+                current_equity = np.nan
+            if np.isfinite(current_equity):
+                total_realized = sum(float(row.get("pnl") or 0.0) for row in exit_trades)
+                running_equity = current_equity - total_realized
+                for row in exit_trades:
+                    running_equity += float(row.get("pnl") or 0.0)
+                    equity_curve.append({"ts": int(row.get("ts") or 0), "equity": running_equity})
+                if not equity_curve:
+                    equity_curve.append({"ts": int(account_row["updated_ts"] or 0), "equity": current_equity})
         latest_ts = 0
         for row in orders:
             latest_ts = max(latest_ts, int(row.get("updated_ts") or row.get("created_ts") or 0))
         for row in fills:
             latest_ts = max(latest_ts, int(row.get("fill_ts") or 0))
+        for row in recent_trades:
+            latest_ts = max(latest_ts, int(row.get("ts") or row.get("updated_ts") or row.get("created_ts") or 0))
         for row in positions:
             latest_ts = max(latest_ts, int(row.get("updated_ts") or 0))
         if account_row is not None:
             latest_ts = max(latest_ts, int(account_row["updated_ts"] or 0))
+        for point in equity_curve[-1:]:
+            latest_ts = max(latest_ts, int(point.get("ts") or 0))
         snapshot_ts = (
             pd.Timestamp.utcfromtimestamp(int(latest_ts)).isoformat() + "+00:00"
             if latest_ts
-            else pd.Timestamp.utcnow().isoformat()
+            else pd.Timestamp.now(tz='UTC').isoformat()
         )
         return {
             "source": "sqlite",
             "snapshot_ts": snapshot_ts,
             "orders": orders,
             "fills": fills,
+            "recent_trades": recent_trades,
             "positions": positions,
             "account": dict(account_row) if account_row is not None else {},
+            "equity_curve": equity_curve,
         }
 
-    def _read_external_snapshot_from_http(self, target_row: dict) -> dict:
-        base_url = str(target_row.get("base_url") or "").rstrip("/")
-        status_path = str(target_row.get("status_path") or "").strip()
-        if not base_url or not status_path:
-            return {}
-        url = f"{base_url}{status_path if status_path.startswith('/') else '/' + status_path}"
+    @staticmethod
+    def _external_endpoint_url(base_url: str, path: str) -> str:
+        return f"{base_url.rstrip('/')}{path if str(path).startswith('/') else '/' + str(path)}"
+
+    def _read_external_json_url(self, url: str) -> dict:
         try:
             with urllib.request.urlopen(url, timeout=5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except Exception:
             return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _deployment_webhook_url_for_target(target_row: dict) -> str:
+        base_url = str(target_row.get("base_url") or "").strip().rstrip("/")
+        webhook_path = str(target_row.get("webhook_path") or "").strip()
+        if webhook_path.startswith("http://") or webhook_path.startswith("https://"):
+            return webhook_path
+        if not base_url or not webhook_path:
+            return ""
+        return DashboardWindow._external_endpoint_url(base_url, webhook_path)
+
+    def _deployment_secret_value(self, target_row: dict) -> str:
+        saved_secret = str(target_row.get("secret_value") or "").strip()
+        if saved_secret:
+            return saved_secret
+        secret_ref = str(target_row.get("secret_ref") or "").strip()
+        if not secret_ref:
+            return ""
+        direct = os.environ.get(secret_ref, "").strip()
+        if direct:
+            return direct
+        return ""
+
+    @staticmethod
+    def _post_deployment_webhook_payload(url: str, payload: dict) -> dict:
+        data = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                status_code = int(response.getcode() or 0)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {int(exc.code)} from execution engine: {body[:500]}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Unable to reach execution engine webhook: {exc}") from exc
+        try:
+            decoded = json.loads(body) if body.strip() else {}
+        except Exception:
+            decoded = {"raw_response": body}
+        if status_code >= 400:
+            raise RuntimeError(f"HTTP {status_code} from execution engine: {body[:500]}")
+        if isinstance(decoded, dict) and decoded.get("ok") is False:
+            raise RuntimeError(str(decoded.get("error") or decoded.get("message") or decoded))
+        return decoded if isinstance(decoded, dict) else {"response": decoded}
+
+    @staticmethod
+    def _live_deployment_strategy_class(strategy_name: str):
+        mapping = {
+            "SMACrossStrategy": SMACrossStrategy,
+            "ZScoreMeanReversionStrategy": ZScoreMeanReversionStrategy,
+            "InverseTurtleStrategy": InverseTurtleStrategy,
+        }
+        return mapping.get(str(strategy_name or "").strip())
+
+    @staticmethod
+    def _live_deployment_completed_bar_index(
+        bars: pd.DataFrame,
+        current_ts: object,
+        timeframe: str,
+    ) -> int | None:
+        if bars is None or bars.empty:
+            return None
+        ts = pd.to_datetime(current_ts, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        index = pd.DatetimeIndex(bars.index)
+        if index.tz is None:
+            index = index.tz_localize("UTC")
+        else:
+            index = index.tz_convert("UTC")
+        completed_at = index + chart_timeframe_delta(timeframe)
+        eligible = completed_at <= pd.Timestamp(ts).tz_convert("UTC")
+        if not bool(eligible.any()):
+            return None
+        return int(np.flatnonzero(np.asarray(eligible))[-1])
+
+    @staticmethod
+    def _live_record_evaluation_timestamp(record: dict) -> pd.Timestamp | None:
+        if not isinstance(record, dict):
+            return None
+        ts = pd.to_datetime(record.get("ts_utc"), utc=True, errors="coerce")
+        received_at = pd.to_datetime(record.get("received_at"), utc=True, errors="coerce")
+        if pd.isna(ts) and pd.isna(received_at):
+            return None
+        if pd.isna(ts):
+            return pd.Timestamp(received_at).tz_convert("UTC")
+        if pd.isna(received_at):
+            return pd.Timestamp(ts).tz_convert("UTC")
+        ts = pd.Timestamp(ts).tz_convert("UTC")
+        received_at = pd.Timestamp(received_at).tz_convert("UTC")
+        return received_at if received_at > ts else ts
+
+    @staticmethod
+    def _completed_bars_for_chart_timeframe(
+        bars: pd.DataFrame,
+        current_ts: object,
+        timeframe: str,
+    ) -> pd.DataFrame:
+        if bars is None or bars.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        index = DashboardWindow._live_deployment_completed_bar_index(bars, current_ts, timeframe)
+        if index is None:
+            return bars.iloc[0:0].copy()
+        return bars.iloc[: int(index) + 1].copy()
+
+    @staticmethod
+    def _live_deployment_signal_plan(previous_position: float, target_percent: float) -> list[tuple[str, str, float]]:
+        def _sign(value: float) -> int:
+            if value > 1e-9:
+                return 1
+            if value < -1e-9:
+                return -1
+            return 0
+
+        previous_sign = _sign(float(previous_position or 0.0))
+        desired_sign = _sign(float(target_percent or 0.0))
+        if previous_sign == desired_sign:
+            return []
+        if desired_sign == 0:
+            side = "LONG" if previous_sign > 0 else "SHORT"
+            return [("EXIT", side, 0.0)] if previous_sign else []
+        desired_side = "LONG" if desired_sign > 0 else "SHORT"
+        if previous_sign == 0:
+            return [("ENTRY", desired_side, float(desired_sign))]
+        previous_side = "LONG" if previous_sign > 0 else "SHORT"
+        return [("EXIT", previous_side, 0.0), ("ENTRY", desired_side, float(desired_sign))]
+
+    @staticmethod
+    def _deployment_position_qty_from_snapshot(symbol: str, snapshot: dict) -> tuple[float, float]:
+        cleaned = _market_symbol_from_dataset_id(symbol)
+        for position in list((snapshot or {}).get("positions") or []):
+            position_symbol = _market_symbol_from_dataset_id(position.get("symbol") or position.get("product_id"))
+            if position_symbol != cleaned:
+                continue
+            qty = 0.0
+            for key in ("quantity", "qty", "position_qty", "shares", "contracts"):
+                try:
+                    raw_qty = position.get(key)
+                    if raw_qty not in (None, ""):
+                        qty = float(raw_qty)
+                        break
+                except Exception:
+                    continue
+            side_text = str(
+                position.get("side")
+                or position.get("position_side")
+                or position.get("asset_side")
+                or ""
+            ).strip().upper()
+            if side_text == "SHORT" and qty > 0:
+                qty = -qty
+            avg_price = 0.0
+            for key in ("avg_price", "avg_entry_price", "average_price", "cost_basis_unit"):
+                try:
+                    raw_price = position.get(key)
+                    if raw_price not in (None, ""):
+                        avg_price = float(raw_price)
+                        break
+                except Exception:
+                    continue
+            return qty, avg_price
+        return 0.0, 0.0
+
+    @staticmethod
+    def _deployment_account_equity(context: dict) -> float | None:
+        account = dict(context.get("account_snapshot") or {})
+        for key in ("equity", "net_liquidation", "net_liq", "portfolio_value"):
+            try:
+                value = account.get(key)
+                if value not in (None, ""):
+                    parsed = float(value)
+                    if np.isfinite(parsed) and parsed > 0.0:
+                        return parsed
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _deployment_account_buying_power(context: dict) -> float | None:
+        account = dict(context.get("account_snapshot") or {})
+        for key in ("buying_power", "available_funds", "cash", "cash_balance"):
+            try:
+                value = account.get(key)
+                if value not in (None, ""):
+                    parsed = float(value)
+                    if np.isfinite(parsed) and parsed > 0.0:
+                        return parsed
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _deployment_effective_annual_volatility_details(
+        bars: pd.DataFrame | None,
+        timeframe: str,
+        execution_config: dict,
+    ) -> dict:
+        normalized_config = DashboardWindow._deployment_execution_config_payload(execution_config)
+        if not normalized_config and isinstance(execution_config, dict):
+            normalized_config = dict(execution_config)
+        model = normalize_position_sizing_model(execution_config.get("position_sizing_model"))
+        details = {
+            "position_sizing_model": model,
+            "annual_volatility": None,
+            "effective_annual_volatility": None,
+            "volatility_multiplier": 1.0,
+            "raw_volatility_multiplier": 1.0,
+            "max_volatility_multiplier": float(normalized_config.get("max_volatility_multiplier", 2.0) or 2.0),
+            "annual_vol_floor": float(normalized_config.get("annual_vol_floor", 0.05) or 0.05),
+            "volatility_cap_applied": False,
+            "annual_vol_floor_applied": False,
+            "volatility_model_applied": False,
+            "annual_vol_window": int(normalized_config.get("annual_vol_window", 252) or 252),
+            "annual_vol_min_periods": int(normalized_config.get("annual_vol_min_periods", 20) or 20),
+            "annual_vol_observations": 0,
+        }
+        if model != POSITION_SIZING_ANNUAL_VOLATILITY:
+            return details
+        normalized_bars = DashboardWindow._normalize_live_monitor_cached_bars(bars)
+        if normalized_bars.empty:
+            return details
+        config = BacktestConfig(
+            timeframe=normalize_chart_timeframe(timeframe),
+            margin_enabled=bool(normalized_config.get("margin_enabled", False)),
+            max_gross_leverage=float(normalized_config.get("max_gross_leverage", 1.0) or 1.0),
+            position_sizing_model=str(normalized_config.get("position_sizing_model", POSITION_SIZING_ANNUAL_VOLATILITY)),
+            annual_vol_window=int(normalized_config.get("annual_vol_window", 252) or 252),
+            annual_vol_min_periods=int(normalized_config.get("annual_vol_min_periods", 20) or 20),
+            annual_vol_floor=float(normalized_config.get("annual_vol_floor", 0.05) or 0.05),
+            max_volatility_multiplier=float(normalized_config.get("max_volatility_multiplier", 2.0) or 2.0),
+            min_position_shares=float(normalized_config.get("min_position_shares", 1.0) or 1.0),
+        )
+        close = pd.to_numeric(normalized_bars["close"], errors="coerce").astype(float)
+        returns = close.pct_change()
+        window, min_periods, periods_per_year = _annual_vol_rolling_lengths(pd.DatetimeIndex(normalized_bars.index), config)
+        annual_vol = returns.rolling(window=window, min_periods=min_periods).std() * np.sqrt(periods_per_year)
+        clean_vol = annual_vol.replace([np.inf, -np.inf], np.nan).dropna()
+        details.update(
+            {
+                "annual_vol_window_bars": int(window),
+                "annual_vol_min_periods_bars": int(min_periods),
+                "annual_vol_periods_per_year": float(periods_per_year),
+                "annual_vol_observations": int(returns.dropna().shape[0]),
+            }
+        )
+        if clean_vol.empty:
+            return details
+        try:
+            annual_volatility = float(clean_vol.iloc[-1])
+        except Exception:
+            annual_volatility = np.nan
+        if not np.isfinite(annual_volatility) or annual_volatility <= 0.0:
+            return details
+        floor = max(1e-9, float(config.annual_vol_floor or 0.05))
+        adjusted_volatility = max(annual_volatility, floor)
+        raw_multiplier = 1.0 / adjusted_volatility
+        max_multiplier = max(0.0, float(config.max_volatility_multiplier or 2.0))
+        multiplier = min(raw_multiplier, max_multiplier) if max_multiplier > 0.0 else 0.0
+        if not np.isfinite(multiplier) or multiplier <= 0.0:
+            multiplier = 1.0
+        details.update(
+            {
+                "annual_volatility": float(annual_volatility),
+                "effective_annual_volatility": float(1.0 / multiplier) if multiplier > 0.0 else None,
+                "volatility_multiplier": float(multiplier),
+                "raw_volatility_multiplier": float(raw_multiplier),
+                "max_volatility_multiplier": float(max_multiplier),
+                "annual_vol_floor": float(floor),
+                "volatility_cap_applied": bool(raw_multiplier > multiplier + 1e-12),
+                "annual_vol_floor_applied": bool(annual_volatility < floor),
+                "volatility_model_applied": True,
+            }
+        )
+        return details
+
+    @staticmethod
+    def _deployment_effective_annual_volatility(
+        bars: pd.DataFrame | None,
+        timeframe: str,
+        execution_config: dict,
+    ) -> tuple[float | None, float]:
+        details = DashboardWindow._deployment_effective_annual_volatility_details(bars, timeframe, execution_config)
+        annual_vol = details.get("annual_volatility")
+        try:
+            annual_vol_float = float(annual_vol)
+        except Exception:
+            annual_vol_float = np.nan
+        if not np.isfinite(annual_vol_float) or annual_vol_float <= 0.0:
+            annual_vol_float = None
+        return annual_vol_float, float(details.get("volatility_multiplier") or 1.0)
+
+    @staticmethod
+    def _deployment_position_size_override_payload(
+        sizing: dict,
+        context: dict,
+        *,
+        action: str,
+        target_percent: float,
+        mark_price: float,
+        bars: pd.DataFrame | None = None,
+    ) -> dict:
+        sizing_payload = dict(sizing or {})
+        raw_override = sizing_payload.get("position_size_override")
+        override = dict(raw_override) if isinstance(raw_override, dict) else {}
+        qty_type = str(sizing_payload.get("qty_type") or "percent_equity").strip().lower()
+        execution_config = DashboardWindow._deployment_execution_config_payload(sizing_payload.get("execution_config"))
+        execution_model = normalize_position_sizing_model(execution_config.get("position_sizing_model"))
+        try:
+            qty_value = float(sizing_payload.get("qty_value"))
+        except Exception:
+            qty_value = 0.0
+        if not override:
+            override = {"mode": "none"}
+            if str(action or "").upper() == "ENTRY" and qty_value > 0.0:
+                if qty_type in {"cash", "target_notional", "notional", "dollars"}:
+                    override.update(
+                        {
+                            "mode": "target_notional",
+                            "target_notional": qty_value,
+                            "target_qty": None,
+                            "base_target_notional": qty_value,
+                        }
+                    )
+                elif qty_type in {"fixed", "shares", "target_qty", "quantity"}:
+                    override.update(
+                        {
+                            "mode": "target_qty",
+                            "target_qty": qty_value,
+                            "target_notional": qty_value * float(mark_price or 0.0) if mark_price else None,
+                        }
+                    )
+                elif qty_type in {"percent_equity", "percent", "pct_equity"}:
+                    account_equity = DashboardWindow._deployment_account_equity(context)
+                    if account_equity is None or account_equity <= 0.0:
+                        raise ValueError("account equity is required for percent_equity live sizing")
+                    buying_power = DashboardWindow._deployment_account_buying_power(context)
+                    volatility_details = DashboardWindow._deployment_effective_annual_volatility_details(
+                        bars,
+                        str(context.get("timeframe") or LIVE_BAR_TIMEFRAME),
+                        execution_config,
+                    )
+                    annual_vol = volatility_details.get("annual_volatility")
+                    volatility_multiplier = float(volatility_details.get("volatility_multiplier") or 1.0)
+                    deployable_equity = account_equity * (qty_value / 100.0)
+                    base_target_notional = deployable_equity * abs(float(target_percent or 0.0))
+                    gross_cap_multiplier = float(execution_config.get("max_gross_leverage", 1.0) or 1.0)
+                    if not bool(execution_config.get("margin_enabled", False)):
+                        gross_cap_multiplier = 1.0
+                    gross_cap_multiplier = max(1.0, gross_cap_multiplier)
+                    account_notional_cap = account_equity * gross_cap_multiplier
+                    max_deployment_notional = account_notional_cap
+                    if execution_model == POSITION_SIZING_ANNUAL_VOLATILITY:
+                        max_volatility_multiplier = max(
+                            0.0,
+                            float(execution_config.get("max_volatility_multiplier", 2.0) or 2.0),
+                        )
+                        volatility_notional_cap = base_target_notional * max_volatility_multiplier
+                        max_deployment_notional = min(max_deployment_notional, volatility_notional_cap)
+                    if buying_power is not None and buying_power > 0.0 and not bool(execution_config.get("margin_enabled", False)):
+                        max_deployment_notional = min(max_deployment_notional, buying_power)
+                    target_notional = min(base_target_notional * volatility_multiplier, max_deployment_notional)
+                    if not np.isfinite(target_notional) or target_notional <= 0.0:
+                        raise ValueError("percent_equity live sizing resolved to target_notional <= 0")
+                    override.update(
+                        {
+                            "mode": "target_notional",
+                            "target_notional": float(target_notional),
+                            "target_qty": None,
+                            "base_target_notional": float(base_target_notional),
+                            "deployment_slice_equity": float(deployable_equity),
+                            "max_deployment_notional": float(max_deployment_notional),
+                            "volatility_multiplier": float(volatility_multiplier),
+                            "raw_volatility_multiplier": float(volatility_details.get("raw_volatility_multiplier") or volatility_multiplier),
+                            "volatility_multiplier_cap": float(volatility_details.get("max_volatility_multiplier") or 0.0),
+                            "volatility_cap_applied": bool(volatility_details.get("volatility_cap_applied", False)),
+                            "effective_annual_volatility": volatility_details.get("effective_annual_volatility"),
+                            "annual_vol_floor": volatility_details.get("annual_vol_floor"),
+                            "annual_vol_floor_applied": bool(volatility_details.get("annual_vol_floor_applied", False)),
+                            "account_equity": float(account_equity),
+                            "account_buying_power": float(buying_power) if buying_power is not None else None,
+                            "account_notional_cap": float(account_notional_cap),
+                        }
+                    )
+                    if annual_vol is not None and np.isfinite(float(annual_vol)) and float(annual_vol) > 0.0:
+                        override["annual_volatility"] = float(annual_vol)
+                    override["volatility_sizing"] = volatility_details
+        for key in (
+            "deployment_id",
+            "parent_deployment_id",
+            "portfolio_id",
+            "strategy_block_id",
+            "dataset_id",
+            "candidate_id",
+            "source_type",
+            "source_id",
+            "strategy_name",
+            "strategy_version",
+            "timeframe",
+        ):
+            value = context.get(key)
+            if value not in (None, "") and override.get(key) in (None, ""):
+                override[key] = value
+        min_shares_source = None
+        if "min_shares" in sizing_payload:
+            min_shares_source = sizing_payload.get("min_shares")
+        elif "min_position_shares" in sizing_payload:
+            min_shares_source = sizing_payload.get("min_position_shares")
+        if min_shares_source not in (None, "") and override.get("min_shares") in (None, ""):
+            try:
+                min_shares_value = max(0.0, float(min_shares_source or 0.0))
+            except Exception:
+                min_shares_value = 0.0
+            if min_shares_value > 0.0 and str(override.get("mode") or "") == "target_notional":
+                try:
+                    target_notional_for_min = float(override.get("target_notional") or 0.0)
+                    min_share_notional = min_shares_value * float(mark_price or 0.0)
+                except Exception:
+                    target_notional_for_min = 0.0
+                    min_share_notional = 0.0
+                if (
+                    target_notional_for_min > 0.0
+                    and min_share_notional > target_notional_for_min
+                    and np.isfinite(min_share_notional)
+                ):
+                    override["requested_min_shares"] = float(min_shares_value)
+                    override["min_shares_suppressed_by_target_notional"] = True
+                    min_shares_value = 0.0
+            override["min_shares"] = float(min_shares_value)
+        trace = dict(override.get("sizing_trace") or {})
+        trace.update(
+            {
+                "qty_type": qty_type,
+                "qty_value": qty_value,
+                "strategy_target_percent": float(target_percent or 0.0),
+                "mark_price": float(mark_price or 0.0),
+                "execution_config": execution_config,
+                "sizing_config_source": str(context.get("sizing_config_source") or ""),
+            }
+        )
+        for key in (
+            "account_equity",
+            "account_buying_power",
+            "deployment_slice_equity",
+            "base_target_notional",
+            "target_notional",
+            "max_deployment_notional",
+            "annual_volatility",
+            "effective_annual_volatility",
+            "volatility_multiplier",
+            "raw_volatility_multiplier",
+            "volatility_multiplier_cap",
+            "volatility_cap_applied",
+            "annual_vol_floor",
+            "annual_vol_floor_applied",
+            "min_shares",
+            "requested_min_shares",
+            "min_shares_suppressed_by_target_notional",
+        ):
+            if key in override:
+                trace[key] = override.get(key)
+        override["sizing_trace"] = trace
+        return override
+
+    @staticmethod
+    def _deployment_signal_payload(
+        context: dict,
+        *,
+        action: str,
+        side: str,
+        target_percent: float,
+        bar_ts: pd.Timestamp,
+        bar_index: int,
+        price: float,
+        bars: pd.DataFrame | None = None,
+    ) -> dict:
+        timestamp = pd.Timestamp(bar_ts)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        sizing = dict(context.get("sizing") or {})
+        qty_type = str(sizing.get("qty_type") or "percent_equity")
+        try:
+            qty_value = float(sizing.get("qty_value"))
+        except Exception:
+            qty_value = abs(float(target_percent or 0.0)) * 100.0
+        event_id = (
+            f"{context.get('deployment_id')}:{context.get('symbol')}:{context.get('timeframe')}:"
+            f"{str(action).upper()}:{str(side).upper()}:{int(timestamp.value)}"
+        )
+        override = DashboardWindow._deployment_position_size_override_payload(
+            sizing,
+            context,
+            action=str(action).upper(),
+            target_percent=target_percent,
+            mark_price=price,
+            bars=bars,
+        )
+        payload = {
+            "secret": context.get("secret") or "",
+            "symbol": context.get("symbol") or "",
+            "action": str(action).upper(),
+            "side": str(side).upper(),
+            "price": float(price),
+            "time": int(timestamp.timestamp()),
+            "sent_ts": int(pd.Timestamp.now(tz="UTC").timestamp()),
+            "event_id": event_id,
+            "bar_index": int(bar_index),
+            "bar_timestamp_utc": timestamp.isoformat(),
+            "deployment_id": context.get("deployment_id") or "",
+            "parent_deployment_id": context.get("parent_deployment_id") or "",
+            "portfolio_id": context.get("portfolio_id") or "",
+            "candidate_id": context.get("candidate_id") or "",
+            "source_type": context.get("source_type") or "",
+            "source_id": context.get("source_id") or "",
+            "dataset_id": context.get("dataset_id") or "",
+            "strategy_block_id": context.get("strategy_block_id") or "",
+            "strategy_name": context.get("strategy_name") or "",
+            "strategy_version": context.get("strategy_version") or "",
+            "strategy_params": dict(context.get("params") or {}),
+            "timeframe": context.get("timeframe") or "",
+            "qty_type": qty_type,
+            "qty_value": qty_value,
+            "annual_vol": override.get("annual_volatility"),
+            "sizing_authority": "quant_backtest_engine",
+            "position_size_override": override,
+            "sizing_trace": dict(override.get("sizing_trace") or {}),
+            "strategy_target_percent": float(target_percent or 0.0),
+            "dashboard_origin": "quant_backtest_engine.live_deployment_runner",
+        }
+        return payload
+
+    @staticmethod
+    def _deployment_signal_sizing_summary(payload: dict) -> str:
+        override = dict((payload or {}).get("position_size_override") or {})
+        trace = dict(override.get("sizing_trace") or (payload or {}).get("sizing_trace") or {})
+
+        def _float_value(key: str) -> float | None:
+            for source in (override, trace, payload or {}):
+                try:
+                    value = source.get(key)
+                    if value not in (None, ""):
+                        parsed = float(value)
+                        if np.isfinite(parsed):
+                            return parsed
+                except Exception:
+                    continue
+            return None
+
+        def _money(value: float | None) -> str:
+            return "n/a" if value is None else f"${value:,.2f}"
+
+        def _ratio(value: float | None) -> str:
+            return "n/a" if value is None else f"{value:.4f}"
+
+        mode = str(override.get("mode") or "none")
+        source = str(trace.get("sizing_config_source") or "").strip()
+        parts = [
+            f"mode={mode}",
+            f"equity={_money(_float_value('account_equity'))}",
+            f"base={_money(_float_value('base_target_notional'))}",
+            f"annual_vol={_ratio(_float_value('annual_volatility'))}",
+            f"raw_mult={_ratio(_float_value('raw_volatility_multiplier'))}",
+            f"used_mult={_ratio(_float_value('volatility_multiplier'))}",
+            f"final={_money(_float_value('target_notional'))}",
+            f"cap={_money(_float_value('max_deployment_notional'))}",
+        ]
+        if source:
+            parts.append(f"source={source}")
+        if bool(override.get("min_shares_suppressed_by_target_notional")):
+            parts.append("min_shares_suppressed=yes")
+        if bool(override.get("volatility_cap_applied")):
+            parts.append("vol_cap=yes")
+        if bool(override.get("annual_vol_floor_applied")):
+            parts.append("vol_floor=yes")
+        return "Sizing " + ", ".join(parts)
+
+    class _LiveDeploymentSignalBroker:
+        def __init__(self, *, position_qty: float = 0.0, avg_price: float = 0.0) -> None:
+            self.position_qty = float(position_qty or 0.0)
+            self.avg_price = float(avg_price or 0.0)
+            self.target_percent_calls: list[dict] = []
+            self.unsupported_orders: list[str] = []
+
+        def target_percent(
+            self,
+            target: float,
+            mark_price: float,
+            earliest_ts: pd.Timestamp | None = None,
+            order_type: str = "market",
+            limit_price: float | None = None,
+            stop_price: float | None = None,
+            tag: str | None = None,
+        ) -> None:
+            self.target_percent_calls.append(
+                {
+                    "target": float(target),
+                    "mark_price": float(mark_price),
+                    "earliest_ts": earliest_ts,
+                    "order_type": order_type,
+                    "limit_price": limit_price,
+                    "stop_price": stop_price,
+                    "tag": tag,
+                }
+            )
+
+        def cancel_orders(self, tag: str | None = None) -> None:
+            self.unsupported_orders.append(f"cancel_orders:{tag or ''}")
+
+        def buy(self, qty: float, earliest_ts: pd.Timestamp | None = None, tag: str | None = None) -> None:
+            self.unsupported_orders.append("buy")
+
+        def sell(self, qty: float, earliest_ts: pd.Timestamp | None = None, tag: str | None = None) -> None:
+            self.unsupported_orders.append("sell")
+
+        def buy_limit(self, qty: float, limit_price: float, earliest_ts: pd.Timestamp | None = None, tag: str | None = None) -> None:
+            self.unsupported_orders.append("buy_limit")
+
+        def sell_limit(self, qty: float, limit_price: float, earliest_ts: pd.Timestamp | None = None, tag: str | None = None) -> None:
+            self.unsupported_orders.append("sell_limit")
+
+        def buy_stop(self, qty: float, stop_price: float, earliest_ts: pd.Timestamp | None = None, tag: str | None = None) -> None:
+            self.unsupported_orders.append("buy_stop")
+
+        def sell_stop(self, qty: float, stop_price: float, earliest_ts: pd.Timestamp | None = None, tag: str | None = None) -> None:
+            self.unsupported_orders.append("sell_stop")
+
+    def _deployment_child_ids(self, deployment_id: str) -> list[str]:
+        self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
+        if self.deployment_child_links_frame.empty:
+            return []
+        rows = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str)
+            == str(deployment_id or "")
+        ]
+        return [
+            str(value)
+            for value in rows.get("child_deployment_id", pd.Series(dtype=str)).fillna("").tolist()
+            if str(value)
+        ]
+
+    def _update_deployment_status_tree(self, deployment_id: str, **kwargs) -> None:
+        root_id = str(deployment_id or "")
+        if not root_id:
+            return
+        self.catalog.update_deployment_status(root_id, **kwargs)
+        for child_id in self._deployment_child_ids(root_id):
+            self.catalog.update_deployment_status(child_id, **kwargs)
+
+    def _ensure_live_deployment_runner_worker(self) -> LiveDeploymentRunnerWorker:
+        worker = getattr(self, "live_deployment_runner_worker", None)
+        if worker is not None and worker.isRunning():
+            return worker
+        worker = LiveDeploymentRunnerWorker(
+            store_path=self.live_market_store.db_path,
+            catalog_db_path=self.catalog.db_path,
+            parent=self,
+        )
+        worker.status_signal.connect(lambda message: self.status_label.setText(message))
+        worker.error_signal.connect(lambda message: self.status_label.setText(message))
+        worker.refresh_signal.connect(self._refresh_live_deployment_runner_state)
+        worker.sync_signal.connect(self._schedule_external_deployment_state_sync)
+        worker.context_error_signal.connect(self._on_live_deployment_runner_context_error)
+        worker.signal_marker_signal.connect(self._on_live_deployment_signal_marker)
+        worker.finished.connect(worker.deleteLater)
+        self.live_deployment_runner_worker = worker
+        worker.start()
+        return worker
+
+    def _refresh_live_deployment_runner_state(self) -> None:
+        self.deployments_frame = self.catalog.load_deployments()
+        self.deployment_metric_snapshots_frame = self.catalog.load_latest_deployment_metric_snapshots()
+        self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
+        self._update_deployment_panel()
+        self._update_live_monitor_panel()
+
+    def _schedule_external_deployment_state_sync(self) -> None:
+        timer = getattr(self, "_external_deployment_sync_timer", None)
+        if timer is not None:
+            timer.start(2500)
+
+    def _run_scheduled_external_deployment_sync(self) -> None:
+        try:
+            self._sync_external_deployment_state(show_dialogs=False)
+        except Exception as exc:
+            self.status_label.setText(f"Post-trade external state sync failed: {exc}")
+
+    def _on_live_deployment_runner_context_error(self, context_id: str) -> None:
+        self._remove_live_deployment_context(str(context_id or ""), stop_streams=True, notify_runner=False)
+
+    def _live_deployment_activation_rows(self, deployment_row: dict) -> list[dict]:
+        deployment_id = str(deployment_row.get("deployment_id") or "")
+        deployments = self.catalog.load_deployments()
+        self.deployments_frame = deployments
+        self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
+        child_ids = set(self._deployment_child_ids(deployment_id))
+        if child_ids and not deployments.empty:
+            rows = deployments.loc[deployments["deployment_id"].fillna("").astype(str).isin(child_ids)]
+            if not rows.empty:
+                return [row.to_dict() for _, row in rows.iterrows()]
+        return [dict(deployment_row)]
+
+    def _deployment_strategy_block_id_for_child(self, child_deployment_id: str) -> str:
+        if self.deployment_child_links_frame.empty:
+            return ""
+        rows = self.deployment_child_links_frame.loc[
+            self.deployment_child_links_frame["child_deployment_id"].fillna("").astype(str)
+            == str(child_deployment_id or "")
+        ]
+        if rows.empty:
+            return ""
+        return str(rows.iloc[0].get("strategy_block_id") or "")
+
+    def _last_completed_live_deployment_bar_ts_ns(self, symbol: str, timeframe: str) -> int:
+        try:
+            now = pd.Timestamp.now(tz="UTC")
+            rule = chart_timeframe_to_pandas_rule(timeframe)
+            current_bar_start = now.floor(rule)
+            latest_completed_start = current_bar_start - chart_timeframe_delta(timeframe)
+            return int(latest_completed_start.value)
+        except Exception:
+            return 0
+
+    def _build_live_deployment_contexts(
+        self,
+        deployment_row: dict,
+        target_row: dict,
+        webhook_url: str,
+        secret: str,
+        snapshot: dict,
+    ) -> tuple[list[dict], list[str]]:
+        contexts: list[dict] = []
+        failures: list[str] = []
+        parent_id = str(deployment_row.get("deployment_id") or "")
+        account_snapshot = dict(snapshot.get("account") or {})
+        for row in self._live_deployment_activation_rows(deployment_row):
+            deployment_id = str(row.get("deployment_id") or "")
+            symbol_source = str(row.get("symbol") or row.get("dataset_id") or "").strip()
+            symbol = self._symbol_from_dataset_id(symbol_source)
+            if not symbol:
+                failures.append(f"{deployment_id[:10] or 'deployment'}: missing symbol")
+                continue
+            strategy_name = str(row.get("strategy") or "").strip()
+            strategy_cls = self._live_deployment_strategy_class(strategy_name)
+            if strategy_cls is None:
+                failures.append(f"{symbol}: unsupported live strategy {strategy_name or 'unknown'}")
+                continue
+            params = self._decode_json_dict(row.get("params_json"))
+            if strategy_name == "InverseTurtleStrategy" and bool(params.get("use_atr_stop", True)):
+                failures.append(f"{symbol}: InverseTurtleStrategy live ATR stop orders are not supported yet")
+                continue
+            timeframe = normalize_chart_timeframe(str(row.get("timeframe") or LIVE_BAR_TIMEFRAME))
+            position_qty, avg_price = self._deployment_position_qty_from_snapshot(symbol, snapshot)
+            parent_deployment_id = str(row.get("parent_deployment_id") or "")
+            strategy_block_id = self._deployment_strategy_block_id_for_child(deployment_id)
+            context_id = f"{parent_id or deployment_id}:{deployment_id}:{symbol}"
+            sizing_payload, sizing_source = self._resolved_live_deployment_sizing_payload(row)
+            contexts.append(
+                {
+                    "context_id": context_id,
+                    "deployment_id": deployment_id,
+                    "parent_deployment_id": parent_deployment_id,
+                    "portfolio_id": parent_deployment_id or (parent_id if parent_id != deployment_id else ""),
+                    "symbol": symbol,
+                    "dataset_id": str(row.get("dataset_id") or ""),
+                    "strategy_block_id": strategy_block_id,
+                    "strategy_name": strategy_name,
+                    "strategy_version": str(row.get("strategy_version") or ""),
+                    "params": params,
+                    "timeframe": timeframe,
+                    "candidate_id": str(row.get("candidate_id") or ""),
+                    "source_type": str(row.get("source_type") or ""),
+                    "source_id": str(row.get("source_id") or ""),
+                    "target_id": str(row.get("target_id") or deployment_row.get("target_id") or ""),
+                    "target_name": str(target_row.get("name") or ""),
+                    "webhook_url": webhook_url,
+                    "secret": secret,
+                    "sizing": sizing_payload,
+                    "sizing_config_source": sizing_source,
+                    "account_snapshot": dict(account_snapshot),
+                    "position_qty": position_qty,
+                    "avg_price": avg_price,
+                    "last_processed_bar_ts_ns": self._last_completed_live_deployment_bar_ts_ns(symbol, timeframe),
+                    "last_signal_bar_ts_ns": 0,
+                }
+            )
+        return contexts, failures
+
+    def _live_deployment_context_conflicts(self, contexts: Sequence[dict], root_deployment_id: str) -> list[str]:
+        conflicts: list[str] = []
+        seen_new: dict[tuple[str, str], str] = {}
+        root_id = str(root_deployment_id or "")
+        for context in list(contexts or []):
+            key = (str(context.get("target_id") or ""), str(context.get("symbol") or ""))
+            label = str(context.get("deployment_id") or "")[:10]
+            if key in seen_new:
+                conflicts.append(f"{key[1]} on {key[0]} appears in both {seen_new[key]} and {label}")
+            else:
+                seen_new[key] = label
+        for context in list(getattr(self, "live_deployment_execution_contexts", {}).values()):
+            context_root_ids = {
+                str(context.get("deployment_id") or ""),
+                str(context.get("parent_deployment_id") or ""),
+                str(context.get("portfolio_id") or ""),
+            }
+            if root_id in context_root_ids:
+                continue
+            key = (str(context.get("target_id") or ""), str(context.get("symbol") or ""))
+            if key in seen_new:
+                conflicts.append(
+                    f"{key[1]} on {key[0]} is already live in deployment {str(context.get('deployment_id') or '')[:10]}"
+                )
+        return conflicts
+
+    def _remove_live_deployment_context(
+        self,
+        context_id: str,
+        *,
+        stop_streams: bool = True,
+        notify_runner: bool = True,
+    ) -> None:
+        if notify_runner:
+            runner = getattr(self, "live_deployment_runner_worker", None)
+            if runner is not None and runner.isRunning():
+                runner.remove_context(str(context_id or ""))
+        context = self.live_deployment_execution_contexts.pop(str(context_id), None)
+        if not isinstance(context, dict):
+            return
+        symbol = str(context.get("symbol") or "")
+        if symbol:
+            indexed = self.live_deployment_symbol_index.get(symbol)
+            if indexed is not None:
+                indexed.discard(str(context_id))
+                if not indexed:
+                    self.live_deployment_symbol_index.pop(symbol, None)
+                    if stop_streams:
+                        self.live_deployment_stream_workers.pop(symbol, None)
+                        self._release_live_symbol_stream(
+                            symbol,
+                            consumer_key=f"live-deployment:{symbol}",
+                            wait_ms=1500,
+                        )
+
+    def _deactivate_live_deployment(self, deployment_id: str, *, stop_streams: bool = True) -> None:
+        root_id = str(deployment_id or "")
+        runner = getattr(self, "live_deployment_runner_worker", None)
+        if runner is not None and runner.isRunning():
+            runner.remove_deployment(root_id)
+        for context_id, context in list(self.live_deployment_execution_contexts.items()):
+            if root_id in {
+                str(context.get("deployment_id") or ""),
+                str(context.get("parent_deployment_id") or ""),
+                str(context.get("portfolio_id") or ""),
+            }:
+                self._remove_live_deployment_context(context_id, stop_streams=stop_streams, notify_runner=False)
+
+    def _stop_live_deployment_streams(self) -> None:
+        for symbol, worker in list(getattr(self, "live_deployment_stream_workers", {}).items()):
+            try:
+                self._release_live_symbol_stream(
+                    symbol,
+                    consumer_key=f"live-deployment:{symbol}",
+                    wait_ms=1500,
+                )
+            except Exception:
+                pass
+            self.live_deployment_stream_workers.pop(symbol, None)
+        self.live_deployment_execution_contexts.clear()
+        self.live_deployment_symbol_index.clear()
+        runner = getattr(self, "live_deployment_runner_worker", None)
+        if runner is not None:
+            runner.clear_contexts()
+            if runner.isRunning():
+                runner.stop()
+                runner.wait(2500)
+        self.live_deployment_runner_worker = None
+
+    def _activate_live_deployment(self, deployment_row: dict) -> tuple[bool, str]:
+        deployment_id = str(deployment_row.get("deployment_id") or "")
+        if not deployment_id:
+            return False, "Deployment is missing an ID."
+        target_row = self._deployment_targets_by_id().get(str(deployment_row.get("target_id", "") or ""), {})
+        if not target_row:
+            message = "The selected deployment target is not configured."
+            self._update_deployment_status_tree(
+                deployment_id,
+                status="error",
+                status_reason=message,
+                last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
+            )
+            return False, message
+        webhook_url = self._deployment_webhook_url_for_target(target_row)
+        if not webhook_url:
+            message = "The selected deployment target has no webhook URL."
+            self._update_deployment_status_tree(
+                deployment_id,
+                status="error",
+                status_reason=message,
+                last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
+            )
+            return False, message
+        secret = self._deployment_secret_value(target_row)
+        if not secret:
+            secret_ref = str(target_row.get("secret_ref") or "webhook secret")
+            message = f"Missing {secret_ref}; enter and save the target webhook secret in Live Monitor target settings."
+            self._update_deployment_status_tree(
+                deployment_id,
+                status="error",
+                status_reason=message,
+                last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
+            )
+            return False, message
+        try:
+            snapshot = self._fetch_target_external_snapshot(target_row)
+        except Exception:
+            snapshot = {}
+        contexts, failures = self._build_live_deployment_contexts(
+            deployment_row,
+            target_row,
+            webhook_url,
+            secret,
+            snapshot,
+        )
+        if failures or not contexts:
+            message = "; ".join(failures) if failures else "No executable live deployment contexts were built."
+            self._update_deployment_status_tree(
+                deployment_id,
+                status="error",
+                status_reason=message,
+                last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
+            )
+            return False, message
+        conflicts = self._live_deployment_context_conflicts(contexts, deployment_id)
+        if conflicts:
+            message = "Live context conflict: " + "; ".join(conflicts)
+            self._update_deployment_status_tree(
+                deployment_id,
+                status="error",
+                status_reason=message,
+                last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
+            )
+            return False, message
+        self._deactivate_live_deployment(deployment_id, stop_streams=False)
+        runner = self._ensure_live_deployment_runner_worker()
+        runner.add_contexts(contexts)
+        for idx, context in enumerate(contexts):
+            context_id = str(context.get("context_id") or "")
+            symbol = str(context.get("symbol") or "")
+            self.live_deployment_execution_contexts[context_id] = context
+            self.live_deployment_symbol_index.setdefault(symbol, set()).add(context_id)
+            counter = getattr(self, "_live_deployment_arm_counter", 0) + 1
+            self._live_deployment_arm_counter = counter
+            self._start_live_deployment_stream(symbol, client_offset=IB_CLIENT_OFFSET_LIVE_DEPLOYMENT + counter)
+        timestamp = pd.Timestamp.now(tz='UTC').isoformat()
+        self._update_deployment_status_tree(
+            deployment_id,
+            status="live",
+            status_reason="Live runner active; waiting for the next completed strategy bar.",
+            armed_at=timestamp,
+            started_at=timestamp,
+        )
+        return True, f"Deployment is live across {len(contexts)} strategy leg{'s' if len(contexts) != 1 else ''}."
+
+    def _mark_live_deployment_context_error(self, context: dict, message: str) -> None:
+        timestamp = pd.Timestamp.now(tz='UTC').isoformat()
+        deployment_id = str(context.get("deployment_id") or "")
+        parent_deployment_id = str(context.get("parent_deployment_id") or "")
+        if deployment_id:
+            self.catalog.update_deployment_status(
+                deployment_id,
+                status="error",
+                status_reason=str(message)[:500],
+                last_error_at=timestamp,
+            )
+        if parent_deployment_id:
+            self.catalog.update_deployment_status(
+                parent_deployment_id,
+                status="error",
+                status_reason=str(message)[:500],
+                last_error_at=timestamp,
+            )
+        self._remove_live_deployment_context(str(context.get("context_id") or ""))
+
+    def _process_live_deployment_bar(self, symbol: str, record: dict) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned or cleaned not in getattr(self, "live_deployment_symbol_index", {}):
+            return
+        runner = self._ensure_live_deployment_runner_worker()
+        runner.enqueue_bar(record)
+
+    @staticmethod
+    def _external_dashboard_data_path(target_row: dict) -> str:
+        status_path = str(target_row.get("status_path") or "").strip()
+        dashboard_path = str(target_row.get("dashboard_path") or "").strip()
+        broker_scope = str(target_row.get("broker_scope") or target_row.get("mode") or "").strip().lower()
+        if status_path == "/live_status" or broker_scope in {"public", "live"}:
+            return "/live_dashboard_data"
+        if status_path == "/coinbase_status" or broker_scope == "coinbase":
+            return "/coinbase_dashboard_data"
+        if status_path == "/status" or broker_scope == "paper":
+            return "/dashboard_data"
+        if status_path.endswith("_status"):
+            return status_path[: -len("_status")] + "_dashboard_data"
+        if dashboard_path in {"/live", "live"}:
+            return "/live_dashboard_data"
+        if dashboard_path in {"/coinbase", "coinbase"}:
+            return "/coinbase_dashboard_data"
+        return "/dashboard_data"
+
+    def _read_external_snapshot_from_http(self, target_row: dict) -> dict:
+        base_url = str(target_row.get("base_url") or "").rstrip("/")
+        status_path = str(target_row.get("status_path") or "").strip()
+        if not base_url:
+            return {}
+        payload = self._read_external_json_url(self._external_endpoint_url(base_url, status_path)) if status_path else {}
+        dashboard_payload = self._read_external_json_url(
+            self._external_endpoint_url(base_url, self._external_dashboard_data_path(target_row))
+        )
+        if not payload and not dashboard_payload:
+            return {}
+        merged = dict(payload)
+        for key in ("account", "orders", "fills", "recent_trades", "positions", "equity_curve"):
+            if key in dashboard_payload:
+                merged[key] = dashboard_payload.get(key)
         return {
             "source": "http",
-            "snapshot_ts": pd.Timestamp.utcnow().isoformat(),
-            "orders": list(payload.get("orders") or []),
-            "fills": list(payload.get("fills") or []),
-            "positions": list(payload.get("positions") or []),
-            "account": dict(payload.get("account") or {}),
+            "snapshot_ts": pd.Timestamp.now(tz='UTC').isoformat(),
+            "orders": list(merged.get("orders") or []),
+            "fills": list(merged.get("fills") or []),
+            "recent_trades": list(merged.get("recent_trades") or []),
+            "positions": list(merged.get("positions") or []),
+            "account": dict(merged.get("account") or {}),
+            "equity_curve": list(merged.get("equity_curve") or []),
         }
 
     def _fetch_target_external_snapshot(self, target_row: dict) -> dict:
@@ -18239,11 +26061,53 @@ WantedBy=default.target
             for fill in list(snapshot.get("fills") or [])
             if int(fill.get("order_id") or -1) in matched_order_ids
         ]
+        matched_recent_trades: list[dict] = []
+        for trade in list(snapshot.get("recent_trades") or []):
+            symbol = str(trade.get("symbol") or "").strip().upper()
+            if symbol and symbol in symbols:
+                matched_recent_trades.append(trade)
         matched_positions: list[dict] = []
         for position in list(snapshot.get("positions") or []):
             symbol = str(position.get("symbol") or "").strip().upper()
             if symbol and symbol in symbols:
                 matched_positions.append(position)
+
+        def _metric_float(row: dict, keys: Sequence[str]) -> float | None:
+            for key in keys:
+                try:
+                    value = row.get(key)
+                    if value not in (None, ""):
+                        parsed = float(value)
+                        if np.isfinite(parsed):
+                            return parsed
+                except Exception:
+                    continue
+            return None
+
+        realized_trade_pnls: list[float] = []
+        for trade in matched_recent_trades:
+            pnl = _metric_float(trade, ("realized_pnl", "pnl", "net_pnl", "profit", "profit_loss"))
+            if pnl is not None:
+                realized_trade_pnls.append(pnl)
+        if not realized_trade_pnls:
+            for fill in matched_fills:
+                pnl = _metric_float(fill, ("realized_pnl", "pnl", "net_pnl", "profit", "profit_loss"))
+                if pnl is not None:
+                    realized_trade_pnls.append(pnl)
+        realized_pnl = sum(realized_trade_pnls) if realized_trade_pnls else None
+        wins = len([value for value in realized_trade_pnls if value > 0])
+        losses = len([value for value in realized_trade_pnls if value < 0])
+        decided_trades = wins + losses
+        win_rate = (wins / decided_trades) if decided_trades else None
+        gross_profit = sum(value for value in realized_trade_pnls if value > 0)
+        gross_loss = abs(sum(value for value in realized_trade_pnls if value < 0))
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+        sharpe = None
+        if len(realized_trade_pnls) >= 2:
+            trade_returns = pd.Series(realized_trade_pnls, dtype=float)
+            std = float(trade_returns.std(ddof=1))
+            if np.isfinite(std) and std > 0:
+                sharpe = float((trade_returns.mean() / std) * np.sqrt(len(trade_returns)))
 
         open_pnl_values = [self._position_open_pnl(position) for position in matched_positions]
         open_pnl = sum(float(value) for value in open_pnl_values if value is not None) if open_pnl_values else None
@@ -18253,6 +26117,8 @@ WantedBy=default.target
             if str(order.get("status") or "").strip().lower() in {"rejected", "cancelled", "canceled", "error"}
         ]
         trade_count = len(matched_fills) if matched_fills else len(
+            matched_recent_trades
+        ) if matched_recent_trades else len(
             [order for order in matched_orders if str(order.get("status") or "").strip().lower() in {"filled", "partial"}]
         )
         health = {
@@ -18260,29 +26126,32 @@ WantedBy=default.target
             "account": dict(snapshot.get("account") or {}),
             "matched_orders": len(matched_orders),
             "matched_fills": len(matched_fills),
+            "matched_recent_trades": len(matched_recent_trades),
             "problem_orders": len(problem_orders),
             "open_positions": len(matched_positions),
             "symbols": sorted(symbols),
+            "equity_curve": list(snapshot.get("equity_curve") or []),
         }
         return {
-            "snapshot_ts": str(snapshot.get("snapshot_ts") or pd.Timestamp.utcnow().isoformat()),
-            "realized_pnl": None,
+            "snapshot_ts": str(snapshot.get("snapshot_ts") or pd.Timestamp.now(tz='UTC').isoformat()),
+            "realized_pnl": realized_pnl,
             "open_pnl": open_pnl,
             "trade_count": trade_count,
-            "win_count": None,
-            "loss_count": None,
-            "win_rate": None,
-            "profit_factor": None,
-            "sharpe": None,
+            "win_count": wins if decided_trades else None,
+            "loss_count": losses if decided_trades else None,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "sharpe": sharpe,
             "current_position_json": {"positions": matched_positions},
             "health_json": health,
             "problem_order_count": len(problem_orders),
         }
 
-    def _sync_external_deployment_state(self) -> None:
+    def _sync_external_deployment_state(self, _checked: bool = False, *, show_dialogs: bool = True) -> None:
         deployments = self.catalog.load_deployments()
         if deployments.empty:
-            QtWidgets.QMessageBox.information(self, "No deployments", "Create a deployment first.")
+            if show_dialogs:
+                QtWidgets.QMessageBox.information(self, "No deployments", "Create a deployment first.")
             return
         self.deployments_frame = deployments
         self.deployment_child_links_frame = self.catalog.load_deployment_child_links()
@@ -18291,7 +26160,8 @@ WantedBy=default.target
             deployments["parent_deployment_id"].fillna("").astype(str) == ""
         ].reset_index(drop=True)
         if parent_deployments.empty:
-            QtWidgets.QMessageBox.information(self, "No parent deployments", "There are no parent deployments to sync.")
+            if show_dialogs:
+                QtWidgets.QMessageBox.information(self, "No parent deployments", "There are no parent deployments to sync.")
             return
         snapshots_by_target: dict[str, dict] = {}
         failures: list[str] = []
@@ -18315,7 +26185,7 @@ WantedBy=default.target
             aggregate = self._aggregate_external_snapshot_for_deployment(deployment_row, snapshot)
             self.catalog.save_deployment_metric_snapshot(
                 deployment_id=str(deployment_row.get("deployment_id") or ""),
-                snapshot_ts=str(aggregate.get("snapshot_ts") or pd.Timestamp.utcnow().isoformat()),
+                snapshot_ts=str(aggregate.get("snapshot_ts") or pd.Timestamp.now(tz='UTC').isoformat()),
                 realized_pnl=aggregate.get("realized_pnl"),
                 open_pnl=aggregate.get("open_pnl"),
                 trade_count=aggregate.get("trade_count"),
@@ -18367,10 +26237,14 @@ WantedBy=default.target
         if parent_deployments.empty:
             self.live_monitor_summary_label.setText("No deployment monitor state is available yet.")
             self.live_monitor_details.clear()
+            if hasattr(self, "live_monitor_equity_figure"):
+                self._draw_live_monitor_equity_curve(pd.Series(dtype=float))
             return
         for row_idx, (_, row) in enumerate(parent_deployments.iterrows()):
             metric_row = metric_map.get(str(row.get("deployment_id", "") or ""), {})
             target_row = target_map.get(str(row.get("target_id", "") or ""), {})
+            health = self._decode_json_dict(metric_row.get("health_json"))
+            account = dict(health.get("account") or {})
             values = [
                 str(row.get("deployment_id", ""))[:10],
                 self._deployment_kind_label(str(row.get("deployment_kind", "") or "")),
@@ -18378,6 +26252,8 @@ WantedBy=default.target
                 self._deployment_scope_label(row.to_dict()),
                 str(target_row.get("name", "") or row.get("target_id", "") or "—"),
                 str(row.get("status", "") or "draft"),
+                self._deployment_fmt_money(account.get("equity")),
+                self._deployment_fmt_money(account.get("buying_power")),
                 self._deployment_fmt_money(metric_row.get("realized_pnl")),
                 self._deployment_fmt_money(metric_row.get("open_pnl")),
                 str(int(metric_row.get("trade_count", 0) or 0)),
@@ -18394,12 +26270,13 @@ WantedBy=default.target
                 self.live_monitor_table.setItem(row_idx, col_idx, item)
         if self.live_monitor_table.rowCount() > 0 and not self.live_monitor_table.selectedItems():
             self.live_monitor_table.selectRow(0)
-        live_count = int(parent_deployments["status"].fillna("").astype(str).eq("live").sum())
-        paused_count = int(parent_deployments["status"].fillna("").astype(str).eq("paused").sum())
-        error_count = int(parent_deployments["status"].fillna("").astype(str).eq("error").sum())
+        status_counts = self._deployment_status_counts(parent_deployments)
         portfolio_count = int(parent_deployments["deployment_kind"].fillna("").astype(str).str.startswith("portfolio_").sum())
         self.live_monitor_summary_label.setText(
-            f"Deployments: {len(parent_deployments)} | Portfolio: {portfolio_count} | Live: {live_count} | Paused: {paused_count} | Error: {error_count}"
+            f"Deployments: {len(parent_deployments)} | Portfolio: {portfolio_count} | "
+            f"Draft: {status_counts['draft']} | Armed: {status_counts['armed']} | "
+            f"Live: {status_counts['live']} | Paused: {status_counts['paused']} | "
+            f"Stopped: {status_counts['stopped']} | Error: {status_counts['error']}"
         )
         self._refresh_live_monitor_details()
 
@@ -18418,16 +26295,87 @@ WantedBy=default.target
         payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
         return payload if isinstance(payload, dict) else None
 
+    def _selected_live_monitor_target_row(self) -> dict:
+        selected = self._selected_live_monitor_row()
+        if not selected:
+            return {}
+        return self._deployment_targets_by_id().get(str(selected.get("target_id", "") or ""), {})
+
+    @staticmethod
+    def _normalize_external_engine_base_url(value: str) -> str:
+        base_url = str(value or "").strip().rstrip("/")
+        if not base_url:
+            return ""
+        if not base_url.startswith(("http://", "https://")):
+            base_url = f"http://{base_url}"
+        return base_url.rstrip("/")
+
+    def _save_live_monitor_engine_url(self) -> None:
+        selected = self._selected_live_monitor_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        target_id = str(selected.get("target_id", "") or "")
+        target_row = self._deployment_targets_by_id().get(target_id, {})
+        if not target_row:
+            QtWidgets.QMessageBox.warning(self, "Missing target", "The selected deployment target is not configured.")
+            return
+        base_url = self._normalize_external_engine_base_url(self.live_monitor_engine_url_edit.text())
+        is_local = any(token in base_url for token in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+        transport_mode = str(target_row.get("transport_mode") or "remote_http")
+        if base_url and not is_local:
+            transport_mode = "remote_http"
+        secret_edit = getattr(self, "live_monitor_engine_secret_edit", None)
+        secret_value = str(secret_edit.text() if secret_edit is not None else target_row.get("secret_value") or "").strip()
+        self.catalog.save_deployment_target(
+            target_id=target_id,
+            name=str(target_row.get("name") or target_id),
+            mode=str(target_row.get("mode") or ""),
+            broker_scope=str(target_row.get("broker_scope") or ""),
+            transport_mode=transport_mode,
+            base_url=base_url,
+            webhook_path=str(target_row.get("webhook_path") or ""),
+            status_path=str(target_row.get("status_path") or ""),
+            dashboard_path=str(target_row.get("dashboard_path") or ""),
+            logs_path=str(target_row.get("logs_path") or ""),
+            project_root=str(target_row.get("project_root") or ""),
+            db_path=str(target_row.get("db_path") or ""),
+            log_db_path=str(target_row.get("log_db_path") or ""),
+            secret_ref=str(target_row.get("secret_ref") or ""),
+            secret_value=secret_value,
+            is_active=bool(target_row.get("is_active", True)),
+        )
+        self.deployment_targets_frame = self.catalog.load_deployment_targets()
+        self._update_deployment_panel()
+        self._update_live_monitor_panel()
+        self.status_label.setText(f"External engine target settings saved for {target_row.get('name') or target_id}.")
+
     def _refresh_live_monitor_details(self) -> None:
         selected = self._selected_live_monitor_row()
         if not selected:
             self.live_monitor_details.clear()
+            if hasattr(self, "live_monitor_engine_url_edit"):
+                self.live_monitor_engine_url_edit.clear()
+            if hasattr(self, "live_monitor_engine_secret_edit"):
+                self.live_monitor_engine_secret_edit.clear()
+            if hasattr(self, "live_monitor_equity_figure"):
+                self._draw_live_monitor_equity_curve(pd.Series(dtype=float))
             return
         metric_row = dict(selected.get("_metric_row") or {})
         health = self._decode_json_dict(metric_row.get("health_json"))
         account = dict(health.get("account") or {})
+        target_row = self._selected_live_monitor_target_row()
+        if hasattr(self, "live_monitor_engine_url_edit"):
+            self._live_monitor_engine_url_refreshing = True
+            self.live_monitor_engine_url_edit.setText(str(target_row.get("base_url") or ""))
+            if hasattr(self, "live_monitor_engine_secret_edit"):
+                self.live_monitor_engine_secret_edit.setText(str(target_row.get("secret_value") or ""))
+            self._live_monitor_engine_url_refreshing = False
         current_position = self._decode_json_dict(metric_row.get("current_position_json"))
         matched_positions = list(current_position.get("positions") or [])
+        sizing = self._decode_json_dict(selected.get("sizing_json"))
+        sizing_config = self._deployment_execution_config_payload(sizing.get("execution_config"))
+        sizing_line = self._deployment_sizing_config_summary(sizing, sizing_config)
         child_links = self.deployment_child_links_frame.loc[
             self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == str(selected.get("deployment_id", "") or "")
         ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
@@ -18437,6 +26385,10 @@ WantedBy=default.target
             f"Strategy: {selected.get('strategy', '') or '—'}",
             f"Scope: {self._deployment_scope_label(selected)}",
             f"Status: {selected.get('status', '') or 'draft'}",
+            f"Status Reason: {selected.get('status_reason', '') or '—'}",
+            f"Last Signal: {selected.get('last_signal_at', '') or '—'}",
+            f"Sizing: {sizing_line}",
+            f"Webhook Secret: {'saved' if str(target_row.get('secret_value') or '').strip() else 'missing'}",
             f"Realized PnL: {self._deployment_fmt_money(metric_row.get('realized_pnl'))}",
             f"Open PnL: {self._deployment_fmt_money(metric_row.get('open_pnl'))}",
             f"Trades: {int(metric_row.get('trade_count', 0) or 0)}",
@@ -18446,6 +26398,7 @@ WantedBy=default.target
             f"Problem Orders: {int(health.get('problem_orders', 0) or 0)}",
             f"Open Positions: {len(matched_positions)}",
             f"Account Equity: {self._deployment_fmt_money(account.get('equity'))}",
+            f"Buying Power: {self._deployment_fmt_money(account.get('buying_power'))}",
             f"Child legs: {len(child_links)}",
             "",
             f"Notes: {selected.get('notes', '') or 'None'}",
@@ -18457,6 +26410,7 @@ WantedBy=default.target
                     f"- {row.get('child_deployment_id', '')[:10]} | dataset={row.get('dataset_id', '') or '—'} | block={row.get('strategy_block_id', '') or '—'}"
                 )
         self.live_monitor_details.setPlainText("\n".join(lines))
+        self._draw_live_monitor_equity_curve(self._equity_curve_series_from_points(health.get("equity_curve")))
 
     def _set_selected_live_monitor_status(self, status: str) -> None:
         selected = self._selected_live_monitor_row()
@@ -18466,18 +26420,20 @@ WantedBy=default.target
         target_id = str(selected.get("deployment_id", "") or "")
         if not target_id:
             return
-        timestamp = pd.Timestamp.utcnow().isoformat()
-        update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
         if status == "armed":
-            update_kwargs["armed_at"] = timestamp
-        elif status == "stopped":
+            ok, message = self._activate_live_deployment(selected)
+            self.refresh(refresh_heatmap=False)
+            if not ok:
+                QtWidgets.QMessageBox.warning(self, "Live Deployment", message)
+            self.status_label.setText(message)
+            return
+        timestamp = pd.Timestamp.now(tz='UTC').isoformat()
+        update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
+        if status in {"paused", "stopped"}:
+            self._deactivate_live_deployment(target_id)
+        if status == "stopped":
             update_kwargs["stopped_at"] = timestamp
-        self.catalog.update_deployment_status(target_id, **update_kwargs)
-        related_children = self.deployment_child_links_frame.loc[
-            self.deployment_child_links_frame["parent_deployment_id"].fillna("").astype(str) == target_id
-        ] if not self.deployment_child_links_frame.empty else pd.DataFrame()
-        for _, row in related_children.iterrows():
-            self.catalog.update_deployment_status(str(row.get("child_deployment_id", "") or ""), **update_kwargs)
+        self._update_deployment_status_tree(target_id, **update_kwargs)
         self.refresh(refresh_heatmap=False)
         self.status_label.setText(f"Deployment status updated to {status}.")
 
@@ -18495,6 +26451,1059 @@ WantedBy=default.target
             )
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    @staticmethod
+    def _live_monitor_trade_columns() -> list[str]:
+        return [
+            "seq",
+            "ts_utc_ns",
+            "side",
+            "qty",
+            "price",
+            "fee",
+            "realized_pnl",
+            "equity_after",
+            "bar_index",
+            "event",
+            "event_type",
+            "position_after",
+            "label",
+        ]
+
+    @staticmethod
+    def _trade_timestamp_from_value(raw_value) -> pd.Timestamp | None:
+        numeric_ts: float | None = None
+        try:
+            numeric_ts = float(raw_value)
+        except Exception:
+            numeric_ts = None
+        if numeric_ts is not None and np.isfinite(numeric_ts):
+            if numeric_ts > 1_000_000_000_000_000:
+                timestamp = pd.to_datetime(int(numeric_ts), unit="ns", utc=True, errors="coerce")
+            elif numeric_ts > 1_000_000_000_000:
+                timestamp = pd.to_datetime(numeric_ts, unit="ms", utc=True, errors="coerce")
+            else:
+                timestamp = pd.to_datetime(numeric_ts, unit="s", utc=True, errors="coerce")
+        else:
+            timestamp = pd.to_datetime(raw_value, utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            return None
+        return pd.Timestamp(timestamp).tz_convert("UTC")
+
+    @staticmethod
+    def _live_trade_side(action: str, position_side: str) -> tuple[str, str]:
+        normalized_action = str(action or "").strip().upper()
+        normalized_position = str(position_side or "").strip().upper()
+        event = "entry" if normalized_action == "ENTRY" else "exit" if normalized_action == "EXIT" else normalized_action.lower()
+        if normalized_action == "ENTRY":
+            side = "sell" if normalized_position == "SHORT" else "buy"
+        elif normalized_action == "EXIT":
+            side = "buy" if normalized_position == "SHORT" else "sell"
+        else:
+            side = "sell" if normalized_position == "SHORT" else "buy"
+        return side, event or "trade"
+
+    def _live_monitor_trade_marker_frame(self, symbol: str, snapshot: dict, bars: pd.DataFrame) -> pd.DataFrame:
+        if bars is None or bars.empty:
+            return pd.DataFrame(columns=self._live_monitor_trade_columns())
+        cleaned = self._symbol_from_dataset_id(symbol)
+        first_ts = pd.Timestamp(bars.index[0]).tz_convert("UTC")
+        last_ts = pd.Timestamp(bars.index[-1]).tz_convert("UTC")
+        order_by_id: dict[int, dict] = {}
+        for order in list(snapshot.get("orders") or []):
+            try:
+                order_by_id[int(order.get("id"))] = dict(order)
+            except Exception:
+                continue
+
+        events: list[dict] = []
+        for fill in list(snapshot.get("fills") or []):
+            order = order_by_id.get(int(fill.get("order_id") or -1), {})
+            fill_symbol = self._symbol_from_dataset_id(order.get("symbol") or fill.get("symbol"))
+            if fill_symbol != cleaned:
+                continue
+            events.append(
+                {
+                    "timestamp": self._trade_timestamp_from_value(fill.get("fill_ts")),
+                    "qty": fill.get("filled_qty") or order.get("qty") or 0.0,
+                    "price": fill.get("avg_price") or order.get("price") or 0.0,
+                    "fee": 0.0,
+                    "realized_pnl": 0.0,
+                    "action": order.get("action") or "",
+                    "position_side": order.get("side") or "",
+                    "label_source": "Fill",
+                }
+            )
+
+        if not events:
+            for trade in list(snapshot.get("recent_trades") or []):
+                trade_symbol = self._symbol_from_dataset_id(trade.get("symbol"))
+                if trade_symbol != cleaned:
+                    continue
+                events.append(
+                    {
+                        "timestamp": self._trade_timestamp_from_value(trade.get("ts") or trade.get("timestamp")),
+                        "qty": trade.get("qty") or 0.0,
+                        "price": trade.get("price") or 0.0,
+                        "fee": trade.get("fee") or 0.0,
+                        "realized_pnl": trade.get("pnl") or trade.get("realized_pnl") or 0.0,
+                        "action": trade.get("action") or "",
+                        "position_side": trade.get("side") or "",
+                        "label_source": "Trade",
+                    }
+                )
+
+        if not events:
+            for order in list(snapshot.get("orders") or []):
+                order_symbol = self._symbol_from_dataset_id(order.get("symbol"))
+                if order_symbol != cleaned:
+                    continue
+                if str(order.get("status") or "").strip().lower() not in {"filled", "partial"}:
+                    continue
+                events.append(
+                    {
+                        "timestamp": self._trade_timestamp_from_value(order.get("updated_ts") or order.get("created_ts")),
+                        "qty": order.get("qty") or 0.0,
+                        "price": order.get("price") or order.get("limit_price") or 0.0,
+                        "fee": 0.0,
+                        "realized_pnl": 0.0,
+                        "action": order.get("action") or "",
+                        "position_side": order.get("side") or "",
+                        "label_source": "Order",
+                    }
+                )
+
+        rows: list[dict] = []
+        position_after = 0.0
+        sort_fallback_ts = pd.Timestamp("2262-04-11", tz="UTC")
+        for seq, event in enumerate(sorted(events, key=lambda item: item.get("timestamp") or sort_fallback_ts), start=1):
+            trade_ts = event.get("timestamp")
+            if trade_ts is None or trade_ts < first_ts or trade_ts > last_ts:
+                continue
+            bar_index = int(bars.index.get_indexer([trade_ts], method="nearest")[0])
+            if bar_index < 0:
+                continue
+            try:
+                qty_abs = abs(float(event.get("qty") or 0.0))
+            except Exception:
+                qty_abs = 0.0
+            try:
+                price = float(event.get("price") or 0.0)
+            except Exception:
+                price = 0.0
+            if not np.isfinite(price) or price <= 0.0:
+                price = float(bars.iloc[bar_index].get("close") or 0.0)
+            side, event_type = self._live_trade_side(str(event.get("action") or ""), str(event.get("position_side") or ""))
+            signed_qty = qty_abs if side == "buy" else -qty_abs
+            position_after += signed_qty
+            rows.append(
+                {
+                    "seq": len(rows) + 1,
+                    "ts_utc_ns": int(trade_ts.value),
+                    "side": side,
+                    "qty": signed_qty,
+                    "price": price,
+                    "fee": float(event.get("fee") or 0.0),
+                    "realized_pnl": float(event.get("realized_pnl") or 0.0),
+                    "equity_after": np.nan,
+                    "bar_index": bar_index,
+                    "event": event_type,
+                    "event_type": event_type,
+                    "position_after": position_after,
+                    "label": f"{event.get('label_source') or 'Trade'} {event_type.title()} {len(rows) + 1}",
+                }
+            )
+        return pd.DataFrame(rows, columns=self._live_monitor_trade_columns())
+
+    @staticmethod
+    def _live_monitor_signal_trade_marker(payload: dict, bars: pd.DataFrame) -> dict | None:
+        if not isinstance(payload, dict) or bars is None or bars.empty:
+            return None
+        timestamp = pd.to_datetime(payload.get("bar_timestamp_utc"), utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            timestamp = DashboardWindow._trade_timestamp_from_value(payload.get("time"))
+        if timestamp is None or pd.isna(timestamp):
+            return None
+        trade_ts = pd.Timestamp(timestamp).tz_convert("UTC")
+        normalized_bars = DashboardWindow._normalize_live_monitor_cached_bars(bars)
+        if normalized_bars.empty:
+            return None
+        try:
+            bar_index = int(normalized_bars.index.get_indexer([trade_ts], method="nearest")[0])
+        except Exception:
+            try:
+                bar_index = int(payload.get("bar_index"))
+            except Exception:
+                bar_index = -1
+        if bar_index < 0:
+            return None
+        try:
+            price = float(payload.get("price") or 0.0)
+        except Exception:
+            price = 0.0
+        if not np.isfinite(price) or price <= 0.0:
+            try:
+                price = float(normalized_bars.iloc[bar_index].get("close") or 0.0)
+            except Exception:
+                price = 0.0
+        override = dict(payload.get("position_size_override") or {})
+        qty_value = override.get("target_qty")
+        if qty_value in (None, ""):
+            try:
+                target_notional = float(override.get("target_notional") or 0.0)
+                qty_value = target_notional / price if price > 0.0 else 0.0
+            except Exception:
+                qty_value = 0.0
+        try:
+            qty_abs = abs(float(qty_value or 0.0))
+        except Exception:
+            qty_abs = 0.0
+        side, event_type = DashboardWindow._live_trade_side(
+            str(payload.get("action") or ""),
+            str(payload.get("side") or ""),
+        )
+        signed_qty = qty_abs if side == "buy" else -qty_abs
+        action = str(payload.get("action") or event_type).strip().upper()
+        position_side = str(payload.get("side") or "").strip().upper()
+        label_bits = ["Signal", action.title()]
+        if position_side:
+            label_bits.append(position_side.title())
+        return {
+            "timestamp_utc_ns": str(int(trade_ts.value)),
+            "bar_index": int(bar_index),
+            "price": float(price),
+            "quantity": float(signed_qty),
+            "side": side,
+            "event": event_type,
+            "label": " ".join(label_bits),
+        }
+
+    def _live_monitor_marker_frame_from_markers(self, markers: Sequence[dict], bars: pd.DataFrame) -> pd.DataFrame:
+        if not markers:
+            return pd.DataFrame(columns=self._live_monitor_trade_columns())
+        rows: list[dict] = []
+        position_after = 0.0
+        for marker in list(markers or []):
+            try:
+                bar_index = int(marker.get("bar_index"))
+                ts_utc_ns = int(marker.get("timestamp_utc_ns") or marker.get("timestampUtcNs") or 0)
+            except Exception:
+                continue
+            if bar_index < 0 or ts_utc_ns <= 0:
+                continue
+            try:
+                quantity = float(marker.get("quantity") or 0.0)
+            except Exception:
+                quantity = 0.0
+            position_after += quantity
+            rows.append(
+                {
+                    "seq": len(rows) + 1,
+                    "ts_utc_ns": ts_utc_ns,
+                    "side": str(marker.get("side") or ""),
+                    "qty": quantity,
+                    "price": float(marker.get("price") or 0.0),
+                    "fee": 0.0,
+                    "realized_pnl": 0.0,
+                    "equity_after": np.nan,
+                    "bar_index": bar_index,
+                    "event": str(marker.get("event") or "trade"),
+                    "event_type": str(marker.get("event") or "trade"),
+                    "position_after": position_after,
+                    "label": str(marker.get("label") or "Signal"),
+                }
+            )
+        return pd.DataFrame(rows, columns=self._live_monitor_trade_columns())
+
+    def _on_live_deployment_signal_marker(self, payload: object) -> None:
+        data = dict(payload or {}) if isinstance(payload, dict) else {}
+        symbol = self._symbol_from_dataset_id(data.get("symbol"))
+        if not symbol:
+            return
+        payload_deployment_ids = {
+            str(data.get("deployment_id") or ""),
+            str(data.get("parent_deployment_id") or ""),
+            str(data.get("portfolio_id") or ""),
+        }
+        payload_deployment_ids.discard("")
+        for session_id, info in list(getattr(self, "live_monitor_chart_sessions", {}).items()):
+            if not isinstance(info, dict):
+                continue
+            if self._symbol_from_dataset_id(info.get("symbol")) != symbol:
+                continue
+            session_deployment_id = str(info.get("deployment_id") or "")
+            if payload_deployment_ids and session_deployment_id and session_deployment_id not in payload_deployment_ids:
+                continue
+            marker = self._live_monitor_signal_trade_marker(data, info.get("bars"))
+            if not marker:
+                continue
+            local_markers = list(info.get("local_trade_markers") or [])
+            marker_key = (
+                marker.get("timestamp_utc_ns"),
+                marker.get("bar_index"),
+                marker.get("side"),
+                marker.get("event"),
+                marker.get("price"),
+                marker.get("quantity"),
+            )
+            existing_keys = {
+                (
+                    item.get("timestamp_utc_ns"),
+                    item.get("bar_index"),
+                    item.get("side"),
+                    item.get("event"),
+                    item.get("price"),
+                    item.get("quantity"),
+                )
+                for item in local_markers
+                if isinstance(item, dict)
+            }
+            if marker_key not in existing_keys:
+                local_markers.append(marker)
+            info["local_trade_markers"] = local_markers
+            try:
+                timeframe = normalize_chart_timeframe(str(info.get("timeframe") or LIVE_BAR_TIMEFRAME))
+                self.magellan.send_live_update(
+                    str(info.get("session_id") or session_id),
+                    title=f"{symbol} {chart_timeframe_label(timeframe)}",
+                    status_text=f"{marker.get('label', 'Signal')} sent.",
+                    trade_markers=[marker],
+                    timeout_ms=MAGELLAN_LIVE_UPDATE_TIMEOUT_MS,
+                )
+            except Exception as exc:
+                self.status_label.setText(f"Unable to add live signal marker for {symbol}: {exc}")
+
+    def _selected_live_monitor_chart_lookback(self) -> str:
+        combo = getattr(self, "live_monitor_chart_lookback_combo", None)
+        if combo is None:
+            return "3mo"
+        value = str(combo.currentData() or "").strip()
+        return value or "3mo"
+
+    def _deployment_strategy_contexts_for_symbol(self, deployment_row: dict, symbol: str) -> list[tuple[str | None, str, dict]]:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return []
+        structure = self._decode_json_dict(deployment_row.get("structure_json"))
+        params = self._decode_json_dict(deployment_row.get("params_json"))
+        deployment_kind = str(deployment_row.get("deployment_kind") or "").strip()
+        strategy = str(deployment_row.get("strategy") or "").strip()
+        contexts: list[tuple[str | None, str, dict]] = []
+
+        if deployment_kind == "portfolio_strategy_blocks":
+            for block in list(structure.get("strategy_blocks") or []):
+                block_datasets = [
+                    str(item).strip()
+                    for item in list(block.get("asset_dataset_ids") or [])
+                    if str(item).strip()
+                ]
+                if not block_datasets:
+                    block_datasets = [
+                        str(asset.get("dataset_id") or "").strip()
+                        for asset in list(block.get("assets") or [])
+                        if str(asset.get("dataset_id") or "").strip()
+                    ]
+                if block_datasets and cleaned not in {self._symbol_from_dataset_id(item) for item in block_datasets}:
+                    continue
+                block_strategy = str(block.get("strategy_name") or block.get("strategy") or strategy or "").strip()
+                if not block_strategy:
+                    continue
+                label = str(block.get("display_name") or block.get("block_id") or block_strategy or "").strip()
+                contexts.append((label or None, block_strategy, dict(block.get("strategy_params") or block.get("params") or {})))
+            return contexts
+
+        if strategy:
+            contexts.append((None, strategy, params))
+        return contexts
+
+    def _deployment_chart_indicator_series(
+        self,
+        bars: pd.DataFrame,
+        indicator_ids: Sequence[str],
+        strategy_contexts: Sequence[tuple[str | None, str, dict]],
+    ) -> tuple[dict[str, pd.Series], dict[str, pd.Series], dict[str, dict]]:
+        overlays, panes, styles = compute_chart_indicators(bars, indicator_ids)
+        try:
+            strategy_overlays, strategy_panes, strategy_styles = ChartSnapshotExporter._build_portfolio_asset_strategy_series(
+                bars,
+                strategy_contexts,
+            )
+        except Exception:
+            return overlays, panes, styles
+        overlays.update(strategy_overlays)
+        panes.update(strategy_panes)
+        styles.update(strategy_styles)
+        return overlays, panes, styles
+
+    def _live_monitor_equity_curve_for_session(self, info: dict) -> pd.Series:
+        stored = info.get("equity_curve") if isinstance(info.get("equity_curve"), pd.Series) else pd.Series(dtype=float, name="equity")
+        target_id = str(info.get("target_id") or "").strip()
+        target_row = self._deployment_targets_by_id().get(target_id, {}) if target_id else {}
+        if str(target_row.get("transport_mode") or "").strip().lower() != "co_located":
+            return stored
+        try:
+            last_refresh = float(info.get("last_equity_refresh_monotonic") or 0.0)
+        except Exception:
+            last_refresh = 0.0
+        now = time.monotonic()
+        if last_refresh > 0.0 and now - last_refresh < 5.0:
+            return stored
+        info["last_equity_refresh_monotonic"] = now
+        try:
+            snapshot = self._read_external_snapshot_from_sqlite(target_row)
+        except Exception:
+            return stored
+        refreshed = self._equity_curve_series_from_points(snapshot.get("equity_curve"))
+        if refreshed.empty:
+            return stored
+        info["equity_curve"] = refreshed
+        return refreshed
+
+    def _open_or_reload_live_monitor_chart(
+        self,
+        *,
+        selected: dict,
+        snapshot: dict,
+        deployment_id: str,
+        symbol: str,
+        timeframe: str,
+        lookback: str,
+        indicator_ids: Sequence[str],
+        equity_curve: pd.Series,
+        status_text: str,
+        reload_existing: bool = False,
+        client_offset: int = 0,
+    ) -> tuple[bool, str]:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return False, "Missing symbol."
+        try:
+            bars, _dataset_id, note = self._build_charts_combined_bars(cleaned, timeframe=timeframe, lookback=lookback)
+        except sqlite3.Error as exc:
+            return False, f"Live market store unavailable: {exc}"
+        if bars.empty:
+            return False, note
+        bars = self._normalize_live_monitor_cached_bars(bars)
+        if bars.empty:
+            return False, note
+        completed_bars = self._completed_bars_for_chart_timeframe(bars, pd.Timestamp.now(tz="UTC"), timeframe)
+        if completed_bars.empty:
+            return False, f"No completed {chart_timeframe_label(timeframe)} bars are available for {cleaned} yet."
+        if len(completed_bars) < LIVE_MONITOR_MIN_SEED_BARS:
+            return False, (
+                f"Waiting for at least {LIVE_MONITOR_MIN_SEED_BARS} completed "
+                f"{chart_timeframe_label(timeframe)} bars before opening {cleaned} Live Monitor."
+            )
+        strategy_contexts = self._deployment_strategy_contexts_for_symbol(selected, cleaned)
+        overlays, panes, styles = self._deployment_chart_indicator_series(bars, indicator_ids, strategy_contexts)
+        trades_df = self._live_monitor_trade_marker_frame(cleaned, snapshot, bars)
+        session_id = f"live-monitor:{deployment_id}:{cleaned}"
+        previous_session = dict(getattr(self, "live_monitor_chart_sessions", {}).get(session_id, {}) or {})
+        local_trade_markers = [
+            dict(item)
+            for item in list(previous_session.get("local_trade_markers") or [])
+            if isinstance(item, dict)
+        ]
+        local_trades_df = self._live_monitor_marker_frame_from_markers(local_trade_markers, bars)
+        if not local_trades_df.empty:
+            trades_df = pd.concat([trades_df, local_trades_df], ignore_index=True, sort=False)
+            if not trades_df.empty:
+                trades_df = trades_df.drop_duplicates(
+                    subset=["ts_utc_ns", "bar_index", "side", "qty", "price", "event_type"],
+                    keep="first",
+                ).reset_index(drop=True)
+                trades_df["seq"] = np.arange(1, len(trades_df) + 1, dtype=int)
+        title = f"{cleaned} {chart_timeframe_label(timeframe)}"
+        subtitle = f"Deployment {deployment_id[:10]} live monitor"
+        status = status_text or "Deployment chart seeded from historical data, strategy indicators, live market store, and external engine trades."
+        snapshot_artifact = self.live_chart_snapshot_exporter.export_market_snapshot(
+            symbol=cleaned,
+            timeframe=timeframe,
+            bars=bars,
+            overlays=overlays,
+            panes=panes,
+            series_styles=styles,
+            equity_curve=equity_curve if equity_curve is not None and not equity_curve.empty else None,
+            trades_df=trades_df,
+            snapshot_root=Path("data/live_chart_snapshots") / "deployments" / deployment_id / cleaned / timeframe / lookback,
+            title=title,
+            subtitle=subtitle,
+            status_text=status,
+            overwrite=True,
+        )
+        session_open = session_id in getattr(self, "live_monitor_chart_sessions", {})
+        if reload_existing and session_open:
+            self.magellan.reload_live_seed(
+                session_id,
+                title=title,
+                subtitle=subtitle,
+                status_text=status,
+                snapshot_path=snapshot_artifact.snapshot_root,
+                timeout_ms=5000,
+            )
+        else:
+            try:
+                self.magellan.close_session(session_id, timeout_ms=300)
+            except Exception:
+                pass
+            self.magellan.open_live_session(
+                session_id,
+                title=title,
+                subtitle=subtitle,
+                status_text=status,
+                snapshot_path=snapshot_artifact.snapshot_root,
+                timeout_ms=5000,
+            )
+        self.live_monitor_chart_sessions[session_id] = {
+            "session_id": session_id,
+            "deployment_id": deployment_id,
+            "target_id": str(selected.get("target_id") or ""),
+            "symbol": cleaned,
+            "timeframe": timeframe,
+            "lookback": lookback,
+            "indicator_ids": list(indicator_ids),
+            "strategy_contexts": list(strategy_contexts),
+            "bars": bars.copy(),
+            "equity_curve": equity_curve if isinstance(equity_curve, pd.Series) else pd.Series(dtype=float, name="equity"),
+            "local_trade_markers": local_trade_markers,
+            "bar_index_by_ts_ns": self._live_monitor_bar_index_map_from_bars(bars),
+            "next_live_bar_index": int(len(bars)),
+            "last_equity_refresh_monotonic": 0.0,
+            "last_preview_update_monotonic": 0.0,
+            "last_sent_bar_ts_ns": int(pd.Timestamp(bars.index[-1]).tz_convert("UTC").value),
+            "last_sent_bar_index": int(len(bars) - 1),
+            "last_completed_replacement_bar_ts_ns": int(pd.Timestamp(completed_bars.index[-1]).tz_convert("UTC").value),
+        }
+        if client_offset:
+            self._start_live_monitor_chart_stream(cleaned, client_offset=client_offset)
+        return True, note
+
+    def _start_live_monitor_historical_sync(
+        self,
+        symbol: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        context: dict,
+        client_offset: int,
+    ) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        existing = self.live_monitor_historical_sync_workers.get(cleaned)
+        if existing is not None and existing.isRunning():
+            return
+        self.live_monitor_historical_sync_contexts[cleaned] = dict(context)
+        worker = ChartHistoricalSyncWorker(
+            symbol=cleaned,
+            start=start,
+            end=end,
+            store_path=self.live_market_store.db_path,
+            config=self._charts_ib_config(client_offset=client_offset),
+            parent=self,
+        )
+        worker.status_signal.connect(lambda text, sym=cleaned: self.status_label.setText(f"{sym}: {text}"))
+        worker.error_signal.connect(lambda message, sym=cleaned: self._on_live_monitor_historical_sync_error(sym, message))
+        worker.finished_signal.connect(self._on_live_monitor_historical_sync_finished)
+        worker.finished.connect(lambda sym=cleaned: self.live_monitor_historical_sync_workers.pop(sym, None))
+        worker.finished.connect(worker.deleteLater)
+        self.live_monitor_historical_sync_workers[cleaned] = worker
+        worker.start()
+
+    def _on_live_monitor_historical_sync_finished(self, payload: object) -> None:
+        data = dict(payload or {}) if isinstance(payload, dict) else {}
+        symbol = self._symbol_from_dataset_id(data.get("symbol"))
+        rows = int(data.get("rows") or 0)
+        context = self.live_monitor_historical_sync_contexts.pop(symbol, {})
+        if not symbol or not context:
+            return
+        ok, message = self._open_or_reload_live_monitor_chart(
+            selected=dict(context.get("selected") or {}),
+            snapshot=dict(context.get("snapshot") or {}),
+            deployment_id=str(context.get("deployment_id") or ""),
+            symbol=symbol,
+            timeframe=str(context.get("timeframe") or LIVE_BAR_TIMEFRAME),
+            lookback=str(context.get("lookback") or "3mo"),
+            indicator_ids=list(context.get("indicator_ids") or []),
+            equity_curve=context.get("equity_curve") if isinstance(context.get("equity_curve"), pd.Series) else pd.Series(dtype=float),
+            status_text=f"Historical gap synced from IB ({rows} bar(s)); deployment chart reloaded.",
+            reload_existing=True,
+            client_offset=int(context.get("stream_client_offset") or 0),
+        )
+        if ok:
+            self.status_label.setText(f"{symbol} Live Monitor chart synced with {rows} IB historical bar(s).")
+        else:
+            self.status_label.setText(f"{symbol} Live Monitor historical sync stored {rows} bar(s), but chart reload failed: {message}")
+
+    def _on_live_monitor_historical_sync_error(self, symbol: str, message: str) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        self.live_monitor_historical_sync_contexts.pop(cleaned, None)
+        self.status_label.setText(f"{cleaned} Live Monitor historical sync failed: {message}")
+
+    def _open_live_monitor_charts(self, _checked: bool = False) -> None:
+        selected = self._selected_live_monitor_row()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
+            return
+        symbols = sorted(self._deployment_symbol_scope(selected))
+        if not symbols:
+            QtWidgets.QMessageBox.information(self, "No deployment symbols", "The selected deployment does not expose any ticker symbols.")
+            return
+        if len(symbols) > MAX_WATCHLIST_STREAM_SYMBOLS:
+            symbols = symbols[:MAX_WATCHLIST_STREAM_SYMBOLS]
+        self._close_live_monitor_charts(silent=True)
+        target_row = self._deployment_targets_by_id().get(str(selected.get("target_id", "") or ""), {})
+        snapshot = self._fetch_target_external_snapshot(target_row) if target_row else {}
+        if not snapshot:
+            metric_row = dict(selected.get("_metric_row") or {})
+            health = self._decode_json_dict(metric_row.get("health_json"))
+            snapshot = {
+                "account": dict(health.get("account") or {}),
+                "equity_curve": list(health.get("equity_curve") or []),
+                "orders": [],
+                "fills": [],
+                "recent_trades": [],
+                "positions": list(self._decode_json_dict(metric_row.get("current_position_json")).get("positions") or []),
+            }
+        deployment_id = str(selected.get("deployment_id") or "")
+        timeframe = normalize_chart_timeframe(str(selected.get("timeframe") or self._selected_charts_timeframe() or LIVE_BAR_TIMEFRAME))
+        lookback = self._selected_live_monitor_chart_lookback()
+        indicator_ids: list[str] = []
+        equity_curve = self._equity_curve_series_from_points(snapshot.get("equity_curve"))
+        opened = 0
+        failures: list[str] = []
+        syncing: list[str] = []
+        for idx, symbol in enumerate(symbols, start=1):
+            cleaned_symbol = self._symbol_from_dataset_id(symbol)
+            if not cleaned_symbol:
+                continue
+            sync_window = self._charts_historical_sync_window(cleaned_symbol, lookback=lookback)
+            context = {
+                "selected": dict(selected),
+                "snapshot": dict(snapshot),
+                "deployment_id": deployment_id,
+                "timeframe": timeframe,
+                "lookback": lookback,
+                "indicator_ids": list(indicator_ids),
+                "equity_curve": equity_curve,
+                "stream_client_offset": IB_CLIENT_OFFSET_LIVE_MONITOR + idx,
+            }
+            if sync_window is not None:
+                counter = getattr(self, "_live_monitor_open_counter", 0) + 1
+                self._live_monitor_open_counter = counter
+                client_offset_sync = IB_CLIENT_OFFSET_LIVE_MONITOR_SYNC + counter
+                self._start_live_monitor_historical_sync(
+                    cleaned_symbol,
+                    sync_window[0],
+                    sync_window[1],
+                    context=context,
+                    client_offset=client_offset_sync,
+                )
+                syncing.append(cleaned_symbol)
+            try:
+                status = (
+                    "Deployment chart opened from best available local/live bars while IB historical gap sync runs."
+                    if sync_window is not None
+                    else "Deployment chart seeded from historical data, strategy indicators, live market store, and external engine trades."
+                )
+                counter = getattr(self, "_live_monitor_open_counter", 0) + 1
+                self._live_monitor_open_counter = counter
+                client_offset_chart = IB_CLIENT_OFFSET_LIVE_MONITOR + counter
+                ok, message = self._open_or_reload_live_monitor_chart(
+                    selected=dict(selected),
+                    snapshot=snapshot,
+                    deployment_id=deployment_id,
+                    symbol=cleaned_symbol,
+                    timeframe=timeframe,
+                    lookback=lookback,
+                    indicator_ids=indicator_ids,
+                    equity_curve=equity_curve,
+                    status_text=status,
+                    reload_existing=False,
+                    client_offset=client_offset_chart,
+                )
+                if ok:
+                    opened += 1
+                elif sync_window is None:
+                    failures.append(f"{cleaned_symbol}: {message}")
+            except Exception as exc:
+                failures.append(f"{cleaned_symbol}: {exc}")
+        if opened:
+            self.status_label.setText(f"Opened {opened} Magellan deployment chart{'s' if opened != 1 else ''}.")
+        if syncing:
+            sync_text = f" Syncing IB historical gap for {', '.join(syncing[:5])}{'...' if len(syncing) > 5 else ''}."
+            self.status_label.setText((self.status_label.text() + sync_text) if opened else sync_text.strip())
+        if failures:
+            existing_status = self.status_label.text().strip()
+            prefix = f"{existing_status} " if existing_status else ""
+            self.status_label.setText(prefix + " | ".join(failures[:3]))
+
+    def _start_live_monitor_chart_stream(self, symbol: str, *, client_offset: int) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        worker = self.live_monitor_chart_stream_workers.get(cleaned)
+        if worker is not None and worker.isRunning():
+            return
+        worker = self._acquire_live_symbol_stream(
+            cleaned,
+            client_offset=client_offset,
+            consumer_key=f"live-monitor:{cleaned}",
+        )
+        if worker is not None:
+            self.live_monitor_chart_stream_workers[cleaned] = worker
+
+    def _start_live_deployment_stream(self, symbol: str, *, client_offset: int) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        self._stop_non_deployment_symbol_streams(cleaned)
+        worker = self.live_deployment_stream_workers.get(cleaned)
+        if worker is not None and worker.isRunning():
+            return
+        worker = self._acquire_live_symbol_stream(
+            cleaned,
+            client_offset=client_offset,
+            consumer_key=f"live-deployment:{cleaned}",
+        )
+        if worker is not None:
+            self.live_deployment_stream_workers[cleaned] = worker
+
+    def _acquire_live_symbol_stream(
+        self,
+        symbol: str,
+        *,
+        client_offset: int,
+        consumer_key: str,
+    ) -> ChartLiveStreamWorker | None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return None
+        if not hasattr(self, "live_symbol_stream_workers"):
+            self.live_symbol_stream_workers = {}
+        if not hasattr(self, "live_symbol_stream_consumers"):
+            self.live_symbol_stream_consumers = {}
+        consumers = self.live_symbol_stream_consumers.setdefault(cleaned, set())
+        consumers.add(str(consumer_key))
+        worker = self.live_symbol_stream_workers.get(cleaned)
+        if worker is not None and worker.isRunning():
+            return worker
+        if worker is not None:
+            self.live_symbol_stream_workers.pop(cleaned, None)
+        worker = ChartLiveStreamWorker(
+            symbol=cleaned,
+            store_path=self.live_market_store.db_path,
+            config=self._charts_ib_config(client_offset=client_offset),
+            parent=self,
+        )
+        worker.bar_signal.connect(self._on_charts_live_bar)
+        worker.preview_bar_signal.connect(self._on_charts_live_preview_bar)
+        worker.status_signal.connect(lambda text, sym=cleaned: self._on_live_symbol_stream_status(sym, text))
+        worker.error_signal.connect(lambda message, sym=cleaned: self._on_live_symbol_stream_error(sym, message))
+        worker.finished.connect(lambda sym=cleaned, stream=worker: self._on_live_symbol_stream_finished(sym, stream))
+        worker.finished.connect(worker.deleteLater)
+        self.live_symbol_stream_workers[cleaned] = worker
+        worker.start()
+        return worker
+
+    def _release_live_symbol_stream(
+        self,
+        symbol: str,
+        *,
+        consumer_key: str,
+        wait_ms: int = 1500,
+    ) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        consumers_by_symbol = getattr(self, "live_symbol_stream_consumers", {})
+        consumers = consumers_by_symbol.get(cleaned)
+        if consumers is not None:
+            consumers.discard(str(consumer_key))
+            if consumers:
+                return
+            consumers_by_symbol.pop(cleaned, None)
+        workers = getattr(self, "live_symbol_stream_workers", {})
+        worker = workers.pop(cleaned, None)
+        if worker is None:
+            return
+        if getattr(self, "live_monitor_chart_stream_workers", {}).get(cleaned) is worker:
+            self.live_monitor_chart_stream_workers.pop(cleaned, None)
+        if getattr(self, "live_deployment_stream_workers", {}).get(cleaned) is worker:
+            self.live_deployment_stream_workers.pop(cleaned, None)
+        try:
+            if worker.isRunning():
+                worker.stop()
+                worker.wait(int(wait_ms))
+        except Exception:
+            pass
+
+    def _on_live_symbol_stream_status(self, symbol: str, text: str) -> None:
+        if hasattr(self, "status_label"):
+            self.status_label.setText(f"{symbol} live stream: {text}")
+
+    def _on_live_symbol_stream_error(self, symbol: str, message: str) -> None:
+        if hasattr(self, "status_label"):
+            self.status_label.setText(f"{symbol} live stream error: {message}")
+
+    def _on_live_symbol_stream_finished(self, symbol: str, worker: ChartLiveStreamWorker) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return
+        if getattr(self, "live_symbol_stream_workers", {}).get(cleaned) is worker:
+            self.live_symbol_stream_workers.pop(cleaned, None)
+            self.live_symbol_stream_consumers.pop(cleaned, None)
+        if getattr(self, "live_monitor_chart_stream_workers", {}).get(cleaned) is worker:
+            self.live_monitor_chart_stream_workers.pop(cleaned, None)
+        if getattr(self, "live_deployment_stream_workers", {}).get(cleaned) is worker:
+            self.live_deployment_stream_workers.pop(cleaned, None)
+
+    def _send_live_monitor_magellan_update(self, symbol: str, record: dict) -> None:
+        cleaned = self._symbol_from_dataset_id(symbol)
+        sessions = [
+            (session_id, info)
+            for session_id, info in list(getattr(self, "live_monitor_chart_sessions", {}).items())
+            if isinstance(info, dict) and str(info.get("symbol") or "").strip().upper() == cleaned
+        ]
+        if not sessions:
+            return
+        ts = pd.to_datetime(record.get("ts_utc"), utc=True, errors="coerce")
+        if pd.isna(ts):
+            return
+        is_partial = bool(record.get("is_partial"))
+        evaluation_ts = None if is_partial else self._live_record_evaluation_timestamp(record)
+        if not is_partial and evaluation_ts is None:
+            return
+        for session_id, info in sessions:
+            current_info = self.live_monitor_chart_sessions.get(session_id)
+            if not isinstance(current_info, dict):
+                current_info = info
+            timeframe = normalize_chart_timeframe(str(current_info.get("timeframe") or LIVE_BAR_TIMEFRAME))
+            if is_partial:
+                try:
+                    last_preview_at = float(current_info.get("last_preview_update_monotonic") or 0.0)
+                except Exception:
+                    last_preview_at = 0.0
+                now_mono = time.monotonic()
+                if (
+                    last_preview_at > 0.0
+                    and now_mono - last_preview_at < LIVE_MONITOR_PREVIEW_UPDATE_MIN_INTERVAL_SECONDS
+                ):
+                    continue
+                current_info["last_preview_update_monotonic"] = now_mono
+            bars, updated_bar_ts = self._live_monitor_cached_bars_with_record(
+                current_info.get("bars"),
+                record,
+                timeframe=timeframe,
+                symbol=cleaned,
+            )
+            if bars.empty or updated_bar_ts is None or len(bars) < LIVE_MONITOR_MIN_SEED_BARS:
+                continue
+            current_info["bars"] = bars
+            try:
+                latest_source_bar_index = int(bars.index.get_loc(updated_bar_ts))
+            except Exception:
+                continue
+            latest_bar = bars.iloc[latest_source_bar_index]
+            latest_bar_ts = pd.Timestamp(updated_bar_ts).tz_convert("UTC")
+            latest_bar_ts_ns = int(latest_bar_ts.value)
+            live_bar_index = self._live_monitor_bar_index_for_timestamp(
+                current_info,
+                bars,
+                latest_bar_ts,
+            )
+            live_bars_payload: list[dict] = []
+            if live_bar_index is not None:
+                live_bars_payload = [
+                    {
+                        "timestamp_utc_ns": str(int(latest_bar_ts.value)),
+                        "bar_index": int(live_bar_index),
+                        "open": float(latest_bar.get("open") or 0.0),
+                        "high": float(latest_bar.get("high") or 0.0),
+                        "low": float(latest_bar.get("low") or 0.0),
+                        "close": float(latest_bar.get("close") or 0.0),
+                        "volume": float(latest_bar.get("volume") or 0.0),
+                    }
+                ]
+
+            overlay_payload: list[dict] = []
+            pane_payload: list[dict] = []
+            equity_payload: list[dict] = []
+            completed_bar_ts_ns = 0
+            completed_bar_label = ""
+            completed_payload_sent = False
+            completed_source_bar_index = (
+                None
+                if is_partial
+                else self._live_deployment_completed_bar_index(bars, evaluation_ts, timeframe)
+            )
+            if completed_source_bar_index is not None:
+                completed_source_bar_index = int(completed_source_bar_index)
+                completed_bars = bars.iloc[: completed_source_bar_index + 1].copy()
+                if not completed_bars.empty:
+                    completed_bar_ts = pd.Timestamp(bars.index[completed_source_bar_index]).tz_convert("UTC")
+                    completed_bar_ts_ns = int(completed_bar_ts.value)
+                    completed_bar_label = completed_bar_ts.tz_convert("America/New_York").strftime("%H:%M")
+                    if completed_bar_ts_ns > int(current_info.get("last_completed_replacement_bar_ts_ns") or 0):
+                        completed_live_bar_index = self._live_monitor_bar_index_for_timestamp(
+                            current_info,
+                            bars,
+                            completed_bar_ts,
+                        )
+                        overlays, panes, styles = self._deployment_chart_indicator_series(
+                            completed_bars,
+                            list(current_info.get("indicator_ids") or []),
+                            list(current_info.get("strategy_contexts") or []),
+                        )
+                        if completed_live_bar_index is not None:
+                            overlay_payload.extend(
+                                incremental_series_payload(
+                                    overlays,
+                                    bar_index=completed_live_bar_index,
+                                    timestamp=completed_bar_ts,
+                                    styles=styles,
+                                    source_bar_index=completed_source_bar_index,
+                                )
+                            )
+                            pane_payload.extend(
+                                incremental_series_payload(
+                                    panes,
+                                    bar_index=completed_live_bar_index,
+                                    timestamp=completed_bar_ts,
+                                    styles=styles,
+                                    source_bar_index=completed_source_bar_index,
+                                )
+                            )
+                            equity_curve = self._live_monitor_equity_curve_for_session(current_info)
+                            if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
+                                aligned_equity = pd.to_numeric(equity_curve.sort_index(), errors="coerce")
+                                if aligned_equity.index.tz is None:
+                                    aligned_equity.index = aligned_equity.index.tz_localize("UTC")
+                                else:
+                                    aligned_equity.index = aligned_equity.index.tz_convert("UTC")
+                                aligned_equity = aligned_equity[~aligned_equity.index.duplicated(keep="last")]
+                                aligned_equity = aligned_equity.reindex(completed_bars.index, method="ffill").bfill().rename("equity")
+                                equity_payload.extend(
+                                    incremental_series_payload(
+                                        {"equity": aligned_equity},
+                                        bar_index=completed_live_bar_index,
+                                        timestamp=completed_bar_ts,
+                                        styles={"equity": {"color": PALETTE["blue"], "line_width": 1.3}},
+                                        source_bar_index=completed_source_bar_index,
+                                    )
+                                )
+                            completed_payload_sent = True
+            preview_indicator_needed = (
+                live_bar_index is not None
+                and latest_source_bar_index >= 0
+                and (is_partial or completed_source_bar_index is None or latest_source_bar_index != int(completed_source_bar_index))
+            )
+            if preview_indicator_needed:
+                preview_bars = bars.iloc[: latest_source_bar_index + 1].copy()
+                if not preview_bars.empty:
+                    overlays, panes, styles = self._deployment_chart_indicator_series(
+                        preview_bars,
+                        list(current_info.get("indicator_ids") or []),
+                        list(current_info.get("strategy_contexts") or []),
+                    )
+                    overlay_payload.extend(
+                        incremental_series_payload(
+                            overlays,
+                            bar_index=int(live_bar_index),
+                            timestamp=latest_bar_ts,
+                            styles=styles,
+                            source_bar_index=latest_source_bar_index,
+                        )
+                    )
+                    pane_payload.extend(
+                        incremental_series_payload(
+                            panes,
+                            bar_index=int(live_bar_index),
+                            timestamp=latest_bar_ts,
+                            styles=styles,
+                            source_bar_index=latest_source_bar_index,
+                        )
+                    )
+                    equity_curve = self._live_monitor_equity_curve_for_session(current_info)
+                    if isinstance(equity_curve, pd.Series) and not equity_curve.empty:
+                        aligned_equity = pd.to_numeric(equity_curve.sort_index(), errors="coerce")
+                        if aligned_equity.index.tz is None:
+                            aligned_equity.index = aligned_equity.index.tz_localize("UTC")
+                        else:
+                            aligned_equity.index = aligned_equity.index.tz_convert("UTC")
+                        aligned_equity = aligned_equity[~aligned_equity.index.duplicated(keep="last")]
+                        aligned_equity = aligned_equity.reindex(preview_bars.index, method="ffill").bfill().rename("equity")
+                        equity_payload.extend(
+                            incremental_series_payload(
+                                {"equity": aligned_equity},
+                                bar_index=int(live_bar_index),
+                                timestamp=latest_bar_ts,
+                                styles={"equity": {"color": PALETTE["blue"], "line_width": 1.3}},
+                                source_bar_index=latest_source_bar_index,
+                            )
+                        )
+            if not any((live_bars_payload, overlay_payload, pane_payload, equity_payload)):
+                continue
+            try:
+                title = f"{cleaned} {chart_timeframe_label(timeframe)}"
+                status_bits = [
+                    f"{'Preview' if is_partial else 'Live'} bar {latest_bar_ts.tz_convert('America/New_York').strftime('%H:%M')}",
+                    f"last IB minute {pd.Timestamp(ts).tz_convert('America/New_York').strftime('%H:%M:%S')}",
+                ]
+                if completed_bar_ts_ns and any((overlay_payload, pane_payload, equity_payload)):
+                    status_bits.insert(0, f"Completed {chart_timeframe_label(timeframe)} bar {completed_bar_label}")
+                self.magellan.send_live_update(
+                    str(current_info.get("session_id") or session_id),
+                    title=title,
+                    status_text="; ".join(status_bits),
+                    bars=live_bars_payload,
+                    overlay_series=overlay_payload,
+                    pane_series=pane_payload,
+                    equity_series=equity_payload,
+                    timeout_ms=MAGELLAN_LIVE_UPDATE_TIMEOUT_MS,
+                )
+                if isinstance(current_info, dict):
+                    if is_partial:
+                        current_info["last_preview_update_monotonic"] = time.monotonic()
+                    if live_bar_index is not None:
+                        current_info["last_sent_bar_ts_ns"] = latest_bar_ts_ns
+                        current_info["last_sent_bar_index"] = int(live_bar_index)
+                    if completed_bar_ts_ns and completed_payload_sent:
+                        current_info["last_completed_replacement_bar_ts_ns"] = completed_bar_ts_ns
+            except Exception as exc:
+                self.status_label.setText(f"Unable to update deployment chart for {cleaned}: {exc}")
+
+    def _close_live_monitor_charts(self, _checked: bool = False, *, silent: bool = False) -> None:
+        closed = 0
+        for session_id in list(getattr(self, "live_monitor_chart_sessions", {})):
+            try:
+                self.magellan.close_session(session_id, timeout_ms=500)
+                closed += 1
+            except Exception:
+                pass
+        self.live_monitor_chart_sessions.clear()
+        for symbol, worker in list(getattr(self, "live_monitor_chart_stream_workers", {}).items()):
+            try:
+                self._release_live_symbol_stream(
+                    symbol,
+                    consumer_key=f"live-monitor:{symbol}",
+                    wait_ms=1500,
+                )
+            except Exception:
+                pass
+            self.live_monitor_chart_stream_workers.pop(symbol, None)
+        for symbol, worker in list(getattr(self, "live_monitor_historical_sync_workers", {}).items()):
+            try:
+                if worker.isRunning():
+                    worker.requestInterruption()
+                    worker.quit()
+                    worker.wait(1500)
+            except Exception:
+                pass
+            self.live_monitor_historical_sync_workers.pop(symbol, None)
+        self.live_monitor_historical_sync_contexts.clear()
+        if not silent:
+            self.status_label.setText(f"Closed {closed} deployment chart{'s' if closed != 1 else ''}.")
 
     def _selected_walk_forward_source_for_monte_carlo(self) -> str | None:
         if not hasattr(self, "monte_carlo_source_table"):
@@ -18654,7 +27663,7 @@ WantedBy=default.target
             artifact = ingest_csv_to_store(csv_path, dataset_id=dataset_id, resolution=self.tf_combo.currentText().strip() or None)
             acq_run_id = f"import_{uuid.uuid4().hex[:8]}"
             rc = ResultCatalog(self.catalog.db_path)
-            started_at = pd.Timestamp.utcnow().isoformat()
+            started_at = pd.Timestamp.now(tz='UTC').isoformat()
             rc.start_acquisition_run(
                 acquisition_run_id=acq_run_id,
                 trigger_type="manual_import",
@@ -18673,7 +27682,7 @@ WantedBy=default.target
                 dataset_id=artifact.dataset_id,
                 status="ingested",
                 started_at=started_at,
-                finished_at=pd.Timestamp.utcnow().isoformat(),
+                finished_at=pd.Timestamp.now(tz='UTC').isoformat(),
                 csv_path=artifact.csv_path,
                 parquet_path=artifact.parquet_path,
                 coverage_start=artifact.start,
@@ -18684,7 +27693,7 @@ WantedBy=default.target
             )
             rc.finish_acquisition_run(
                 acq_run_id,
-                finished_at=pd.Timestamp.utcnow().isoformat(),
+                finished_at=pd.Timestamp.now(tz='UTC').isoformat(),
                 status="success",
                 success_count=1,
                 failed_count=0,
@@ -18705,6 +27714,12 @@ WantedBy=default.target
             except Exception:
                 return default
 
+        def _int(edit: QtWidgets.QLineEdit, default: int) -> int:
+            try:
+                return int(float(edit.text().strip()))
+            except Exception:
+                return default
+
         starting_cash = _float(self.starting_cash_edit, 100_000)
         fee_rate = _float(self.fee_rate_edit, 0.0002)
         fee_buy = _float(self.fee_buy_edit, fee_rate)
@@ -18714,6 +27729,12 @@ WantedBy=default.target
         slip_sell = _float(self.slip_sell_edit, slippage)
         borrow_rate = _float(self.borrow_rate_edit, 0.0)
         fill_ratio = _float(self.fill_ratio_edit, 1.0)
+        max_gross_leverage = max(1.0, _float(self.max_gross_leverage_edit, 2.0))
+        annual_vol_window = max(2, _int(self.annual_vol_window_edit, 252))
+        annual_vol_min_periods = max(2, _int(self.annual_vol_min_periods_edit, 20))
+        annual_vol_floor = max(1e-9, _float(self.annual_vol_floor_edit, 0.05))
+        max_volatility_multiplier = max(0.0, _float(self.max_volatility_multiplier_edit, 2.0))
+        min_position_shares = max(0.0, _float(self.min_position_shares_edit, 1.0))
         return {
             "starting_cash": starting_cash,
             "fee_rate": fee_rate,
@@ -18722,6 +27743,14 @@ WantedBy=default.target
             "slippage_schedule": {"buy": slip_buy, "sell": slip_sell},
             "borrow_rate": borrow_rate,
             "fill_ratio": fill_ratio,
+            "margin_enabled": self.margin_enabled_chk.isChecked(),
+            "max_gross_leverage": max_gross_leverage,
+            "position_sizing_model": str(self.position_sizing_model_combo.currentData() or "none"),
+            "annual_vol_window": annual_vol_window,
+            "annual_vol_min_periods": annual_vol_min_periods,
+            "annual_vol_floor": annual_vol_floor,
+            "max_volatility_multiplier": max_volatility_multiplier,
+            "min_position_shares": min_position_shares,
             "fill_on_close": self.fill_on_close_chk.isChecked(),
             "recalc_on_fill": self.recalc_on_fill_chk.isChecked(),
             "allow_short": self.allow_short_chk.isChecked(),
@@ -18786,7 +27815,9 @@ WantedBy=default.target
             return issues, False
         for block in portfolio_strategy_blocks:
             strategy_name = str(block.get("strategy_name") or "").strip()
-            if strategy_name not in supported_strategies:
+            spec = getattr(self, "strategy_specs", {}).get(strategy_name)
+            class_name = spec["class"].__name__ if spec and "class" in spec else strategy_name
+            if class_name not in supported_strategies:
                 issues.append(
                     f"{strategy_name or 'Unknown strategy'} does not have a vectorized portfolio adapter yet."
                 )
@@ -19071,7 +28102,6 @@ WantedBy=default.target
         dataset_id = dataset_ids[0] if dataset_ids else (self.dataset_combo.currentText().strip() or "dataset")
         study_mode = str(self.study_mode_combo.currentData() or STUDY_MODE_INDEPENDENT)
         timeframes = [tf.strip() for tf in self.timeframes_combo.currentText().split(",") if tf.strip()]
-        horizons_raw = [h.strip() for h in self.horizons_combo.currentText().split(",") if h.strip()]
         risk_free_raw = self.risk_free_edit.text().strip()
         try:
             risk_free_rate = float(risk_free_raw) if risk_free_raw else 0.0
@@ -19102,6 +28132,11 @@ WantedBy=default.target
         if not timeframes:
             QtWidgets.QMessageBox.warning(self, "Timeframes", "Provide at least one timeframe.")
             return
+        horizon_request = self._resolve_horizon_request(dataset_ids)
+        if horizon_request is None:
+            self.status_label.setText("Grid cancelled")
+            return
+        horizons_raw = list(horizon_request.get("horizons") or [])
 
         strategy_factory, strat_params, param_errors = self._collect_strategy_params()
         if param_errors:
@@ -19170,6 +28205,9 @@ WantedBy=default.target
             sharpe_debug=self.sharpe_debug_chk.isChecked(),
             risk_free_rate=risk_free_rate,
             bt_settings=bt_settings,
+            horizon_mode=str(horizon_request.get("mode") or HORIZON_MODE_DYNAMIC),
+            fixed_horizon_start=horizon_request.get("fixed_start"),
+            fixed_horizon_end=horizon_request.get("fixed_end"),
             portfolio_strategy_blocks=portfolio_strategy_blocks,
         )
         self.worker.finished_signal.connect(self._grid_finished)
@@ -19312,6 +28350,323 @@ WantedBy=default.target
         except Exception:
             return str(mode).replace("_", " ").title()
 
+    def _on_dataset_scope_changed(self) -> None:
+        self._update_study_dataset_summary()
+        self._update_horizon_coverage_summary()
+
+    def _current_horizon_mode(self) -> str:
+        if hasattr(self, "fixed_horizon_radio") and self.fixed_horizon_radio.isChecked():
+            return HORIZON_MODE_DATE_RANGE
+        return HORIZON_MODE_DYNAMIC
+
+    @staticmethod
+    def _coerce_utc_timestamp(value: object) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        try:
+            stamp = pd.to_datetime(value, utc=True, errors="coerce")
+        except Exception:
+            return None
+        if pd.isna(stamp):
+            return None
+        return pd.Timestamp(stamp)
+
+    @staticmethod
+    def _qdate_from_timestamp(value: object) -> QtCore.QDate:
+        stamp = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(stamp):
+            return QtCore.QDate()
+        return QtCore.QDate(int(stamp.year), int(stamp.month), int(stamp.day))
+
+    @staticmethod
+    def _qdate_to_timestamp(date: QtCore.QDate, *, is_end: bool = False) -> pd.Timestamp:
+        stamp = pd.Timestamp(date.toString("yyyy-MM-dd"), tz="UTC")
+        if is_end:
+            return stamp + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+        return stamp
+
+    @staticmethod
+    def _qdate_outside(date: QtCore.QDate, minimum: QtCore.QDate, maximum: QtCore.QDate) -> bool:
+        day = date.toJulianDay()
+        return day < minimum.toJulianDay() or day > maximum.toJulianDay()
+
+    def _run_dataset_ids_for_current_scope(self) -> list[str]:
+        if not hasattr(self, "dataset_combo"):
+            return []
+        study_mode = str(self.study_mode_combo.currentData() or STUDY_MODE_INDEPENDENT)
+        if study_mode == STUDY_MODE_PORTFOLIO and self.portfolio_strategy_blocks:
+            return self._portfolio_strategy_block_dataset_ids()
+        return self._selected_study_dataset_ids()
+
+    def _dataset_shared_coverage(self, dataset_ids: Sequence[str]) -> dict:
+        resolved_ids = list(dict.fromkeys(str(item).strip() for item in list(dataset_ids or []) if str(item).strip()))
+        result = {
+            "dataset_ids": resolved_ids,
+            "per_dataset": [],
+            "missing": [],
+            "start": None,
+            "end": None,
+            "has_overlap": False,
+        }
+        if not resolved_ids:
+            return result
+
+        record_map: dict[str, dict] = {}
+        frame = self.picker_snapshot_frame()
+        if isinstance(frame, pd.DataFrame) and not frame.empty and "dataset_id" in frame.columns:
+            for _, row in frame.iterrows():
+                dataset_id = str(row.get("dataset_id") or "").strip()
+                if dataset_id and dataset_id not in record_map:
+                    record_map[dataset_id] = row.to_dict()
+
+        starts: list[pd.Timestamp] = []
+        ends: list[pd.Timestamp] = []
+        per_dataset: list[dict] = []
+        missing: list[str] = []
+        store: DuckDBStore | None = None
+        catalog: ResultCatalog | None = None
+        try:
+            for dataset_id in resolved_ids:
+                record = dict(record_map.get(dataset_id) or {})
+                start_ts = self._coerce_utc_timestamp(record.get("coverage_start"))
+                end_ts = self._coerce_utc_timestamp(record.get("coverage_end"))
+                if start_ts is None or end_ts is None:
+                    catalog = catalog or ResultCatalog(self.catalog.db_path)
+                    catalog_record = catalog.load_acquisition_dataset(dataset_id)
+                    if catalog_record is not None:
+                        start_ts = start_ts or self._coerce_utc_timestamp(catalog_record.coverage_start)
+                        end_ts = end_ts or self._coerce_utc_timestamp(catalog_record.coverage_end)
+                if start_ts is None or end_ts is None:
+                    store = store or DuckDBStore()
+                    meta = _cached_local_dataset_meta(store, store.dataset_path(dataset_id))
+                    if meta:
+                        start_ts = start_ts or self._coerce_utc_timestamp(meta.get("coverage_start"))
+                        end_ts = end_ts or self._coerce_utc_timestamp(meta.get("coverage_end"))
+                if start_ts is None or end_ts is None:
+                    missing.append(dataset_id)
+                    continue
+                starts.append(start_ts)
+                ends.append(end_ts)
+                per_dataset.append({"dataset_id": dataset_id, "start": start_ts, "end": end_ts})
+        finally:
+            if store is not None:
+                store.close()
+
+        result["per_dataset"] = per_dataset
+        result["missing"] = missing
+        if starts and ends and not missing:
+            shared_start = max(starts)
+            shared_end = min(ends)
+            result["start"] = shared_start
+            result["end"] = shared_end
+            result["has_overlap"] = bool(shared_start <= shared_end)
+        return result
+
+    def _set_horizon_control_enabled(self) -> None:
+        if not hasattr(self, "horizons_combo"):
+            return
+        fixed_mode = self._current_horizon_mode() == HORIZON_MODE_DATE_RANGE
+        coverage_valid = bool(getattr(self, "_horizon_coverage_valid", False))
+        self.horizons_combo.setEnabled(not fixed_mode)
+        self.horizon_start_date_edit.setEnabled(fixed_mode and coverage_valid)
+        self.horizon_end_date_edit.setEnabled(fixed_mode and coverage_valid)
+
+    def _update_horizon_controls(self) -> None:
+        self._update_horizon_coverage_summary()
+
+    def _apply_specific_horizon_bounds(self, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> None:
+        if not hasattr(self, "horizon_start_date_edit"):
+            return
+        minimum = self._qdate_from_timestamp(start_ts)
+        maximum = self._qdate_from_timestamp(end_ts)
+        if not minimum.isValid() or not maximum.isValid() or minimum.toJulianDay() > maximum.toJulianDay():
+            return
+        start_edit = self.horizon_start_date_edit
+        end_edit = self.horizon_end_date_edit
+        start_edit.blockSignals(True)
+        end_edit.blockSignals(True)
+        try:
+            start_edit.setDateRange(minimum, maximum)
+            end_edit.setDateRange(minimum, maximum)
+            start_date = start_edit.date()
+            end_date = end_edit.date()
+            if self._qdate_outside(start_date, minimum, maximum):
+                start_date = minimum
+            if self._qdate_outside(end_date, minimum, maximum):
+                end_date = maximum
+            if start_date.toJulianDay() > end_date.toJulianDay():
+                start_date = minimum
+                end_date = maximum
+            start_edit.setDate(start_date)
+            end_edit.setDate(end_date)
+        finally:
+            start_edit.blockSignals(False)
+            end_edit.blockSignals(False)
+
+    def _on_horizon_start_date_changed(self, date: QtCore.QDate) -> None:
+        if not hasattr(self, "horizon_end_date_edit"):
+            return
+        if date.toJulianDay() > self.horizon_end_date_edit.date().toJulianDay():
+            self.horizon_end_date_edit.setDate(date)
+        self._update_horizon_coverage_summary()
+
+    def _on_horizon_end_date_changed(self, date: QtCore.QDate) -> None:
+        if not hasattr(self, "horizon_start_date_edit"):
+            return
+        if date.toJulianDay() < self.horizon_start_date_edit.date().toJulianDay():
+            self.horizon_start_date_edit.setDate(date)
+        self._update_horizon_coverage_summary()
+
+    def _dynamic_horizon_issues(
+        self,
+        horizons_raw: Sequence[str],
+        shared_start: pd.Timestamp,
+        shared_end: pd.Timestamp,
+    ) -> tuple[list[str], list[str]]:
+        invalid: list[str] = []
+        too_long: list[str] = []
+        for horizon in horizons_raw:
+            try:
+                delta = _parse_horizon_timedelta(horizon)
+            except Exception:
+                invalid.append(str(horizon))
+                continue
+            if delta <= pd.Timedelta(0):
+                invalid.append(str(horizon))
+            elif shared_end - delta < shared_start:
+                too_long.append(str(horizon))
+        return invalid, too_long
+
+    def _update_horizon_coverage_summary(self) -> None:
+        if not hasattr(self, "horizon_coverage_label"):
+            return
+        dataset_ids = self._run_dataset_ids_for_current_scope()
+        coverage = self._dataset_shared_coverage(dataset_ids)
+        self._horizon_shared_coverage = coverage
+        self._horizon_coverage_valid = False
+        tooltip_lines: list[str] = []
+        if not dataset_ids:
+            self.horizon_coverage_label.setText("Select a dataset to see available coverage.")
+            self.horizon_coverage_label.setToolTip("")
+            self._set_horizon_control_enabled()
+            return
+        missing = list(coverage.get("missing") or [])
+        if missing:
+            preview = ", ".join(missing[:3])
+            if len(missing) > 3:
+                preview = f"{preview}, ..."
+            self.horizon_coverage_label.setText(f"Coverage unavailable for {len(missing)} selected dataset(s): {preview}.")
+            self.horizon_coverage_label.setToolTip("\n".join(missing))
+            self._set_horizon_control_enabled()
+            return
+        shared_start = coverage.get("start")
+        shared_end = coverage.get("end")
+        if not coverage.get("has_overlap") or shared_start is None or shared_end is None:
+            self.horizon_coverage_label.setText("Selected datasets do not have an overlapping historical range.")
+            self.horizon_coverage_label.setToolTip("")
+            self._set_horizon_control_enabled()
+            return
+
+        shared_start = pd.Timestamp(shared_start)
+        shared_end = pd.Timestamp(shared_end)
+        self._horizon_coverage_valid = True
+        self._apply_specific_horizon_bounds(shared_start, shared_end)
+        for row in list(coverage.get("per_dataset") or []):
+            tooltip_lines.append(
+                f"{row['dataset_id']}: {_format_coverage_date(row['start'])} to {_format_coverage_date(row['end'])}"
+            )
+        max_days = max(0, int((shared_end - shared_start) / pd.Timedelta(days=1)))
+        text = (
+            f"Available shared range: {_format_coverage_date(shared_start)} to {_format_coverage_date(shared_end)} "
+            f"across {len(dataset_ids)} dataset(s). Max dynamic lookback: {max_days}d."
+        )
+        if self._current_horizon_mode() == HORIZON_MODE_DYNAMIC:
+            horizons_raw = [h.strip() for h in self.horizons_combo.currentText().split(",") if h.strip()]
+            invalid, too_long = self._dynamic_horizon_issues(horizons_raw, shared_start, shared_end)
+            if invalid:
+                text = f"{text} Invalid horizon: {', '.join(invalid)}."
+            elif too_long:
+                text = f"{text} Outside coverage: {', '.join(too_long)}."
+        self.horizon_coverage_label.setText(text)
+        self.horizon_coverage_label.setToolTip("\n".join(tooltip_lines))
+        self._set_horizon_control_enabled()
+
+    def _selected_specific_horizon_timestamps(self) -> tuple[pd.Timestamp, pd.Timestamp]:
+        return (
+            self._qdate_to_timestamp(self.horizon_start_date_edit.date(), is_end=False),
+            self._qdate_to_timestamp(self.horizon_end_date_edit.date(), is_end=True),
+        )
+
+    def _resolve_horizon_request(self, dataset_ids: Sequence[str]) -> dict | None:
+        coverage = self._dataset_shared_coverage(dataset_ids)
+        missing = list(coverage.get("missing") or [])
+        shared_start = coverage.get("start")
+        shared_end = coverage.get("end")
+        if missing:
+            self._show_error_dialog(
+                "Dataset Coverage Missing",
+                f"Coverage could not be determined for {len(missing)} selected dataset(s).",
+                details="\n".join(missing),
+            )
+            return None
+        if not coverage.get("has_overlap") or shared_start is None or shared_end is None:
+            self._show_error_dialog(
+                "Dataset Coverage Unavailable",
+                "The selected datasets do not have a shared historical date range.",
+                details="\n".join(str(item) for item in list(dataset_ids or [])),
+            )
+            return None
+
+        shared_start = pd.Timestamp(shared_start)
+        shared_end = pd.Timestamp(shared_end)
+        mode = self._current_horizon_mode()
+        if mode == HORIZON_MODE_DATE_RANGE:
+            fixed_start, fixed_end = self._selected_specific_horizon_timestamps()
+            if fixed_start > fixed_end:
+                QtWidgets.QMessageBox.warning(self, "Date Range", "Start date must be before or equal to end date.")
+                return None
+            if fixed_start.normalize() < shared_start.normalize() or fixed_end.normalize() > shared_end.normalize():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Date Range Outside Data",
+                    "Choose dates inside the available shared range: "
+                    f"{_format_coverage_date(shared_start)} to {_format_coverage_date(shared_end)}.",
+                )
+                return None
+            label = f"{_format_coverage_date(fixed_start)}->{_format_coverage_date(fixed_end)}"
+            return {
+                "mode": mode,
+                "horizons": [label],
+                "fixed_start": fixed_start,
+                "fixed_end": fixed_end,
+            }
+
+        horizons_raw = [h.strip() for h in self.horizons_combo.currentText().split(",") if h.strip()]
+        invalid, too_long = self._dynamic_horizon_issues(horizons_raw, shared_start, shared_end)
+        if invalid:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid Horizons",
+                "Use horizon values like 7d, 30d, 6mo, or 1y.\n\nInvalid: " + ", ".join(invalid),
+            )
+            return None
+        if too_long:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Horizon Outside Data",
+                "These horizons start before the available shared dataset range: "
+                + ", ".join(too_long)
+                + "\n\nAvailable shared range: "
+                + f"{_format_coverage_date(shared_start)} to {_format_coverage_date(shared_end)}.",
+            )
+            return None
+        return {
+            "mode": mode,
+            "horizons": horizons_raw,
+            "fixed_start": None,
+            "fixed_end": None,
+        }
+
     def _portfolio_strategy_block_dataset_ids(self) -> list[str]:
         dataset_ids: list[str] = []
         seen: set[str] = set()
@@ -19341,6 +28696,7 @@ WantedBy=default.target
         block_dataset_ids = self._portfolio_strategy_block_dataset_ids()
         self.study_dataset_ids = block_dataset_ids
         self._update_study_dataset_summary()
+        self._update_horizon_coverage_summary()
         self._update_portfolio_strategy_block_summary()
         self._update_portfolio_allocation_summary()
 
@@ -19348,6 +28704,7 @@ WantedBy=default.target
         self.portfolio_strategy_blocks = []
         self._update_portfolio_strategy_block_summary()
         self._update_portfolio_allocation_summary()
+        self._update_horizon_coverage_summary()
 
     def _update_portfolio_strategy_block_summary(self) -> None:
         if not hasattr(self, "portfolio_blocks_summary"):
@@ -19406,6 +28763,7 @@ WantedBy=default.target
                 "Each asset is backtested separately; this is not portfolio backtesting."
             )
         self._update_portfolio_allocation_summary()
+        self._update_horizon_coverage_summary()
 
     def _update_portfolio_allocation_summary(self) -> None:
         if not hasattr(self, "portfolio_allocation_summary"):
@@ -19567,6 +28925,7 @@ WantedBy=default.target
             }
             self._update_study_dataset_summary()
             self._refresh_universe_dataset_summary()
+            self._update_horizon_coverage_summary()
         except Exception:
             # Best-effort; leave combo as-is if listing fails.
             pass
@@ -19672,6 +29031,7 @@ WantedBy=default.target
         else:
             self.study_dataset_ids = selected
         self._update_study_dataset_summary()
+        self._update_horizon_coverage_summary()
 
     def _reset_study_datasets_to_current(self) -> None:
         self.study_universe_id = ""
@@ -19681,12 +29041,14 @@ WantedBy=default.target
             self.study_universe_combo.blockSignals(False)
         self.study_dataset_ids = []
         self._update_study_dataset_summary()
+        self._update_horizon_coverage_summary()
 
     def _on_study_universe_changed(self) -> None:
         if not hasattr(self, "study_universe_combo"):
             return
         self.study_universe_id = str(self.study_universe_combo.currentData() or "")
         self._update_study_dataset_summary()
+        self._update_horizon_coverage_summary()
 
     def _shutdown_asset_worker(self, worker: QtCore.QThread | None) -> None:
         if worker is None or not worker.isRunning():
@@ -19700,8 +29062,32 @@ WantedBy=default.target
         if self._magellan_warm_timer.isActive():
             self._magellan_warm_timer.stop()
         self._prepare_download_session_for_shutdown()
+        downloads_stopped = self._shutdown_download_activity(wait_ms=60000)
+        if not downloads_stopped:
+            self._closing = False
+            if hasattr(self, "download_status"):
+                self.download_status.setText("Still waiting for download finalization to stop. Try closing again after it finishes.")
+            event.ignore()
+            return
         self._shutdown_asset_worker(self.asset_provider_worker)
         self._shutdown_asset_worker(self.asset_reference_worker)
+        self._stop_charts_live_stream()
+        self._stop_charts_watchlist_streams()
+        self._close_live_monitor_charts(silent=True)
+        self._stop_live_deployment_streams()
+        if self.charts_current_session_id:
+            try:
+                self.magellan.close_session(self.charts_current_session_id, timeout_ms=500)
+            except Exception:
+                pass
+        if self.charts_historical_sync_worker and self.charts_historical_sync_worker.isRunning():
+            self.charts_historical_sync_worker.requestInterruption()
+            self.charts_historical_sync_worker.quit()
+            self.charts_historical_sync_worker.wait(1500)
+        if self.charts_watchlist_worker and self.charts_watchlist_worker.isRunning():
+            self.charts_watchlist_worker.requestInterruption()
+            self.charts_watchlist_worker.quit()
+            self.charts_watchlist_worker.wait(1500)
         if self.worker and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait(2000)
@@ -19712,7 +29098,7 @@ WantedBy=default.target
         if self._closing:
             return
         try:
-            self.magellan.ensure_running(timeout_ms=2500)
+            self.magellan.warmup_async()
         except Exception:
             # Keep warmup best-effort so the dashboard still opens even if Magellan is unavailable.
             pass
@@ -19720,10 +29106,21 @@ WantedBy=default.target
     def _snapshot_root_for_run(self, run: "RunRow") -> Path:
         return self.snapshot_exporter.root_dir / str(run.run_id)
 
+    @staticmethod
+    def _manifest_is_strict_json(manifest_path: Path) -> bool:
+        def _reject_json_constant(value: str):
+            raise ValueError(f"Non-standard JSON constant: {value}")
+
+        try:
+            json.loads(manifest_path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+        except Exception:
+            return False
+        return True
+
     def _existing_snapshot_root_for_run(self, run: "RunRow") -> Path | None:
         snapshot_root = self._snapshot_root_for_run(run)
         manifest_path = snapshot_root / "manifest.json"
-        if manifest_path.exists():
+        if manifest_path.exists() and self._manifest_is_strict_json(manifest_path):
             return snapshot_root.resolve()
         return None
 
@@ -19732,11 +29129,18 @@ WantedBy=default.target
         assets_root = snapshot_root / "assets"
         if not assets_root.exists():
             return []
-        roots = [
-            child.resolve()
-            for child in sorted(assets_root.iterdir(), key=lambda item: item.name.lower())
-            if child.is_dir() and (child / "manifest.json").exists()
-        ]
+        roots: list[Path] = []
+        invalid_manifest_found = False
+        for child in sorted(assets_root.iterdir(), key=lambda item: item.name.lower()):
+            manifest_path = child / "manifest.json"
+            if not child.is_dir() or not manifest_path.exists():
+                continue
+            if self._manifest_is_strict_json(manifest_path):
+                roots.append(child.resolve())
+            else:
+                invalid_manifest_found = True
+        if invalid_manifest_found:
+            return []
         return roots
 
     @staticmethod
@@ -19858,6 +29262,7 @@ WantedBy=default.target
                 execution_cfg.get("one_order_per_signal", current_bt_settings.get("one_order_per_signal", True))
             ),
             risk_free_rate=float(execution_cfg.get("risk_free_rate", current_bt_settings.get("risk_free_rate", 0.0))),
+            **_backtest_sizing_kwargs({**current_bt_settings, **execution_cfg}),
         )
         return PortfolioExecutionRequest(
             assets=assets,
@@ -20081,9 +29486,16 @@ WantedBy=default.target
             grid_params[key] = vals
         return cls, grid_params, errors
 
-    def _show_error_dialog(self, title: str, text: str, details: str | None = None) -> None:
+    def _show_message_dialog(
+        self,
+        title: str,
+        text: str,
+        details: str | None = None,
+        *,
+        icon: QtWidgets.QMessageBox.Icon = QtWidgets.QMessageBox.Icon.Information,
+    ) -> None:
         box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+        box.setIcon(icon)
         box.setWindowTitle(title)
         box.setText(text or "Unknown error")
         if details:
@@ -20108,6 +29520,14 @@ WantedBy=default.target
             """
         )
         box.exec()
+
+    def _show_error_dialog(self, title: str, text: str, details: str | None = None) -> None:
+        self._show_message_dialog(
+            title,
+            text,
+            details,
+            icon=QtWidgets.QMessageBox.Icon.Critical,
+        )
 
     def _summarize_error(self, message: str | None) -> str:
         """Return a concise error line (typically the last line of a traceback)."""
@@ -20522,14 +29942,23 @@ class BatchDetailDialog(DashboardDialog):
         if not trades:
             return pd.DataFrame()
         rows = []
-        pos = 0.0
-        prev_realized = 0.0
+        pos_by_asset: dict[str, float] = {}
+        prev_realized_by_asset: dict[str, float] = {}
         for i, t in enumerate(trades, start=1):
-            position_before = pos
-            qty = t["qty"]
-            pos += qty
-            net_pnl = t["realized_pnl"] - prev_realized
-            prev_realized = t["realized_pnl"]
+            asset_label = str(t.get("dataset_id", "") or "")
+            source_dataset_id = str(t.get("source_dataset_id", asset_label) or asset_label)
+            strategy_block_id = str(t.get("strategy_block_id", "") or "")
+            position_before = float(pos_by_asset.get(asset_label, 0.0))
+            qty = float(t.get("qty", 0.0))
+            pos = position_before + qty
+            if abs(pos) < 1e-12:
+                pos = 0.0
+            pos_by_asset[asset_label] = pos
+            prev_realized = float(prev_realized_by_asset.get(asset_label, 0.0))
+            realized_cum = float(t.get("realized_pnl", 0.0))
+            net_pnl = realized_cum - prev_realized
+            prev_realized_by_asset[asset_label] = realized_cum
+
             if position_before * pos < 0:
                 trade_type = "flip"
             elif abs(pos) > abs(position_before):
@@ -20548,18 +29977,28 @@ class BatchDetailDialog(DashboardDialog):
             rows.append(
                 {
                     "trade_number": i,
+                    "asset": source_dataset_id,
+                    "asset_label": asset_label if asset_label != source_dataset_id else "",
+                    "strategy_block": strategy_block_id,
                     "type": trade_type,
-                    "timestamp": t["timestamp"],
+                    "timestamp": t.get("timestamp", ""),
                     "signal": signal,
                     "side": side,
-                    "price": t["price"],
+                    "price": float(t.get("price", 0.0)),
                     "qty": qty,
                     "position_after": pos,
                     "net_pnl": net_pnl,
-                    "realized_pnl_cum": t["realized_pnl"],
+                    "realized_pnl_cum": realized_cum,
                 }
             )
-        return pd.DataFrame(rows)
+        frame = pd.DataFrame(rows)
+        if "asset_label" in frame.columns and (frame["asset_label"] == "").all():
+            frame = frame.drop(columns=["asset_label"])
+        if "strategy_block" in frame.columns and (frame["strategy_block"] == "").all():
+            frame = frame.drop(columns=["strategy_block"])
+        if "asset" in frame.columns and (frame["asset"] == "").all():
+            frame = frame.drop(columns=["asset"])
+        return frame
 
     def _download_trades(self, run: RunRow) -> None:
         try:
@@ -22569,6 +32008,7 @@ class FixedPortfolioCandidateDialog(DashboardDialog):
                 notes=str(notes or ""),
             )
         self._refresh_candidate_queue()
+        self._notify_dashboard_hook("_on_candidate_catalog_changed")
 
     def _remove_selected_candidate(self) -> None:
         selected = self._selected_candidate()
@@ -22584,6 +32024,7 @@ class FixedPortfolioCandidateDialog(DashboardDialog):
             return
         self.catalog.delete_optimization_candidate(str(selected.get("candidate_id", "")))
         self._refresh_candidate_queue()
+        self._notify_dashboard_hook("_on_candidate_catalog_changed")
 
 
 class OptimizationStudyDialog(DashboardDialog):
@@ -23475,6 +32916,7 @@ class OptimizationStudyDialog(DashboardDialog):
         )
         self.candidates = self.catalog.load_optimization_candidates(self.study_id)
         self._refresh_slice_view()
+        self._notify_dashboard_hook("_on_candidate_catalog_changed")
 
     def _remove_selected_candidate(self) -> None:
         selected = self._selected_candidate_row()
@@ -23491,6 +32933,7 @@ class OptimizationStudyDialog(DashboardDialog):
         self.catalog.delete_optimization_candidate(str(selected.get("candidate_id", "")))
         self.candidates = self.catalog.load_optimization_candidates(self.study_id)
         self._refresh_slice_view()
+        self._notify_dashboard_hook("_on_candidate_catalog_changed")
 
     def _refresh_asset_distribution(self) -> None:
         selected = self._selected_aggregate_row()
@@ -24895,7 +34338,10 @@ class TickerPickerDialog(DashboardDialog):
         info = QtWidgets.QLabel("Select tickers to schedule for data acquisition.")
         info.setObjectName("Sub")
         layout.addWidget(info)
-        legend = QtWidgets.QLabel("Ready = ingested and current | Stale / Raw Only = needs attention | Error / Missing = not usable yet")
+        legend = QtWidgets.QLabel(
+            "Ready = ingested, current, and gap-free | Gappy = current but quality repair is needed | "
+            "Stale / Raw Only = needs attention | Error / Missing = not usable yet"
+        )
         legend.setObjectName("Sub")
         legend.setWordWrap(True)
         layout.addWidget(legend)
@@ -25342,6 +34788,7 @@ class RunChartDialog(DashboardDialog):
             one_order_per_signal=bool(bt_settings.get("one_order_per_signal", True)),
             base_execution=True if run.timeframe != "1 minutes" else False,
             base_timeframe="1 minutes",
+            **_backtest_sizing_kwargs(bt_settings),
         )
         orchestrator = ExecutionOrchestrator()
         return orchestrator.execute(
@@ -25411,7 +34858,7 @@ class RunChartDialog(DashboardDialog):
             "SMA Fast": "#4da3ff",
             "SMA Slow": "#ffd166",
             "Half-Life Mean": "#4da3ff",
-            "Z-Score": "#ffcc66",
+            "Z-Score": "#a28bff",
             "Upper": "#27d07d",
             "Lower": "#ff6b6b",
             "Exit Upper": "#7ee787",
