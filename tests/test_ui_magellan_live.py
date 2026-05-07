@@ -121,6 +121,113 @@ class DeploymentStatusSummaryTests(unittest.TestCase):
         self.assertEqual(counts["paused"], 1)
 
 
+class LiveRunnerProcessBoundaryTests(unittest.TestCase):
+    def test_activate_live_deployment_queues_runner_command_instead_of_gui_worker(self) -> None:
+        queued = []
+        statuses = []
+        legacy_stop_calls = []
+
+        class FakeCatalog:
+            db_path = "/tmp/backtests.sqlite"
+
+            def enqueue_deployment_runner_command(self, command_type, *, deployment_id="", payload_json=None):
+                queued.append((command_type, deployment_id, dict(payload_json or {})))
+                return "command-123456"
+
+        window = DashboardWindow.__new__(DashboardWindow)
+        window.catalog = FakeCatalog()
+        window.deployment_targets_frame = pd.DataFrame(
+            [
+                {
+                    "target_id": "target-1",
+                    "name": "Target",
+                    "base_url": "http://127.0.0.1",
+                    "webhook_path": "/webhook",
+                    "secret_value": "secret",
+                    "secret_ref": "",
+                }
+            ]
+        )
+        window._ensure_live_deployment_runner_process = lambda: True
+        window._stop_live_deployment_streams = lambda: legacy_stop_calls.append(True)
+        window._update_deployment_status_tree = lambda deployment_id, **kwargs: statuses.append((deployment_id, kwargs))
+        window._build_live_deployment_contexts = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("GUI must not build live runner execution contexts.")
+        )
+
+        ok, message = DashboardWindow._activate_live_deployment(
+            window,
+            {"deployment_id": "deploy-1", "target_id": "target-1"},
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("Queued live runner arm command", message)
+        self.assertEqual(queued, [("arm", "deploy-1", {"deployment_id": "deploy-1"})])
+        self.assertEqual(legacy_stop_calls, [True])
+        self.assertEqual(statuses[-1][0], "deploy-1")
+        self.assertEqual(statuses[-1][1]["status"], "armed")
+
+    def test_open_live_monitor_charts_queues_chart_service_command_instead_of_gui_snapshot(self) -> None:
+        queued = []
+
+        class FakeStatus:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def setText(self, value: str) -> None:
+                self.value = value
+
+            def text(self) -> str:
+                return self.value
+
+        class FakeCatalog:
+            db_path = "/tmp/backtests.sqlite"
+
+            def enqueue_live_chart_command(self, command_type, *, session_id="", deployment_id="", payload_json=None):
+                queued.append((command_type, session_id, deployment_id, dict(payload_json or {})))
+                return "chart-command-123"
+
+        window = DashboardWindow.__new__(DashboardWindow)
+        window.catalog = FakeCatalog()
+        window.live_monitor_chart_sessions = {}
+        window.status_label = FakeStatus()
+        window._selected_live_monitor_row = lambda: {
+            "deployment_id": "deploy-1",
+            "target_id": "target-1",
+            "timeframe": "15m",
+        }
+        window._deployment_symbol_scope = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("GUI must not resolve deployment chart symbols.")
+        )
+        window._symbol_from_dataset_id = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("GUI must not build dataset-symbol maps for chart open.")
+        )
+        window._selected_live_monitor_chart_lookback = lambda: "3mo"
+        window._selected_charts_timeframe = lambda: "1m"
+        window._ensure_live_monitor_chart_service_process = lambda: True
+        window._close_live_monitor_charts = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Open must not close/inspect existing charts on the GUI thread.")
+        )
+        window._open_or_reload_live_monitor_chart = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("GUI must not build/open Live Monitor chart snapshots.")
+        )
+        window._fetch_target_external_snapshot = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("GUI must not fetch external chart state.")
+        )
+
+        DashboardWindow._open_live_monitor_charts(window)
+
+        self.assertEqual(len(queued), 1)
+        command_type, session_id, deployment_id, payload = queued[0]
+        self.assertEqual(command_type, "open_deployment_charts")
+        self.assertEqual(session_id, "")
+        self.assertEqual(deployment_id, "deploy-1")
+        self.assertEqual(payload["timeframe"], "15m")
+        self.assertEqual(payload["lookback"], "3mo")
+        self.assertTrue(payload["replace_existing"])
+        self.assertIn("Queued Live Monitor Magellan chart open", window.status_label.text())
+
+
 class LiveDeploymentRunnerTests(unittest.TestCase):
     def test_secret_loader_prefers_saved_target_secret(self) -> None:
         secret = DashboardWindow._deployment_secret_value(
@@ -752,26 +859,57 @@ class LiveMonitorMagellanUpdateTests(unittest.TestCase):
             ["live-monitor:SOXL", "live-deployment:SOXL"],
         )
 
-    def test_closing_live_monitor_releases_only_monitor_stream_consumer(self) -> None:
+    def test_closing_service_owned_live_monitor_chart_queues_close_command(self) -> None:
         class FakeMagellan:
             def close_session(self, *args, **kwargs) -> None:
+                raise AssertionError("GUI must not close service-owned Magellan sessions directly.")
+
+        queued = []
+        class FakeProcess:
+            def poll(self):
                 return None
 
-        released = []
         window = DashboardWindow.__new__(DashboardWindow)
         window.magellan = FakeMagellan()
-        window.live_monitor_chart_sessions = {"live-monitor:test:SOXL": {}}
-        window.live_monitor_chart_stream_workers = {"SOXL": object()}
+        window.live_monitor_chart_service_process = FakeProcess()
+        window.live_monitor_chart_sessions = {
+            "live-monitor:test:SOXL": {"owner": "service", "deployment_id": "test", "symbol": "SOXL"}
+        }
+        window.live_monitor_chart_stream_workers = {}
         window.live_monitor_historical_sync_workers = {}
         window.live_monitor_historical_sync_contexts = {}
         window._symbol_from_dataset_id = lambda value: _market_symbol_from_dataset_id(value)
-        window._release_live_symbol_stream = lambda symbol, *, consumer_key, wait_ms=1500: released.append(
-            (symbol, consumer_key, wait_ms)
+        window._ensure_live_monitor_chart_service_process = lambda: True
+        window._selected_live_monitor_row = lambda: {"deployment_id": "test"}
+        window._queue_live_chart_command = lambda command_type, **kwargs: queued.append((command_type, kwargs)) or "close-command"
+        window._release_live_symbol_stream = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("service-owned charts should not hold GUI stream consumers")
         )
 
         DashboardWindow._close_live_monitor_charts(window, silent=True)
 
-        self.assertEqual(released, [("SOXL", "live-monitor:SOXL", 1500)])
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0][0], "close_deployment_charts")
+        self.assertEqual(queued[0][1]["deployment_id"], "test")
+        self.assertEqual(window.live_monitor_chart_sessions, {})
+
+    def test_closing_with_no_service_sessions_does_not_cold_start_chart_service(self) -> None:
+        window = DashboardWindow.__new__(DashboardWindow)
+        window.live_monitor_chart_sessions = {}
+        window.live_monitor_chart_service_process = None
+        window.live_monitor_chart_stream_workers = {}
+        window.live_monitor_historical_sync_workers = {}
+        window.live_monitor_historical_sync_contexts = {}
+        window._ensure_live_monitor_chart_service_process = lambda: (_ for _ in ()).throw(
+            AssertionError("No-op close must not start the chart service.")
+        )
+        window._queue_live_chart_command = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("No-op close must not enqueue chart commands.")
+        )
+
+        DashboardWindow._close_live_monitor_charts(window, silent=True)
+
+        self.assertEqual(window.live_monitor_chart_sessions, {})
 
     def test_live_deployment_initial_bar_stamp_does_not_load_chart_history(self) -> None:
         window = DashboardWindow.__new__(DashboardWindow)

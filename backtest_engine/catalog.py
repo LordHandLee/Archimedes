@@ -291,6 +291,65 @@ class DeploymentMetricSnapshotRecord:
 
 
 @dataclass
+class DeploymentRunnerCommandRecord:
+    command_id: str
+    command_type: str
+    deployment_id: str | None
+    payload_json: str
+    status: str
+    claimed_by: str | None
+    error: str | None
+    created_at: str | None
+    updated_at: str | None
+    claimed_at: str | None
+    processed_at: str | None
+
+
+@dataclass
+class DeploymentRunnerEventRecord:
+    event_seq: int
+    event_id: str
+    event_type: str
+    deployment_id: str | None
+    context_id: str | None
+    symbol: str | None
+    severity: str
+    message: str | None
+    payload_json: str
+    created_at: str | None
+
+
+@dataclass
+class LiveChartCommandRecord:
+    command_id: str
+    command_type: str
+    session_id: str | None
+    deployment_id: str | None
+    payload_json: str
+    status: str
+    claimed_by: str | None
+    error: str | None
+    created_at: str | None
+    updated_at: str | None
+    claimed_at: str | None
+    processed_at: str | None
+
+
+@dataclass
+class LiveChartEventRecord:
+    event_seq: int
+    event_id: str
+    event_type: str
+    session_id: str | None
+    deployment_id: str | None
+    symbol: str | None
+    severity: str
+    message: str | None
+    payload_json: str
+    created_at: str | None
+
+
+@dataclass
 class UniverseRecord:
     universe_id: str
     name: str
@@ -1624,6 +1683,109 @@ class ResultCatalog:
                     health_json TEXT NOT NULL,
                     PRIMARY KEY (deployment_id, snapshot_ts)
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deployment_runner_commands (
+                    command_id TEXT PRIMARY KEY,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    command_type TEXT NOT NULL,
+                    deployment_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    claimed_by TEXT,
+                    claimed_at TEXT,
+                    processed_at TEXT,
+                    error TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deployment_runner_events (
+                    event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    event_type TEXT NOT NULL,
+                    deployment_id TEXT,
+                    context_id TEXT,
+                    symbol TEXT,
+                    severity TEXT NOT NULL,
+                    message TEXT,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_deployment_runner_commands_status_created
+                ON deployment_runner_commands(status, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_deployment_runner_events_seq
+                ON deployment_runner_events(event_seq)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_deployment_runner_events_deployment
+                ON deployment_runner_events(deployment_id, event_seq)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_chart_commands (
+                    command_id TEXT PRIMARY KEY,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    command_type TEXT NOT NULL,
+                    session_id TEXT,
+                    deployment_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    claimed_by TEXT,
+                    claimed_at TEXT,
+                    processed_at TEXT,
+                    error TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_chart_events (
+                    event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    event_type TEXT NOT NULL,
+                    session_id TEXT,
+                    deployment_id TEXT,
+                    symbol TEXT,
+                    severity TEXT NOT NULL,
+                    message TEXT,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_live_chart_commands_status_created
+                ON live_chart_commands(status, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_live_chart_events_seq
+                ON live_chart_events(event_seq)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_live_chart_events_session
+                ON live_chart_events(session_id, event_seq)
                 """
             )
             conn.execute(
@@ -4993,6 +5155,501 @@ class ResultCatalog:
                 sharpe=float(row[9]) if row[9] is not None else None,
                 current_position_json=row[10],
                 health_json=row[11],
+            )
+            for row in rows
+        ]
+
+    def enqueue_deployment_runner_command(
+        self,
+        command_type: str,
+        *,
+        deployment_id: str = "",
+        payload_json: Dict | str | None = None,
+        command_id: str = "",
+    ) -> str:
+        resolved_id = str(command_id or uuid.uuid4().hex)
+        encoded_payload = (
+            payload_json if isinstance(payload_json, str) else json.dumps(payload_json or {}, sort_keys=True)
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO deployment_runner_commands
+                (
+                    command_id, command_type, deployment_id, payload_json, status
+                )
+                VALUES (?, ?, ?, ?, 'queued')
+                ON CONFLICT(command_id) DO UPDATE SET
+                    command_type=excluded.command_type,
+                    deployment_id=excluded.deployment_id,
+                    payload_json=excluded.payload_json,
+                    status='queued',
+                    claimed_by=NULL,
+                    claimed_at=NULL,
+                    processed_at=NULL,
+                    error=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    resolved_id,
+                    str(command_type or "").strip().lower(),
+                    str(deployment_id or ""),
+                    str(encoded_payload),
+                ),
+            )
+        return resolved_id
+
+    def claim_deployment_runner_commands(
+        self,
+        *,
+        runner_id: str,
+        limit: int = 25,
+    ) -> list[DeploymentRunnerCommandRecord]:
+        claimed: list[DeploymentRunnerCommandRecord] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT
+                    command_id, command_type, deployment_id, payload_json, status, claimed_by, error,
+                    created_at, updated_at, claimed_at, processed_at
+                FROM deployment_runner_commands
+                WHERE status='queued'
+                ORDER BY created_at ASC, command_id ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            for row in rows:
+                cursor = conn.execute(
+                    """
+                    UPDATE deployment_runner_commands
+                    SET status='running', claimed_by=?, claimed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                    WHERE command_id=? AND status='queued'
+                    """,
+                    (str(runner_id or ""), str(row[0])),
+                )
+                if int(cursor.rowcount or 0) != 1:
+                    continue
+                claimed.append(
+                    DeploymentRunnerCommandRecord(
+                        command_id=row[0],
+                        command_type=row[1],
+                        deployment_id=row[2],
+                        payload_json=row[3],
+                        status="running",
+                        claimed_by=str(runner_id or ""),
+                        error=row[6],
+                        created_at=row[7],
+                        updated_at=row[8],
+                        claimed_at=row[9],
+                        processed_at=row[10],
+                    )
+                )
+        return claimed
+
+    def finish_deployment_runner_command(self, command_id: str, *, error: str = "") -> None:
+        if not command_id:
+            return
+        status = "error" if error else "done"
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE deployment_runner_commands
+                SET status=?, error=?, processed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE command_id=?
+                """,
+                (status, str(error or ""), str(command_id)),
+            )
+
+    def load_deployment_runner_commands(
+        self,
+        *,
+        status: str = "",
+        limit: int = 500,
+    ) -> list[DeploymentRunnerCommandRecord]:
+        with self.connect() as conn:
+            if status:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        command_id, command_type, deployment_id, payload_json, status, claimed_by, error,
+                        created_at, updated_at, claimed_at, processed_at
+                    FROM deployment_runner_commands
+                    WHERE status=?
+                    ORDER BY created_at DESC, command_id DESC
+                    LIMIT ?
+                    """,
+                    (str(status), max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        command_id, command_type, deployment_id, payload_json, status, claimed_by, error,
+                        created_at, updated_at, claimed_at, processed_at
+                    FROM deployment_runner_commands
+                    ORDER BY created_at DESC, command_id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+        return [
+            DeploymentRunnerCommandRecord(
+                command_id=row[0],
+                command_type=row[1],
+                deployment_id=row[2],
+                payload_json=row[3],
+                status=row[4],
+                claimed_by=row[5],
+                error=row[6],
+                created_at=row[7],
+                updated_at=row[8],
+                claimed_at=row[9],
+                processed_at=row[10],
+            )
+            for row in rows
+        ]
+
+    def save_deployment_runner_event(
+        self,
+        *,
+        event_type: str,
+        deployment_id: str = "",
+        context_id: str = "",
+        symbol: str = "",
+        severity: str = "info",
+        message: str = "",
+        payload_json: Dict | str | None = None,
+        event_id: str = "",
+    ) -> str:
+        resolved_id = str(event_id or uuid.uuid4().hex)
+        encoded_payload = (
+            payload_json if isinstance(payload_json, str) else json.dumps(payload_json or {}, sort_keys=True, default=str)
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO deployment_runner_events
+                (
+                    event_id, event_type, deployment_id, context_id, symbol, severity, message, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resolved_id,
+                    str(event_type or "").strip().lower(),
+                    str(deployment_id or ""),
+                    str(context_id or ""),
+                    str(symbol or ""),
+                    str(severity or "info").strip().lower(),
+                    str(message or ""),
+                    str(encoded_payload),
+                ),
+            )
+        return resolved_id
+
+    def deployment_runner_event_exists(self, event_id: str) -> bool:
+        if not event_id:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM deployment_runner_events WHERE event_id=? LIMIT 1",
+                (str(event_id),),
+            ).fetchone()
+        return row is not None
+
+    def load_deployment_runner_events(
+        self,
+        *,
+        after_seq: int = 0,
+        deployment_id: str = "",
+        limit: int = 500,
+    ) -> list[DeploymentRunnerEventRecord]:
+        with self.connect() as conn:
+            if deployment_id:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        event_seq, event_id, event_type, deployment_id, context_id, symbol,
+                        severity, message, payload_json, created_at
+                    FROM deployment_runner_events
+                    WHERE event_seq > ? AND deployment_id=?
+                    ORDER BY event_seq ASC
+                    LIMIT ?
+                    """,
+                    (int(after_seq or 0), str(deployment_id), max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        event_seq, event_id, event_type, deployment_id, context_id, symbol,
+                        severity, message, payload_json, created_at
+                    FROM deployment_runner_events
+                    WHERE event_seq > ?
+                    ORDER BY event_seq ASC
+                    LIMIT ?
+                    """,
+                    (int(after_seq or 0), max(1, int(limit))),
+                ).fetchall()
+        return [
+            DeploymentRunnerEventRecord(
+                event_seq=int(row[0]),
+                event_id=row[1],
+                event_type=row[2],
+                deployment_id=row[3],
+                context_id=row[4],
+                symbol=row[5],
+                severity=row[6],
+                message=row[7],
+                payload_json=row[8],
+                created_at=row[9],
+            )
+            for row in rows
+        ]
+
+    def enqueue_live_chart_command(
+        self,
+        command_type: str,
+        *,
+        session_id: str = "",
+        deployment_id: str = "",
+        payload_json: Dict | str | None = None,
+        command_id: str = "",
+    ) -> str:
+        resolved_id = str(command_id or uuid.uuid4().hex)
+        encoded_payload = (
+            payload_json if isinstance(payload_json, str) else json.dumps(payload_json or {}, sort_keys=True, default=str)
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_chart_commands
+                (
+                    command_id, command_type, session_id, deployment_id, payload_json, status
+                )
+                VALUES (?, ?, ?, ?, ?, 'queued')
+                ON CONFLICT(command_id) DO UPDATE SET
+                    command_type=excluded.command_type,
+                    session_id=excluded.session_id,
+                    deployment_id=excluded.deployment_id,
+                    payload_json=excluded.payload_json,
+                    status='queued',
+                    claimed_by=NULL,
+                    claimed_at=NULL,
+                    processed_at=NULL,
+                    error=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    resolved_id,
+                    str(command_type or "").strip().lower(),
+                    str(session_id or ""),
+                    str(deployment_id or ""),
+                    str(encoded_payload),
+                ),
+            )
+        return resolved_id
+
+    def claim_live_chart_commands(
+        self,
+        *,
+        service_id: str,
+        limit: int = 25,
+    ) -> list[LiveChartCommandRecord]:
+        claimed: list[LiveChartCommandRecord] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT
+                    command_id, command_type, session_id, deployment_id, payload_json, status, claimed_by, error,
+                    created_at, updated_at, claimed_at, processed_at
+                FROM live_chart_commands
+                WHERE status='queued'
+                ORDER BY created_at ASC, command_id ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            for row in rows:
+                cursor = conn.execute(
+                    """
+                    UPDATE live_chart_commands
+                    SET status='running', claimed_by=?, claimed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                    WHERE command_id=? AND status='queued'
+                    """,
+                    (str(service_id or ""), str(row[0])),
+                )
+                if int(cursor.rowcount or 0) != 1:
+                    continue
+                claimed.append(
+                    LiveChartCommandRecord(
+                        command_id=row[0],
+                        command_type=row[1],
+                        session_id=row[2],
+                        deployment_id=row[3],
+                        payload_json=row[4],
+                        status="running",
+                        claimed_by=str(service_id or ""),
+                        error=row[7],
+                        created_at=row[8],
+                        updated_at=row[9],
+                        claimed_at=row[10],
+                        processed_at=row[11],
+                    )
+                )
+        return claimed
+
+    def finish_live_chart_command(self, command_id: str, *, error: str = "") -> None:
+        if not command_id:
+            return
+        status = "error" if error else "done"
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE live_chart_commands
+                SET status=?, error=?, processed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE command_id=?
+                """,
+                (status, str(error or ""), str(command_id)),
+            )
+
+    def load_live_chart_commands(
+        self,
+        *,
+        status: str = "",
+        limit: int = 500,
+    ) -> list[LiveChartCommandRecord]:
+        with self.connect() as conn:
+            if status:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        command_id, command_type, session_id, deployment_id, payload_json, status, claimed_by, error,
+                        created_at, updated_at, claimed_at, processed_at
+                    FROM live_chart_commands
+                    WHERE status=?
+                    ORDER BY created_at DESC, command_id DESC
+                    LIMIT ?
+                    """,
+                    (str(status), max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        command_id, command_type, session_id, deployment_id, payload_json, status, claimed_by, error,
+                        created_at, updated_at, claimed_at, processed_at
+                    FROM live_chart_commands
+                    ORDER BY created_at DESC, command_id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+        return [
+            LiveChartCommandRecord(
+                command_id=row[0],
+                command_type=row[1],
+                session_id=row[2],
+                deployment_id=row[3],
+                payload_json=row[4],
+                status=row[5],
+                claimed_by=row[6],
+                error=row[7],
+                created_at=row[8],
+                updated_at=row[9],
+                claimed_at=row[10],
+                processed_at=row[11],
+            )
+            for row in rows
+        ]
+
+    def save_live_chart_event(
+        self,
+        *,
+        event_type: str,
+        session_id: str = "",
+        deployment_id: str = "",
+        symbol: str = "",
+        severity: str = "info",
+        message: str = "",
+        payload_json: Dict | str | None = None,
+        event_id: str = "",
+    ) -> str:
+        resolved_id = str(event_id or uuid.uuid4().hex)
+        encoded_payload = (
+            payload_json if isinstance(payload_json, str) else json.dumps(payload_json or {}, sort_keys=True, default=str)
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO live_chart_events
+                (
+                    event_id, event_type, session_id, deployment_id, symbol, severity, message, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resolved_id,
+                    str(event_type or "").strip().lower(),
+                    str(session_id or ""),
+                    str(deployment_id or ""),
+                    str(symbol or ""),
+                    str(severity or "info").strip().lower(),
+                    str(message or ""),
+                    str(encoded_payload),
+                ),
+            )
+        return resolved_id
+
+    def load_live_chart_events(
+        self,
+        *,
+        after_seq: int = 0,
+        session_id: str = "",
+        limit: int = 500,
+    ) -> list[LiveChartEventRecord]:
+        with self.connect() as conn:
+            if session_id:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        event_seq, event_id, event_type, session_id, deployment_id, symbol,
+                        severity, message, payload_json, created_at
+                    FROM live_chart_events
+                    WHERE event_seq > ? AND session_id=?
+                    ORDER BY event_seq ASC
+                    LIMIT ?
+                    """,
+                    (int(after_seq or 0), str(session_id), max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        event_seq, event_id, event_type, session_id, deployment_id, symbol,
+                        severity, message, payload_json, created_at
+                    FROM live_chart_events
+                    WHERE event_seq > ?
+                    ORDER BY event_seq ASC
+                    LIMIT ?
+                    """,
+                    (int(after_seq or 0), max(1, int(limit))),
+                ).fetchall()
+        return [
+            LiveChartEventRecord(
+                event_seq=int(row[0]),
+                event_id=row[1],
+                event_type=row[2],
+                session_id=row[3],
+                deployment_id=row[4],
+                symbol=row[5],
+                severity=row[6],
+                message=row[7],
+                payload_json=row[8],
+                created_at=row[9],
             )
             for row in rows
         ]

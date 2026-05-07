@@ -31,6 +31,7 @@ import urllib.error
 import urllib.request
 import queue
 import signal
+import subprocess
 import re
 import sqlite3
 import threading
@@ -1473,6 +1474,98 @@ class CatalogReader:
                     "sharpe": row.sharpe,
                     "current_position_json": row.current_position_json,
                     "health_json": row.health_json,
+                }
+                for row in rows
+            ]
+        )
+
+    def enqueue_deployment_runner_command(self, command_type: str, *, deployment_id: str = "", payload_json=None) -> str:
+        return ResultCatalog(self.db_path).enqueue_deployment_runner_command(
+            command_type,
+            deployment_id=deployment_id,
+            payload_json=payload_json,
+        )
+
+    def load_deployment_runner_events(self, *, after_seq: int = 0, limit: int = 500) -> pd.DataFrame:
+        rows = ResultCatalog(self.db_path).load_deployment_runner_events(after_seq=after_seq, limit=limit)
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "event_seq",
+                    "event_id",
+                    "event_type",
+                    "deployment_id",
+                    "context_id",
+                    "symbol",
+                    "severity",
+                    "message",
+                    "payload_json",
+                    "created_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "event_seq": row.event_seq,
+                    "event_id": row.event_id,
+                    "event_type": row.event_type,
+                    "deployment_id": row.deployment_id,
+                    "context_id": row.context_id,
+                    "symbol": row.symbol,
+                    "severity": row.severity,
+                    "message": row.message,
+                    "payload_json": row.payload_json,
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
+        )
+
+    def enqueue_live_chart_command(
+        self,
+        command_type: str,
+        *,
+        session_id: str = "",
+        deployment_id: str = "",
+        payload_json=None,
+    ) -> str:
+        return ResultCatalog(self.db_path).enqueue_live_chart_command(
+            command_type,
+            session_id=session_id,
+            deployment_id=deployment_id,
+            payload_json=payload_json,
+        )
+
+    def load_live_chart_events(self, *, after_seq: int = 0, limit: int = 500) -> pd.DataFrame:
+        rows = ResultCatalog(self.db_path).load_live_chart_events(after_seq=after_seq, limit=limit)
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "event_seq",
+                    "event_id",
+                    "event_type",
+                    "session_id",
+                    "deployment_id",
+                    "symbol",
+                    "severity",
+                    "message",
+                    "payload_json",
+                    "created_at",
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "event_seq": row.event_seq,
+                    "event_id": row.event_id,
+                    "event_type": row.event_type,
+                    "session_id": row.session_id,
+                    "deployment_id": row.deployment_id,
+                    "symbol": row.symbol,
+                    "severity": row.severity,
+                    "message": row.message,
+                    "payload_json": row.payload_json,
+                    "created_at": row.created_at,
                 }
                 for row in rows
             ]
@@ -11829,7 +11922,23 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.live_deployment_symbol_index: dict[str, set[str]] = {}
         self.live_deployment_stream_workers: dict[str, ChartLiveStreamWorker] = {}
         self.live_deployment_runner_worker: LiveDeploymentRunnerWorker | None = None
+        self.live_deployment_runner_process: subprocess.Popen | None = None
+        self.live_deployment_runner_last_event_seq = self._latest_live_deployment_runner_event_seq()
+        self.live_monitor_chart_service_process: subprocess.Popen | None = None
+        self._live_monitor_chart_service_warm_queued = False
+        self.live_monitor_chart_service_last_event_seq = self._latest_live_monitor_chart_event_seq()
         self._live_monitor_engine_url_refreshing = False
+        self._live_deployment_runner_event_timer = QtCore.QTimer(self)
+        self._live_deployment_runner_event_timer.setInterval(1000)
+        self._live_deployment_runner_event_timer.timeout.connect(self._poll_live_deployment_runner_events)
+        self._live_deployment_runner_event_timer.start()
+        self._live_monitor_chart_event_timer = QtCore.QTimer(self)
+        self._live_monitor_chart_event_timer.setInterval(1000)
+        self._live_monitor_chart_event_timer.timeout.connect(self._poll_live_monitor_chart_events)
+        self._live_monitor_chart_event_timer.start()
+        self._live_monitor_chart_service_warm_timer = QtCore.QTimer(self)
+        self._live_monitor_chart_service_warm_timer.setSingleShot(True)
+        self._live_monitor_chart_service_warm_timer.timeout.connect(self._warm_live_monitor_chart_service_process)
         self._external_deployment_sync_timer = QtCore.QTimer(self)
         self._external_deployment_sync_timer.setSingleShot(True)
         self._external_deployment_sync_timer.timeout.connect(self._run_scheduled_external_deployment_sync)
@@ -11893,6 +12002,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._load_universes()
         self.refresh()
         QtCore.QTimer.singleShot(1500, self._maybe_start_fundamentals_cache_build)
+        if self._live_monitor_chart_service_prewarm_enabled():
+            self._live_monitor_chart_service_warm_timer.start(3000)
         QtCore.QTimer.singleShot(0, lambda: self._restore_download_session_if_available(auto_resume=False))
 
     # -- sections ------------------------------------------------------------
@@ -11953,6 +12064,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
             getattr(self, "live_monitor_tab", None),
         }:
             self._request_magellan_warmup()
+        if current_widget in {
+            getattr(self, "deployment_tab", None),
+            getattr(self, "live_monitor_tab", None),
+        }:
+            self._request_live_monitor_chart_service_warmup()
         if current_widget is getattr(self, "asset_information_tab", None):
             self._refresh_asset_information_tab()
             return
@@ -11983,6 +12099,26 @@ class DashboardWindow(QtWidgets.QMainWindow):
             return
         if not self._magellan_warm_timer.isActive():
             self._magellan_warm_timer.start(0)
+
+    def _request_live_monitor_chart_service_warmup(self) -> None:
+        if self._closing:
+            return
+        if not self._live_monitor_chart_service_prewarm_enabled():
+            return
+        timer = getattr(self, "_live_monitor_chart_service_warm_timer", None)
+        if timer is None:
+            return
+        if timer.isActive():
+            timer.stop()
+        timer.start(0)
+
+    @staticmethod
+    def _live_monitor_chart_service_prewarm_enabled() -> bool:
+        disabled = str(os.getenv("QUANT_DISABLE_LIVE_CHART_SERVICE_PREWARM", "")).strip().lower()
+        if disabled in {"1", "true", "yes", "on"}:
+            return False
+        platform = str(os.getenv("QT_QPA_PLATFORM", "")).strip().lower()
+        return platform != "offscreen"
 
     def _build_control_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
@@ -15567,7 +15703,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         for symbol in list(self.charts_watchlist_stream_workers):
             if symbol not in active_symbols:
                 self._stop_charts_watchlist_stream(symbol)
-        for idx, symbol in enumerate(symbols, start=1):
+        for idx, symbol in enumerate(symbols):
             if self._charts_symbol_live_paused(symbol):
                 continue
             if self._charts_symbol_stream_running(symbol):
@@ -24691,7 +24827,10 @@ WantedBy=default.target
         timestamp = pd.Timestamp.now(tz='UTC').isoformat()
         update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
         if status in {"paused", "stopped"}:
-            self._deactivate_live_deployment(str(selected.get("deployment_id", "") or ""))
+            self._deactivate_live_deployment(
+                str(selected.get("deployment_id", "") or ""),
+                command_type="pause" if status == "paused" else "stop",
+            )
         if status == "stopped":
             update_kwargs["stopped_at"] = timestamp
         self._update_deployment_status_tree(str(selected.get("deployment_id", "")), **update_kwargs)
@@ -25636,6 +25775,258 @@ WantedBy=default.target
         for child_id in self._deployment_child_ids(root_id):
             self.catalog.update_deployment_status(child_id, **kwargs)
 
+    def _latest_live_deployment_runner_event_seq(self) -> int:
+        try:
+            with sqlite3.connect(self.catalog.db_path) as conn:
+                row = conn.execute("SELECT COALESCE(MAX(event_seq), 0) FROM deployment_runner_events").fetchone()
+        except Exception:
+            return 0
+        try:
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+
+    def _latest_live_monitor_chart_event_seq(self) -> int:
+        try:
+            with sqlite3.connect(self.catalog.db_path) as conn:
+                row = conn.execute("SELECT COALESCE(MAX(event_seq), 0) FROM live_chart_events").fetchone()
+        except Exception:
+            return 0
+        try:
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+
+    def _ensure_live_deployment_runner_process(self) -> bool:
+        process = getattr(self, "live_deployment_runner_process", None)
+        if process is not None and process.poll() is None:
+            return True
+        catalog_path = Path(self.catalog.db_path)
+        live_store_path = Path(self.live_market_store.db_path)
+        command = [
+            sys.executable,
+            "-m",
+            "backtest_engine.live_deployment_runner",
+            "--catalog",
+            str(catalog_path),
+            "--live-store",
+            str(live_store_path),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path(__file__).resolve().parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Unable to start live runner process: {exc}")
+            self.live_deployment_runner_process = None
+            return False
+        self.live_deployment_runner_process = process
+        return True
+
+    def _ensure_live_monitor_chart_service_process(self) -> bool:
+        process = self.__dict__.get("live_monitor_chart_service_process")
+        if process is not None and process.poll() is None:
+            return True
+        if process is not None:
+            self.live_monitor_chart_service_process = None
+            self._live_monitor_chart_service_warm_queued = False
+        catalog_path = Path(self.catalog.db_path)
+        live_store_path = Path(self.live_market_store.db_path)
+        command = [
+            sys.executable,
+            "-m",
+            "backtest_engine.live_monitor_chart_service",
+            "--catalog",
+            str(catalog_path),
+            "--live-store",
+            str(live_store_path),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path(__file__).resolve().parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Unable to start Live Monitor chart service: {exc}")
+            self.live_monitor_chart_service_process = None
+            return False
+        self.live_monitor_chart_service_process = process
+        return True
+
+    def _warm_live_monitor_chart_service_process(self) -> None:
+        if bool(self.__dict__.get("_closing", False)):
+            return
+        if not self._live_monitor_chart_service_prewarm_enabled():
+            return
+        process = self.__dict__.get("live_monitor_chart_service_process")
+        if process is not None and process.poll() is not None:
+            self.live_monitor_chart_service_process = None
+            self._live_monitor_chart_service_warm_queued = False
+        if not self._ensure_live_monitor_chart_service_process():
+            return
+        if bool(getattr(self, "_live_monitor_chart_service_warm_queued", False)):
+            return
+        try:
+            self._queue_live_chart_command("warmup")
+            self._live_monitor_chart_service_warm_queued = True
+        except Exception:
+            self._live_monitor_chart_service_warm_queued = False
+
+    def _queue_live_chart_command(
+        self,
+        command_type: str,
+        *,
+        session_id: str = "",
+        deployment_id: str = "",
+        payload: dict | None = None,
+    ) -> str:
+        payload_dict = {"session_id": str(session_id or ""), "deployment_id": str(deployment_id or "")}
+        payload_dict.update(dict(payload or {}))
+        return self.catalog.enqueue_live_chart_command(
+            str(command_type or "").strip().lower(),
+            session_id=str(session_id or ""),
+            deployment_id=str(deployment_id or ""),
+            payload_json=payload_dict,
+        )
+
+    def _poll_live_monitor_chart_events(self) -> None:
+        if bool(self.__dict__.get("_closing", False)):
+            return
+        try:
+            events = self.catalog.load_live_chart_events(
+                after_seq=int(getattr(self, "live_monitor_chart_service_last_event_seq", 0) or 0),
+                limit=500,
+            )
+        except Exception:
+            return
+        if events.empty:
+            return
+        status_message = ""
+        sessions = getattr(self, "live_monitor_chart_sessions", {})
+        if not isinstance(sessions, dict):
+            sessions = {}
+            self.live_monitor_chart_sessions = sessions
+        for _, row in events.iterrows():
+            try:
+                self.live_monitor_chart_service_last_event_seq = max(
+                    int(self.live_monitor_chart_service_last_event_seq),
+                    int(row.get("event_seq") or 0),
+                )
+            except Exception:
+                pass
+            event_type = str(row.get("event_type") or "")
+            message = str(row.get("message") or "")
+            if message:
+                status_message = message
+            payload = self._decode_json_dict(row.get("payload_json"))
+            session_id = str(row.get("session_id") or payload.get("session_id") or "")
+            deployment_id = str(row.get("deployment_id") or payload.get("deployment_id") or "")
+            symbol = _market_symbol_from_dataset_id(row.get("symbol") or payload.get("symbol"))
+            if event_type in {"chart_opening", "chart_opened_cached", "chart_opened"} and session_id:
+                existing = dict(sessions.get(session_id) or {})
+                existing.update(
+                    {
+                        "owner": "service",
+                        "session_id": session_id,
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "timeframe": str(payload.get("timeframe") or existing.get("timeframe") or ""),
+                        "lookback": str(payload.get("lookback") or existing.get("lookback") or ""),
+                        "pending": event_type == "chart_opening",
+                    }
+                )
+                sessions[session_id] = existing
+            elif event_type == "chart_closed" and session_id:
+                sessions.pop(session_id, None)
+            elif event_type == "service_stopped":
+                self.live_monitor_chart_service_process = None
+                self._live_monitor_chart_service_warm_queued = False
+            elif event_type in {"chart_command_error", "chart_update_error"} and message:
+                status_message = message
+        if status_message and hasattr(self, "status_label"):
+            self.status_label.setText(status_message)
+
+    def _shutdown_live_monitor_chart_service_process(self) -> None:
+        process = getattr(self, "live_monitor_chart_service_process", None)
+        if process is None or process.poll() is not None:
+            return
+        try:
+            self._queue_live_chart_command("shutdown_service")
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except Exception:
+            try:
+                process.terminate()
+                process.wait(timeout=1.0)
+            except Exception:
+                pass
+        self.live_monitor_chart_service_process = None
+        self._live_monitor_chart_service_warm_queued = False
+
+    def _queue_live_deployment_runner_command(self, command_type: str, deployment_id: str, payload: dict | None = None) -> str:
+        return self.catalog.enqueue_deployment_runner_command(
+            str(command_type or "").strip().lower(),
+            deployment_id=str(deployment_id or ""),
+            payload_json={"deployment_id": str(deployment_id or ""), **dict(payload or {})},
+        )
+
+    def _poll_live_deployment_runner_events(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        try:
+            events = self.catalog.load_deployment_runner_events(
+                after_seq=int(getattr(self, "live_deployment_runner_last_event_seq", 0) or 0),
+                limit=500,
+            )
+        except Exception:
+            return
+        if events.empty:
+            return
+        refresh_needed = False
+        status_message = ""
+        for _, row in events.iterrows():
+            try:
+                self.live_deployment_runner_last_event_seq = max(
+                    int(self.live_deployment_runner_last_event_seq),
+                    int(row.get("event_seq") or 0),
+                )
+            except Exception:
+                pass
+            event_type = str(row.get("event_type") or "")
+            message = str(row.get("message") or "")
+            if message:
+                status_message = message
+            payload = self._decode_json_dict(row.get("payload_json"))
+            if event_type == "signal_sent" and payload:
+                try:
+                    self._on_live_deployment_signal_marker(payload)
+                except Exception:
+                    pass
+            if event_type in {
+                "deployment_armed",
+                "deployment_paused",
+                "deployment_stopped",
+                "signal_sent",
+                "signal_evaluated",
+                "signal_duplicate_skipped",
+                "context_error",
+                "command_error",
+            }:
+                refresh_needed = True
+        if status_message and hasattr(self, "status_label"):
+            self.status_label.setText(status_message)
+        if refresh_needed:
+            self._refresh_live_deployment_runner_state()
+
     def _ensure_live_deployment_runner_worker(self) -> LiveDeploymentRunnerWorker:
         worker = getattr(self, "live_deployment_runner_worker", None)
         if worker is not None and worker.isRunning():
@@ -25830,8 +26221,21 @@ WantedBy=default.target
                             wait_ms=1500,
                         )
 
-    def _deactivate_live_deployment(self, deployment_id: str, *, stop_streams: bool = True) -> None:
+    def _deactivate_live_deployment(
+        self,
+        deployment_id: str,
+        *,
+        stop_streams: bool = True,
+        command_type: str = "stop",
+        queue_command: bool = True,
+    ) -> None:
         root_id = str(deployment_id or "")
+        if root_id and queue_command and str(command_type or "").strip().lower() in {"pause", "stop"}:
+            try:
+                self._ensure_live_deployment_runner_process()
+                self._queue_live_deployment_runner_command(str(command_type).strip().lower(), root_id)
+            except Exception:
+                pass
         runner = getattr(self, "live_deployment_runner_worker", None)
         if runner is not None and runner.isRunning():
             runner.remove_deployment(root_id)
@@ -25899,19 +26303,8 @@ WantedBy=default.target
                 last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
             )
             return False, message
-        try:
-            snapshot = self._fetch_target_external_snapshot(target_row)
-        except Exception:
-            snapshot = {}
-        contexts, failures = self._build_live_deployment_contexts(
-            deployment_row,
-            target_row,
-            webhook_url,
-            secret,
-            snapshot,
-        )
-        if failures or not contexts:
-            message = "; ".join(failures) if failures else "No executable live deployment contexts were built."
+        if not self._ensure_live_deployment_runner_process():
+            message = "Unable to start the live runner process."
             self._update_deployment_status_tree(
                 deployment_id,
                 status="error",
@@ -25919,36 +26312,16 @@ WantedBy=default.target
                 last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
             )
             return False, message
-        conflicts = self._live_deployment_context_conflicts(contexts, deployment_id)
-        if conflicts:
-            message = "Live context conflict: " + "; ".join(conflicts)
-            self._update_deployment_status_tree(
-                deployment_id,
-                status="error",
-                status_reason=message,
-                last_error_at=pd.Timestamp.now(tz='UTC').isoformat(),
-            )
-            return False, message
-        self._deactivate_live_deployment(deployment_id, stop_streams=False)
-        runner = self._ensure_live_deployment_runner_worker()
-        runner.add_contexts(contexts)
-        for idx, context in enumerate(contexts):
-            context_id = str(context.get("context_id") or "")
-            symbol = str(context.get("symbol") or "")
-            self.live_deployment_execution_contexts[context_id] = context
-            self.live_deployment_symbol_index.setdefault(symbol, set()).add(context_id)
-            counter = getattr(self, "_live_deployment_arm_counter", 0) + 1
-            self._live_deployment_arm_counter = counter
-            self._start_live_deployment_stream(symbol, client_offset=IB_CLIENT_OFFSET_LIVE_DEPLOYMENT + counter)
+        self._stop_live_deployment_streams()
+        command_id = self._queue_live_deployment_runner_command("arm", deployment_id)
         timestamp = pd.Timestamp.now(tz='UTC').isoformat()
         self._update_deployment_status_tree(
             deployment_id,
-            status="live",
-            status_reason="Live runner active; waiting for the next completed strategy bar.",
+            status="armed",
+            status_reason="Arm command queued for the live runner process.",
             armed_at=timestamp,
-            started_at=timestamp,
         )
-        return True, f"Deployment is live across {len(contexts)} strategy leg{'s' if len(contexts) != 1 else ''}."
+        return True, f"Queued live runner arm command {command_id[:10]} for deployment {deployment_id[:10]}."
 
     def _mark_live_deployment_context_error(self, context: dict, message: str) -> None:
         timestamp = pd.Timestamp.now(tz='UTC').isoformat()
@@ -25971,11 +26344,9 @@ WantedBy=default.target
         self._remove_live_deployment_context(str(context.get("context_id") or ""))
 
     def _process_live_deployment_bar(self, symbol: str, record: dict) -> None:
-        cleaned = self._symbol_from_dataset_id(symbol)
-        if not cleaned or cleaned not in getattr(self, "live_deployment_symbol_index", {}):
-            return
-        runner = self._ensure_live_deployment_runner_worker()
-        runner.enqueue_bar(record)
+        # Strategy execution now belongs to the separate live runner process.
+        # GUI chart streams may still receive bars, but they must not drive orders.
+        return
 
     @staticmethod
     def _external_dashboard_data_path(target_row: dict) -> str:
@@ -26430,7 +26801,10 @@ WantedBy=default.target
         timestamp = pd.Timestamp.now(tz='UTC').isoformat()
         update_kwargs: dict[str, str] = {"status": str(status), "status_reason": ""}
         if status in {"paused", "stopped"}:
-            self._deactivate_live_deployment(target_id)
+            self._deactivate_live_deployment(
+                target_id,
+                command_type="pause" if status == "paused" else "stop",
+            )
         if status == "stopped":
             update_kwargs["stopped_at"] = timestamp
         self._update_deployment_status_tree(target_id, **update_kwargs)
@@ -26717,7 +27091,14 @@ WantedBy=default.target
 
     def _on_live_deployment_signal_marker(self, payload: object) -> None:
         data = dict(payload or {}) if isinstance(payload, dict) else {}
-        symbol = self._symbol_from_dataset_id(data.get("symbol"))
+        legacy_sessions = [
+            (session_id, info)
+            for session_id, info in list(self.__dict__.get("live_monitor_chart_sessions", {}).items())
+            if isinstance(info, dict) and str(info.get("owner") or "") != "service"
+        ]
+        if not legacy_sessions:
+            return
+        symbol = _market_symbol_from_dataset_id(data.get("symbol"))
         if not symbol:
             return
         payload_deployment_ids = {
@@ -26726,10 +27107,8 @@ WantedBy=default.target
             str(data.get("portfolio_id") or ""),
         }
         payload_deployment_ids.discard("")
-        for session_id, info in list(getattr(self, "live_monitor_chart_sessions", {}).items()):
-            if not isinstance(info, dict):
-                continue
-            if self._symbol_from_dataset_id(info.get("symbol")) != symbol:
+        for session_id, info in legacy_sessions:
+            if _market_symbol_from_dataset_id(info.get("symbol")) != symbol:
                 continue
             session_deployment_id = str(info.get("deployment_id") or "")
             if payload_deployment_ids and session_deployment_id and session_deployment_id not in payload_deployment_ids:
@@ -27045,98 +27424,44 @@ WantedBy=default.target
         if not selected:
             QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
             return
-        symbols = sorted(self._deployment_symbol_scope(selected))
-        if not symbols:
-            QtWidgets.QMessageBox.information(self, "No deployment symbols", "The selected deployment does not expose any ticker symbols.")
+        if not self._ensure_live_monitor_chart_service_process():
             return
-        if len(symbols) > MAX_WATCHLIST_STREAM_SYMBOLS:
-            symbols = symbols[:MAX_WATCHLIST_STREAM_SYMBOLS]
-        self._close_live_monitor_charts(silent=True)
-        target_row = self._deployment_targets_by_id().get(str(selected.get("target_id", "") or ""), {})
-        snapshot = self._fetch_target_external_snapshot(target_row) if target_row else {}
-        if not snapshot:
-            metric_row = dict(selected.get("_metric_row") or {})
-            health = self._decode_json_dict(metric_row.get("health_json"))
-            snapshot = {
-                "account": dict(health.get("account") or {}),
-                "equity_curve": list(health.get("equity_curve") or []),
-                "orders": [],
-                "fills": [],
-                "recent_trades": [],
-                "positions": list(self._decode_json_dict(metric_row.get("current_position_json")).get("positions") or []),
-            }
         deployment_id = str(selected.get("deployment_id") or "")
+        if not deployment_id:
+            QtWidgets.QMessageBox.information(self, "No deployment selected", "The selected row does not expose a deployment id.")
+            return
         timeframe = normalize_chart_timeframe(str(selected.get("timeframe") or self._selected_charts_timeframe() or LIVE_BAR_TIMEFRAME))
         lookback = self._selected_live_monitor_chart_lookback()
         indicator_ids: list[str] = []
-        equity_curve = self._equity_curve_series_from_points(snapshot.get("equity_curve"))
-        opened = 0
-        failures: list[str] = []
-        syncing: list[str] = []
-        for idx, symbol in enumerate(symbols, start=1):
-            cleaned_symbol = self._symbol_from_dataset_id(symbol)
-            if not cleaned_symbol:
-                continue
-            sync_window = self._charts_historical_sync_window(cleaned_symbol, lookback=lookback)
-            context = {
-                "selected": dict(selected),
-                "snapshot": dict(snapshot),
-                "deployment_id": deployment_id,
-                "timeframe": timeframe,
-                "lookback": lookback,
-                "indicator_ids": list(indicator_ids),
-                "equity_curve": equity_curve,
-                "stream_client_offset": IB_CLIENT_OFFSET_LIVE_MONITOR + idx,
-            }
-            if sync_window is not None:
-                counter = getattr(self, "_live_monitor_open_counter", 0) + 1
-                self._live_monitor_open_counter = counter
-                client_offset_sync = IB_CLIENT_OFFSET_LIVE_MONITOR_SYNC + counter
-                self._start_live_monitor_historical_sync(
-                    cleaned_symbol,
-                    sync_window[0],
-                    sync_window[1],
-                    context=context,
-                    client_offset=client_offset_sync,
-                )
-                syncing.append(cleaned_symbol)
-            try:
-                status = (
-                    "Deployment chart opened from best available local/live bars while IB historical gap sync runs."
-                    if sync_window is not None
-                    else "Deployment chart seeded from historical data, strategy indicators, live market store, and external engine trades."
-                )
-                counter = getattr(self, "_live_monitor_open_counter", 0) + 1
-                self._live_monitor_open_counter = counter
-                client_offset_chart = IB_CLIENT_OFFSET_LIVE_MONITOR + counter
-                ok, message = self._open_or_reload_live_monitor_chart(
-                    selected=dict(selected),
-                    snapshot=snapshot,
-                    deployment_id=deployment_id,
-                    symbol=cleaned_symbol,
-                    timeframe=timeframe,
-                    lookback=lookback,
-                    indicator_ids=indicator_ids,
-                    equity_curve=equity_curve,
-                    status_text=status,
-                    reload_existing=False,
-                    client_offset=client_offset_chart,
-                )
-                if ok:
-                    opened += 1
-                elif sync_window is None:
-                    failures.append(f"{cleaned_symbol}: {message}")
-            except Exception as exc:
-                failures.append(f"{cleaned_symbol}: {exc}")
-        if opened:
-            self.status_label.setText(f"Opened {opened} Magellan deployment chart{'s' if opened != 1 else ''}.")
-        if syncing:
-            sync_text = f" Syncing IB historical gap for {', '.join(syncing[:5])}{'...' if len(syncing) > 5 else ''}."
-            self.status_label.setText((self.status_label.text() + sync_text) if opened else sync_text.strip())
-        if failures:
-            existing_status = self.status_label.text().strip()
-            prefix = f"{existing_status} " if existing_status else ""
-            self.status_label.setText(prefix + " | ".join(failures[:3]))
+        try:
+            self._queue_live_chart_command(
+                "open_deployment_charts",
+                deployment_id=deployment_id,
+                payload={
+                    "deployment_id": deployment_id,
+                    "timeframe": timeframe,
+                    "lookback": lookback,
+                    "indicator_ids": list(indicator_ids),
+                    "max_symbols": MAX_WATCHLIST_STREAM_SYMBOLS,
+                    "replace_existing": True,
+                },
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Unable to queue Live Monitor chart open: {exc}")
+            return
+        sessions = self.__dict__.get("live_monitor_chart_sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+            self.live_monitor_chart_sessions = sessions
+        sessions[f"live-monitor:{deployment_id}:pending"] = {
+            "owner": "service",
+            "pending": True,
+            "deployment_id": deployment_id,
+            "timeframe": timeframe,
+            "lookback": lookback,
+            "indicator_ids": list(indicator_ids),
+        }
+        self.status_label.setText(f"Queued Live Monitor Magellan chart open for deployment {deployment_id[:10]}.")
 
     def _start_live_monitor_chart_stream(self, symbol: str, *, client_offset: int) -> None:
         cleaned = self._symbol_from_dataset_id(symbol)
@@ -27263,7 +27588,11 @@ WantedBy=default.target
         sessions = [
             (session_id, info)
             for session_id, info in list(getattr(self, "live_monitor_chart_sessions", {}).items())
-            if isinstance(info, dict) and str(info.get("symbol") or "").strip().upper() == cleaned
+            if (
+                isinstance(info, dict)
+                and str(info.get("owner") or "") != "service"
+                and str(info.get("symbol") or "").strip().upper() == cleaned
+            )
         ]
         if not sessions:
             return
@@ -27474,36 +27803,35 @@ WantedBy=default.target
                 self.status_label.setText(f"Unable to update deployment chart for {cleaned}: {exc}")
 
     def _close_live_monitor_charts(self, _checked: bool = False, *, silent: bool = False) -> None:
-        closed = 0
-        for session_id in list(getattr(self, "live_monitor_chart_sessions", {})):
+        process = self.__dict__.get("live_monitor_chart_service_process")
+        process_running = process is not None and process.poll() is None
+        queued = 0
+        if process_running:
             try:
-                self.magellan.close_session(session_id, timeout_ms=500)
-                closed += 1
-            except Exception:
-                pass
-        self.live_monitor_chart_sessions.clear()
-        for symbol, worker in list(getattr(self, "live_monitor_chart_stream_workers", {}).items()):
-            try:
-                self._release_live_symbol_stream(
-                    symbol,
-                    consumer_key=f"live-monitor:{symbol}",
-                    wait_ms=1500,
-                )
-            except Exception:
-                pass
-            self.live_monitor_chart_stream_workers.pop(symbol, None)
-        for symbol, worker in list(getattr(self, "live_monitor_historical_sync_workers", {}).items()):
-            try:
-                if worker.isRunning():
-                    worker.requestInterruption()
-                    worker.quit()
-                    worker.wait(1500)
-            except Exception:
-                pass
-            self.live_monitor_historical_sync_workers.pop(symbol, None)
-        self.live_monitor_historical_sync_contexts.clear()
+                selected = self._selected_live_monitor_row()
+                deployment_id = str((selected or {}).get("deployment_id") or "")
+                if deployment_id:
+                    self._queue_live_chart_command(
+                        "close_deployment_charts",
+                        deployment_id=deployment_id,
+                        payload={"deployment_id": deployment_id},
+                    )
+                else:
+                    self._queue_live_chart_command("close_all_charts")
+                queued = 1
+            except Exception as exc:
+                if not silent:
+                    self.status_label.setText(f"Unable to queue Live Monitor chart close: {exc}")
+        sessions = self.__dict__.get("live_monitor_chart_sessions")
+        if isinstance(sessions, dict):
+            sessions.clear()
+        else:
+            self.live_monitor_chart_sessions = {}
         if not silent:
-            self.status_label.setText(f"Closed {closed} deployment chart{'s' if closed != 1 else ''}.")
+            if queued:
+                self.status_label.setText(f"Queued {queued} deployment chart close command{'s' if queued != 1 else ''}.")
+            else:
+                self.status_label.setText("No Live Monitor chart service is running.")
 
     def _selected_walk_forward_source_for_monte_carlo(self) -> str | None:
         if not hasattr(self, "monte_carlo_source_table"):
@@ -29061,6 +29389,9 @@ WantedBy=default.target
         self._closing = True
         if self._magellan_warm_timer.isActive():
             self._magellan_warm_timer.stop()
+        chart_service_warm_timer = getattr(self, "_live_monitor_chart_service_warm_timer", None)
+        if chart_service_warm_timer is not None and chart_service_warm_timer.isActive():
+            chart_service_warm_timer.stop()
         self._prepare_download_session_for_shutdown()
         downloads_stopped = self._shutdown_download_activity(wait_ms=60000)
         if not downloads_stopped:
@@ -29074,6 +29405,7 @@ WantedBy=default.target
         self._stop_charts_live_stream()
         self._stop_charts_watchlist_streams()
         self._close_live_monitor_charts(silent=True)
+        self._shutdown_live_monitor_chart_service_process()
         self._stop_live_deployment_streams()
         if self.charts_current_session_id:
             try:

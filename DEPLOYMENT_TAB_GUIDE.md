@@ -15,7 +15,7 @@ Manual Deployment is the advanced escape hatch. Use it only when you want to dra
 - Neither field is the broker order payload.
 - The actual order payload should be built later by the deployment runner from the saved deployment record, current live bars, account state, and sizing model.
 
-Current status: the Deployment tab is now a draft/monitor/live-runner layer. It stores the deployment recipe, syncs external account/order state, opens live charts, and can run supported deployed strategies against completed live bars. When a supported deployment is armed, the dashboard starts the live runner, marks the deployment `live`, and sends per-signal ENTRY/EXIT JSON webhooks to the external execution engine.
+Current status: the Deployment tab is now a draft/monitor/live-runner control layer. It stores the deployment recipe, syncs external account/order state, queues live chart open/close requests for a separate chart service process, and queues Arm/Pause/Stop commands for a separate live runner process. When a supported deployment is armed, the runner process marks the deployment `live`, evaluates completed live bars, and sends per-signal ENTRY/EXIT JSON webhooks to the external execution engine.
 
 ## Basic Workflow
 
@@ -28,9 +28,9 @@ Current status: the Deployment tab is now a draft/monitor/live-runner layer. It 
 7. Review the draft in `Deployed / Draft Strategies`.
 8. Click `Arm` to start the live runner. A successful arm validates the webhook target/secret, starts an Interactive Brokers live stream for each deployment symbol, marks the deployment `live`, and waits for the next completed strategy bar before sending any order signal.
 9. Use `Sync External State` to reconcile account equity, buying power, positions, orders, fills, and equity curve data from the external engine.
-10. Use Live Monitor to open Magellan charts for the deployment symbols and inspect live prices plus trade markers.
+10. Use Live Monitor to queue Magellan charts for the deployment symbols and inspect live prices plus trade markers. Snapshot building, Magellan live-session opening, and incremental chart updates run in the chart service process, not in the GUI process.
 
-`Pause` and `Stop` deactivate the dashboard-side live runner for that deployment. They do not cancel broker orders that already reached the external execution engine.
+`Pause` and `Stop` queue commands for the live runner process for that deployment. They do not cancel broker orders that already reached the external execution engine.
 
 The execution-engine webhook secret is a target setting. In Live Monitor, select a deployment, enter the `External Engine URL` and `Webhook Secret`, then click `Save Target Settings`. The secret is saved in the dashboard catalog database with the target record. The dashboard does not scan local SFTP/GVFS mounts or remote `.env` files to discover secrets.
 
@@ -237,14 +237,14 @@ Yes, the same Interactive Brokers live stream can feed charts and real-time stra
 ```text
 Interactive Brokers reqRealTimeBars
   -> LiveMarketDataStore
-  -> Charts / Magellan snapshots
-  -> Deployment live runner thread
+  -> Live Monitor chart service process / Magellan snapshots
+  -> Deployment live runner process
   -> External engine webhook/order API
 ```
 
 That keeps live data isolated from historical data. Strategy execution reads completed bars from `LiveMarketDataStore` and sends orders only when the strategy's desired state changes. A 5-minute deployment, for example, does not trade on the still-forming 10:55 bar; it evaluates that bar only once the next 5-minute bucket begins.
 
-The GUI thread does not run strategy evaluation or webhook POSTs. The Qt live stream emits bar records, and the GUI enqueues those records into `LiveDeploymentRunnerWorker`. The worker thread loads the recent historical/live bars, initializes the same strategy class used by backtests with the saved deployment params, calls `strategy.on_bar(...)` with a small signal broker that captures `target_percent(...)`, and translates state changes into execution-engine webhooks.
+The GUI process does not run strategy evaluation, webhook POSTs, or Live Monitor chart snapshot builds. The GUI writes runner commands and chart commands to the catalog. The separate runner process owns live subscriptions, loads recent historical/live bars, initializes the same strategy class used by backtests with the saved deployment params, calls `strategy.on_bar(...)` with a small signal broker that captures `target_percent(...)`, and translates state changes into execution-engine webhooks. The separate chart service process loads/resamples bars, builds or refreshes Magellan snapshot artifacts, opens/reloads live Magellan sessions, and sends incremental chart updates. Both processes write event records back to the catalog, and the GUI consumes those records to update status only when something meaningful happens.
 
 Historical data can be requested while real-time subscriptions are active, but it should be throttled. IBKR real-time bars use `reqRealTimeBars`, which creates 5-second bar subscriptions and is subject to both market-data-line limits and small-bar pacing limits. Historical bars use `reqHistoricalData`, with `useRTH=0` to include all available regular plus extended-hours data. IBKR allows multiple historical requests, but their documentation still warns about pacing and load-balancing, so the dashboard should gap-fill a bounded window and avoid large duplicate downloads while live strategy streams are running.
 
