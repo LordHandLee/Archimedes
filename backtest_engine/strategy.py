@@ -9,6 +9,8 @@ class Strategy:
 
     Override `initialize` to prepare indicators.
     Override `on_bar` to submit orders each bar.
+    Optionally override `on_before_fill` to cancel or adjust pending orders
+    immediately before the broker attempts fills for a bar.
     Optionally override `on_after_fill` to react immediately after fills when
     `recalc_on_fill=True` is set in BacktestConfig.
     """
@@ -21,6 +23,9 @@ class Strategy:
 
     def on_bar(self, timestamp: pd.Timestamp, bar: pd.Series, broker) -> None:  # pragma: no cover
         raise NotImplementedError
+
+    def on_before_fill(self, timestamp: pd.Timestamp, bar: pd.Series, broker) -> None:  # pragma: no cover
+        pass
 
     def on_after_fill(self, timestamp: pd.Timestamp, bar: pd.Series, broker) -> None:  # pragma: no cover
         pass

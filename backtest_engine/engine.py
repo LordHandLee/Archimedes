@@ -7,7 +7,7 @@ import pandas as pd
 from .broker import Broker, Trade
 from .catalog import ResultCatalog
 from .metrics import PerformanceMetrics, compute_metrics, sharpe_diagnostics
-from .run_ids import compute_logical_run_id
+from .run_ids import assert_backtest_source_current, compute_logical_run_id
 from .sizing import position_sizing_multiplier
 from .strategy import Strategy
 
@@ -103,6 +103,7 @@ class BacktestEngine:
         self.data = data.copy()  # kept for compatibility
 
     def run(self, strategy_params: Dict) -> BacktestResult:
+        assert_backtest_source_current()
         data = self._slice_signal_data()
         run_id = self._compute_run_id(strategy_params, data)
         execution_metadata = self._execution_metadata_for_run(run_id)
@@ -370,6 +371,10 @@ class BacktestEngine:
             return f"{num}min"
         if unit in ("h", "hr"):
             return f"{num}h"
+        if unit in ("d", "day", "days"):
+            return f"{num}D"
+        if unit in ("w", "wk", "week", "weeks"):
+            return f"{num}W"
         return tf  # fallback to original
 
     @staticmethod
@@ -392,6 +397,7 @@ class BacktestEngine:
             broker.pending_orders.append(keep)
 
     def _flush_with_recalc(self, strategy: Strategy, broker: Broker, timestamp: pd.Timestamp, bar: pd.Series) -> list[Trade]:
+        strategy.on_before_fill(timestamp, bar, broker)
         fills = broker.flush_orders(bar=bar, timestamp=timestamp)
         all_fills = list(fills)
         if not self.config.recalc_on_fill:

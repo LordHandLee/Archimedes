@@ -19,6 +19,15 @@ from .vectorized_strategies import VectorizedPendingOrderUpdate, VectorizedSuppo
 
 
 @dataclass(frozen=True)
+class _VectorizedFillResult:
+    filled_slot_mask: np.ndarray
+    filled_order_type: np.ndarray
+    filled_order_qty: np.ndarray
+    filled_order_price: np.ndarray
+    filled_price: np.ndarray
+
+
+@dataclass(frozen=True)
 class VectorizedEngine:
     """
     Narrow v1 vectorized backend.
@@ -33,7 +42,7 @@ class VectorizedEngine:
     """
 
     engine_impl: str = "vectorized"
-    engine_version: str = "1"
+    engine_version: str = "7"
     pending_order_slots: int = 4
     _last_batch_benchmark: BatchExecutionBenchmark | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -65,6 +74,9 @@ class VectorizedEngine:
         support = adapter.supports(config, strategy_cls)
         if not support.supported:
             return support
+        param_support = adapter.supports_params(list(param_grid))
+        if not param_support.supported:
+            return param_support
         if config.recalc_on_fill and strategy_cls.on_after_fill is not Strategy.on_after_fill and not adapter.supports_after_fill():
             return VectorizedSupport(
                 False,
@@ -348,6 +360,7 @@ class VectorizedEngine:
             if not config.fill_on_close:
                 self._execute_with_recalc_loop(
                     adapter=adapter,
+                    order_plan=order_plan,
                     data=data,
                     bar_idx=bar_idx,
                     ts=ts,
@@ -411,6 +424,34 @@ class VectorizedEngine:
                         pending_order_price=pending_order_price,
                         pending_order_active=pending_order_active,
                     )
+                self._apply_pending_order_update(
+                    update=adapter.build_bar_close_update(
+                        order_plan=order_plan,
+                        data=data,
+                        bar_idx=bar_idx,
+                        param_grid=list(param_grid),
+                        config=config,
+                        cash=cash,
+                        position=position,
+                        avg_price=avg_price,
+                        pending_qty=pending_qty,
+                        pending_order_type=pending_order_type,
+                        pending_order_price=pending_order_price,
+                        pending_order_active=pending_order_active,
+                    ),
+                    pending_qty=pending_qty,
+                    pending_order_type=pending_order_type,
+                    pending_order_price=pending_order_price,
+                    pending_order_active=pending_order_active,
+                )
+                if config.one_order_per_signal:
+                    self._prune_pending_orders(
+                        position=position,
+                        pending_qty=pending_qty,
+                        pending_order_type=pending_order_type,
+                        pending_order_price=pending_order_price,
+                        pending_order_active=pending_order_active,
+                    )
                 last_timestamp = ts
                 continue
 
@@ -452,8 +493,37 @@ class VectorizedEngine:
                     pending_order_price=pending_order_price,
                     pending_order_active=pending_order_active,
                 )
+            self._apply_pending_order_update(
+                update=adapter.build_bar_close_update(
+                    order_plan=order_plan,
+                    data=data,
+                    bar_idx=bar_idx,
+                    param_grid=list(param_grid),
+                    config=config,
+                    cash=cash,
+                    position=position,
+                    avg_price=avg_price,
+                    pending_qty=pending_qty,
+                    pending_order_type=pending_order_type,
+                    pending_order_price=pending_order_price,
+                    pending_order_active=pending_order_active,
+                ),
+                pending_qty=pending_qty,
+                pending_order_type=pending_order_type,
+                pending_order_price=pending_order_price,
+                pending_order_active=pending_order_active,
+            )
+            if config.one_order_per_signal:
+                self._prune_pending_orders(
+                    position=position,
+                    pending_qty=pending_qty,
+                    pending_order_type=pending_order_type,
+                    pending_order_price=pending_order_price,
+                    pending_order_active=pending_order_active,
+                )
             self._execute_with_recalc_loop(
                 adapter=adapter,
+                order_plan=order_plan,
                 data=data,
                 bar_idx=bar_idx,
                 ts=ts,
@@ -549,6 +619,7 @@ class VectorizedEngine:
         self,
         *,
         adapter,
+        order_plan,
         data: pd.DataFrame,
         bar_idx: int,
         ts: pd.Timestamp,
@@ -572,7 +643,27 @@ class VectorizedEngine:
         sell_slip: float,
         param_grid: Sequence[Dict],
     ) -> None:
-        filled_slot_mask = self._execute_pending_orders(
+        self._apply_pending_order_update(
+            update=adapter.build_before_fill_update(
+                order_plan=order_plan,
+                data=data,
+                bar_idx=bar_idx,
+                param_grid=list(param_grid),
+                config=config,
+                cash=cash,
+                position=position,
+                avg_price=avg_price,
+                pending_qty=pending_qty,
+                pending_order_type=pending_order_type,
+                pending_order_price=pending_order_price,
+                pending_order_active=pending_order_active,
+            ),
+            pending_qty=pending_qty,
+            pending_order_type=pending_order_type,
+            pending_order_price=pending_order_price,
+            pending_order_active=pending_order_active,
+        )
+        fill_result = self._execute_pending_orders(
             ts=ts,
             open_px=open_px,
             high_px=high_px,
@@ -596,10 +687,11 @@ class VectorizedEngine:
         if not config.recalc_on_fill:
             return
         passes = 0
-        while np.any(filled_slot_mask):
-            filled_mask = np.any(filled_slot_mask, axis=1)
+        while np.any(fill_result.filled_slot_mask):
+            filled_mask = np.any(fill_result.filled_slot_mask, axis=1)
             self._apply_pending_order_update(
-                update=adapter.build_after_fill_update(
+                update=adapter.build_after_fill_update_from_fills(
+                    order_plan=order_plan,
                     data=data,
                     bar_idx=bar_idx,
                     param_grid=list(param_grid),
@@ -612,6 +704,11 @@ class VectorizedEngine:
                     pending_order_type=pending_order_type,
                     pending_order_price=pending_order_price,
                     pending_order_active=pending_order_active,
+                    filled_slot_mask=fill_result.filled_slot_mask,
+                    filled_order_type=fill_result.filled_order_type,
+                    filled_order_qty=fill_result.filled_order_qty,
+                    filled_order_price=fill_result.filled_order_price,
+                    filled_price=fill_result.filled_price,
                 ),
                 pending_qty=pending_qty,
                 pending_order_type=pending_order_type,
@@ -620,7 +717,7 @@ class VectorizedEngine:
             )
             if passes >= max(int(config.max_recalc_passes), 0):
                 break
-            filled_slot_mask = self._execute_pending_orders(
+            fill_result = self._execute_pending_orders(
                 ts=ts,
                 open_px=open_px,
                 high_px=high_px,
@@ -957,17 +1054,30 @@ class VectorizedEngine:
         sell_fee: float,
         buy_slip: float,
         sell_slip: float,
-    ) -> np.ndarray:
+    ) -> _VectorizedFillResult:
         filled_mask = np.zeros_like(pending_order_active, dtype=bool)
+        filled_order_type = np.full_like(pending_order_type, -1, dtype=np.int8)
+        filled_order_qty = np.zeros_like(pending_qty, dtype=float)
+        filled_order_price = np.full_like(pending_order_price, np.nan, dtype=float)
+        filled_price = np.full_like(pending_order_price, np.nan, dtype=float)
         if pending_qty.size == 0 or pending_order_active.size == 0:
-            return filled_mask
+            return _VectorizedFillResult(
+                filled_slot_mask=filled_mask,
+                filled_order_type=filled_order_type,
+                filled_order_qty=filled_order_qty,
+                filled_order_price=filled_order_price,
+                filled_price=filled_price,
+            )
         for slot_idx in range(pending_order_active.shape[1]):
             active_params = np.flatnonzero(pending_order_active[:, slot_idx] & (np.abs(pending_qty[:, slot_idx]) > 1e-12))
             for param_idx in active_params:
+                order_type = int(pending_order_type[param_idx, slot_idx])
+                order_qty = float(pending_qty[param_idx, slot_idx])
+                order_price = float(pending_order_price[param_idx, slot_idx])
                 fill_price = self._fill_price_for_order(
-                    order_type=int(pending_order_type[param_idx, slot_idx]),
-                    qty=float(pending_qty[param_idx, slot_idx]),
-                    order_price=float(pending_order_price[param_idx, slot_idx]),
+                    order_type=order_type,
+                    qty=order_qty,
+                    order_price=order_price,
                     open_px=open_px,
                     high_px=high_px,
                     low_px=low_px,
@@ -976,7 +1086,7 @@ class VectorizedEngine:
                 if fill_price is None:
                     continue
                 trade = self._execute_order(
-                    qty=float(pending_qty[param_idx, slot_idx]),
+                    qty=order_qty,
                     price=fill_price,
                     timestamp=ts,
                     cash=cash,
@@ -993,11 +1103,21 @@ class VectorizedEngine:
                 if trade is not None:
                     trades_by_param[int(param_idx)].append(trade)
                     filled_mask[param_idx, slot_idx] = True
+                    filled_order_type[param_idx, slot_idx] = order_type
+                    filled_order_qty[param_idx, slot_idx] = order_qty
+                    filled_order_price[param_idx, slot_idx] = order_price
+                    filled_price[param_idx, slot_idx] = fill_price
                     pending_order_active[param_idx, slot_idx] = False
                     pending_qty[param_idx, slot_idx] = 0.0
                     pending_order_type[param_idx, slot_idx] = 0
                     pending_order_price[param_idx, slot_idx] = np.nan
-        return filled_mask
+        return _VectorizedFillResult(
+            filled_slot_mask=filled_mask,
+            filled_order_type=filled_order_type,
+            filled_order_qty=filled_order_qty,
+            filled_order_price=filled_order_price,
+            filled_price=filled_price,
+        )
 
     def _fill_price_for_order(
         self,
@@ -1083,8 +1203,7 @@ class VectorizedEngine:
             if requested_short_qty > prev_short_qty:
                 equity_mark = max(float(cash[param_idx]) + prev_qty * adj_price, 0.0)
                 max_gross = equity_mark * effective_max_gross_leverage(config)
-                current_long_notional = max(prev_qty, 0.0) * adj_price
-                allowed_short_qty = max(max_gross - current_long_notional, 0.0) / adj_price
+                allowed_short_qty = max(max_gross, 0.0) / adj_price
                 if requested_short_qty > allowed_short_qty:
                     qty = -allowed_short_qty - prev_qty
                     if abs(qty) < 1e-12:

@@ -153,7 +153,13 @@ class DuckDBStore:
 
     def resample(self, dataset_id: str, timeframe: str) -> pd.DataFrame:
         """
-        Resample using DuckDB's time_bucket for performance, returning pandas DataFrame.
+        Resample using DuckDB for performance, returning pandas DataFrame.
+
+        Match BacktestEngine's pandas semantics:
+        ``resample(rule, label="right", closed="right")``.
+        DuckDB's ``time_bucket`` labels left-closed buckets by default, so shift
+        timestamps back one microsecond before bucketing and then label by the
+        bucket end.
         """
         path = self.dataset_path(dataset_id)
         if not path.exists():
@@ -163,15 +169,27 @@ class DuckDBStore:
         WITH src AS (
             SELECT *
             FROM parquet_scan('{path}')
+        ),
+        bucketed AS (
+            SELECT
+                time_bucket(INTERVAL '{timeframe}', src.timestamp - INTERVAL '1 microsecond')
+                    + INTERVAL '{timeframe}' AS timestamp,
+                src.timestamp AS source_timestamp,
+                open,
+                high,
+                low,
+                close,
+                volume
+            FROM src
         )
         SELECT
-            time_bucket(INTERVAL '{timeframe}', src.timestamp) AS timestamp,
-            first(open) AS open,
+            timestamp,
+            first(open ORDER BY source_timestamp) AS open,
             max(high) AS high,
             min(low) AS low,
-            last(close) AS close,
+            last(close ORDER BY source_timestamp) AS close,
             sum(volume) AS volume
-        FROM src
+        FROM bucketed
         GROUP BY 1
         HAVING open IS NOT NULL AND close IS NOT NULL
         ORDER BY 1
@@ -184,15 +202,69 @@ class DuckDBStore:
         path = self.dataset_path(dataset_id)
         if not path.exists():
             raise FileNotFoundError(f"Parquet not found for dataset_id={dataset_id}")
-        df = self.load(dataset_id)
-        start_ts = df.index.min() if not df.empty else None
-        end_ts = df.index.max() if not df.empty else None
+        footer_meta = self._describe_parquet_footer(path)
+        if footer_meta is not None:
+            return {
+                "dataset_id": dataset_id,
+                "parquet_path": str(path),
+                **footer_meta,
+            }
+        quoted_path = self._quote_duckdb_path(path)
+        row = self.conn.execute(
+            f"""
+            SELECT
+                min(timestamp) AS coverage_start,
+                max(timestamp) AS coverage_end,
+                count(*) AS bar_count
+            FROM parquet_scan('{quoted_path}')
+            """
+        ).fetchone()
+        start_ts = pd.to_datetime(row[0], utc=True, errors="coerce") if row and row[0] is not None else None
+        end_ts = pd.to_datetime(row[1], utc=True, errors="coerce") if row and row[1] is not None else None
+        if start_ts is not None and pd.isna(start_ts):
+            start_ts = None
+        if end_ts is not None and pd.isna(end_ts):
+            end_ts = None
         return {
             "dataset_id": dataset_id,
             "parquet_path": str(path),
             "coverage_start": start_ts.isoformat() if start_ts is not None else None,
             "coverage_end": end_ts.isoformat() if end_ts is not None else None,
-            "bar_count": int(len(df)),
+            "bar_count": int(row[2] or 0) if row else 0,
+        }
+
+    @staticmethod
+    def _describe_parquet_footer(path: Path) -> dict | None:
+        try:
+            import pyarrow.parquet as pq
+
+            parquet_file = pq.ParquetFile(path)
+            metadata = parquet_file.metadata
+            names = list(parquet_file.schema.names)
+            timestamp_idx = names.index("timestamp")
+        except Exception:
+            return None
+
+        start_ts: pd.Timestamp | None = None
+        end_ts: pd.Timestamp | None = None
+        for row_group_idx in range(metadata.num_row_groups):
+            try:
+                stats = metadata.row_group(row_group_idx).column(timestamp_idx).statistics
+            except Exception:
+                return None
+            if stats is None or not getattr(stats, "has_min_max", False):
+                return None
+            group_start = pd.to_datetime(stats.min, utc=True, errors="coerce")
+            group_end = pd.to_datetime(stats.max, utc=True, errors="coerce")
+            if pd.isna(group_start) or pd.isna(group_end):
+                return None
+            start_ts = group_start if start_ts is None else min(start_ts, group_start)
+            end_ts = group_end if end_ts is None else max(end_ts, group_end)
+
+        return {
+            "coverage_start": start_ts.isoformat() if start_ts is not None else None,
+            "coverage_end": end_ts.isoformat() if end_ts is not None else None,
+            "bar_count": int(metadata.num_rows or 0),
         }
 
     @staticmethod

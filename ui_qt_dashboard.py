@@ -86,7 +86,12 @@ from backtest_engine import (
     REBALANCE_MODE_ON_CHANGE_OR_PERIODIC,
     REBALANCE_MODE_ON_CHANGE_OR_PERIODIC_OR_DRIFT,
     ResultCatalog,
+    AdaptiveOUKalmanZScoreStrategy,
+    RegimeFilteredAdaptiveOUKalmanZScoreStrategy,
+    SMARegimeFilteredZScoreMeanReversionStrategy,
     SMACrossStrategy,
+    SMATrendRegimeStrategy,
+    TrendFollowingRibbonStrategy,
     InverseTurtleStrategy,
     ZScoreMeanReversionStrategy,
     UnsupportedExecutionModeError,
@@ -205,7 +210,136 @@ from backtest_engine.live_market import (
     wait_for_realtime_bar_samples,
 )
 from backtest_engine.reporting import plot_param_heatmap
-from backtest_engine.sample_strategies import compute_zscore_mean_reversion_features
+from backtest_engine.sample_strategies import (
+    compute_adaptive_ou_kalman_zscore_features,
+    compute_regime_filtered_adaptive_ou_kalman_zscore_features,
+    compute_sma_regime_filtered_zscore_mean_reversion_features,
+    compute_sma_trend_regime_features,
+    compute_trend_following_ribbon_features,
+    compute_zscore_mean_reversion_features,
+)
+
+
+REGIME_FILTER_TIMEFRAME_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Same as chart", ""),
+    ("5 min", "5 minutes"),
+    ("15 min", "15 minutes"),
+    ("1 hour", "1 hour"),
+    ("4 hour", "4 hours"),
+    ("1 day", "1 day"),
+)
+
+
+BOOLEAN_PARAM_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("True", "True"),
+    ("False", "False"),
+)
+
+STRATEGY_PARAM_DROPDOWN_OPTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "ma_type": (
+        ("EMA", "EMA"),
+        ("SMA", "SMA"),
+        ("RMA", "RMA"),
+        ("WMA", "WMA"),
+        ("VWMA", "VWMA"),
+    ),
+    "distance_ma_type": (
+        ("SMA", "SMA"),
+        ("EMA", "EMA"),
+        ("RMA", "RMA"),
+        ("WMA", "WMA"),
+        ("VWMA", "VWMA"),
+    ),
+    "distance_norm_mode": (
+        ("ATR", "ATR"),
+        ("Percent", "Percent"),
+        ("Raw", "Raw"),
+    ),
+    "regime_mode": (
+        ("Fastest vs slowest", "fastest_slowest"),
+        ("Stacked SMAs", "stacked"),
+        ("Fast/slow confirmed", "fast_slow_confirmed"),
+    ),
+    "regime_timeframe": REGIME_FILTER_TIMEFRAME_OPTIONS,
+    "atr_stop_update_mode": (
+        ("Trailing", "Trailing"),
+        ("Rolling", "Rolling"),
+    ),
+    "atr_stop_basis": (
+        ("High/Low", "HighLow"),
+        ("Close", "Close"),
+    ),
+    "stop_reentry_mode": (
+        ("Immediate", "Immediate"),
+        ("Stop recapture", "StopRecapture"),
+    ),
+    "z_smooth_type": (
+        ("None", "None"),
+        ("SMA", "SMA"),
+        ("EMA", "EMA"),
+    ),
+    "vol_type": (
+        ("ATR", "ATR"),
+        ("Return std", "ReturnStd"),
+    ),
+    "exit_signal_mode": (
+        ("Level", "Level"),
+        ("Cross", "Cross"),
+    ),
+}
+
+STRATEGY_PARAM_DROPDOWN_TOOLTIPS: dict[str, str] = {
+    "ma_type": "Choose the moving-average type used by the ribbon.",
+    "distance_ma_type": "Choose the moving-average type used by the price-distance filter.",
+    "distance_norm_mode": "Choose whether price distance is raw, percent-based, or ATR-normalized.",
+    "regime_mode": "Choose the SMA ordering rule used to classify bullish and bearish regimes.",
+    "regime_timeframe": (
+        "Choose the timeframe used to compute the regime filter.\n"
+        "Same as chart uses the current backtest/chart timeframe."
+    ),
+    "atr_stop_update_mode": "Choose whether ATR stops only trail favorably or recalculate from the latest bar.",
+    "atr_stop_basis": "Choose whether trailing ATR stops anchor to candle extremes or closes.",
+    "stop_reentry_mode": "Choose how stopped trades re-enter while the same regime is still active.",
+    "z_smooth_type": "Choose optional smoothing for the z-score signal.",
+    "vol_type": "Choose the volatility estimate used for spread normalization.",
+    "exit_signal_mode": "Choose whether exits use a continuous level test or a fresh crossing.",
+}
+
+
+def _strategy_param_dropdown_options(param_name: str, ptype: type | None = None) -> tuple[tuple[str, str], ...]:
+    if ptype is bool:
+        return BOOLEAN_PARAM_OPTIONS
+    options = STRATEGY_PARAM_DROPDOWN_OPTIONS.get(str(param_name))
+    if options:
+        return options
+    if str(param_name) == "regime_timeframe":
+        return REGIME_FILTER_TIMEFRAME_OPTIONS
+    return ()
+
+
+def _strategy_param_dropdown_tooltip(param_name: str, ptype: type | None = None) -> str:
+    if ptype is bool:
+        return "Choose True or False."
+    return STRATEGY_PARAM_DROPDOWN_TOOLTIPS.get(str(param_name), "Choose one of the supported values.")
+
+
+def _set_combo_to_data(combo: QtWidgets.QComboBox, value: object) -> None:
+    target = "" if value is None else str(value)
+    for idx in range(combo.count()):
+        data = combo.itemData(idx)
+        if ("" if data is None else str(data)) == target:
+            combo.setCurrentIndex(idx)
+            return
+    combo.setCurrentIndex(0)
+
+
+def _strategy_param_widget_text(widget: QtWidgets.QWidget) -> str:
+    if isinstance(widget, QtWidgets.QComboBox):
+        data = widget.currentData()
+        return str(data if data is not None else widget.currentText()).strip()
+    if isinstance(widget, QtWidgets.QLineEdit):
+        return widget.text().strip()
+    return ""
 
 
 # --- Palette (mirrors dashboard.html) ---------------------------------------
@@ -2000,60 +2134,85 @@ class CatalogReader:
             ]
         )
         if include_untracked_local:
-            dataset_map = {str(row["dataset_id"]): row for _, row in frame.iterrows()} if not frame.empty else {}
+            def _blank(value: object) -> bool:
+                if value is None:
+                    return True
+                try:
+                    if pd.isna(value):
+                        return True
+                except Exception:
+                    pass
+                return not str(value).strip()
+
+            records = frame.to_dict("records") if not frame.empty else []
+            dataset_map = {
+                str(record.get("dataset_id") or ""): record
+                for record in records
+                if str(record.get("dataset_id") or "").strip()
+            }
             store = DuckDBStore()
+            extra_records: list[dict] = []
             for path in sorted(store.data_dir.glob("*.parquet")):
                 dataset_id = path.stem
                 if dataset_id in dataset_map:
-                    mask = frame["dataset_id"] == dataset_id
-                    if not str(frame.loc[mask, "parquet_path"].iloc[0] or "").strip():
-                        frame.loc[mask, "parquet_path"] = str(path)
-                    meta = _cached_local_dataset_meta(store, path)
-                    if meta is None:
-                        continue
-                    if frame.loc[mask, "coverage_start"].isna().all():
-                        frame.loc[mask, "coverage_start"] = meta.get("coverage_start")
-                    if frame.loc[mask, "coverage_end"].isna().all():
-                        frame.loc[mask, "coverage_end"] = meta.get("coverage_end")
-                    if frame.loc[mask, "bar_count"].isna().all():
-                        frame.loc[mask, "bar_count"] = meta.get("bar_count")
-                    if frame.loc[mask, "ingested"].isna().all():
-                        frame.loc[mask, "ingested"] = True
+                    record = dataset_map[dataset_id]
+                    if _blank(record.get("parquet_path")):
+                        record["parquet_path"] = str(path)
+                    needs_meta = any(
+                        _blank(record.get(column))
+                        for column in ("coverage_start", "coverage_end", "bar_count")
+                    ) or record.get("ingested") is None
+                    if needs_meta:
+                        meta = _cached_local_dataset_meta(store, path)
+                        if meta is None:
+                            continue
+                        if _blank(record.get("coverage_start")):
+                            record["coverage_start"] = meta.get("coverage_start")
+                        if _blank(record.get("coverage_end")):
+                            record["coverage_end"] = meta.get("coverage_end")
+                        if _blank(record.get("bar_count")):
+                            record["bar_count"] = meta.get("bar_count")
+                        if record.get("ingested") is None:
+                            record["ingested"] = True
                     continue
                 meta = _cached_local_dataset_meta(store, path)
                 if meta is None:
                     continue
-                extra = {
-                    "dataset_id": dataset_id,
-                    "source": None,
-                    "symbol": None,
-                    "resolution": None,
-                    "history_window": None,
-                    "csv_path": None,
-                    "parquet_path": meta.get("parquet_path"),
-                    "coverage_start": meta.get("coverage_start"),
-                    "coverage_end": meta.get("coverage_end"),
-                    "bar_count": meta.get("bar_count"),
-                    "ingested": True,
-                    "last_download_attempt_at": None,
-                    "last_download_success_at": None,
-                    "last_ingest_at": None,
-                    "last_status": "ingested",
-                    "last_error": None,
-                    "last_run_id": None,
-                    "last_task_id": None,
-                    "quality_state": None,
-                    "quality_expected_interval": None,
-                    "suspicious_gap_count": 0,
-                    "max_suspicious_gap": None,
-                    "suspicious_gap_ranges_json": None,
-                    "repair_request_start": None,
-                    "repair_request_end": None,
-                    "quality_analyzed_at": None,
-                    "created_at": None,
-                    "updated_at": None,
-                }
-                frame = pd.concat([frame, pd.DataFrame([extra])], ignore_index=True)
+                extra_records.append(
+                    {
+                        "dataset_id": dataset_id,
+                        "source": None,
+                        "symbol": None,
+                        "resolution": None,
+                        "history_window": None,
+                        "csv_path": None,
+                        "parquet_path": meta.get("parquet_path"),
+                        "coverage_start": meta.get("coverage_start"),
+                        "coverage_end": meta.get("coverage_end"),
+                        "bar_count": meta.get("bar_count"),
+                        "ingested": True,
+                        "last_download_attempt_at": None,
+                        "last_download_success_at": None,
+                        "last_ingest_at": None,
+                        "last_status": "ingested",
+                        "last_error": None,
+                        "last_run_id": None,
+                        "last_task_id": None,
+                        "quality_state": None,
+                        "quality_expected_interval": None,
+                        "suspicious_gap_count": 0,
+                        "max_suspicious_gap": None,
+                        "suspicious_gap_ranges_json": None,
+                        "repair_request_start": None,
+                        "repair_request_end": None,
+                        "quality_analyzed_at": None,
+                        "created_at": None,
+                        "updated_at": None,
+                    }
+                )
+            store.close()
+            if records or extra_records:
+                frame = pd.DataFrame([*records, *extra_records])
         if frame.empty:
             return pd.DataFrame(
                 columns=[
@@ -4884,6 +5043,10 @@ class GridWorker(QtCore.QThread):
                 allow_short=bool(self.bt_settings.get("allow_short", True)),
                 use_cache=bool(self.bt_settings.get("use_cache", False)),
                 intrabar_sim=self.intrabar_sim,
+                # Dashboard optimizations compare Reference and Vectorized on the same resampled bars.
+                # Full lower-timeframe base_execution remains reference-only and is not a vectorized v1 mode.
+                base_execution=False,
+                base_timeframe="1 minutes",
                 prevent_scale_in=bool(self.bt_settings.get("prevent_scale_in", True)),
                 one_order_per_signal=bool(self.bt_settings.get("one_order_per_signal", True)),
                 sharpe_debug=self.sharpe_debug,
@@ -5000,18 +5163,38 @@ class GridWorker(QtCore.QThread):
                         strategy_spec = getattr(self.parent(), "strategy_specs", None) if hasattr(self, "parent") else None
                         known_map = {
                             "SMA Crossover": "SMACrossStrategy",
+                            "SMA Trend Regime": "SMATrendRegimeStrategy",
+                            "Trend Following Ribbon": "TrendFollowingRibbonStrategy",
                             "Z-Score Mean Reversion": "ZScoreMeanReversionStrategy",
+                            "SMA Regime Z-Score Mean Reversion": "SMARegimeFilteredZScoreMeanReversionStrategy",
+                            "Adaptive OU Kalman Z-Score": "AdaptiveOUKalmanZScoreStrategy",
+                            "Regime Filtered OU Kalman Z-Score": "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
                             "Inverse Turtle": "InverseTurtleStrategy",
                             "SMACrossStrategy": "SMACrossStrategy",
+                            "SMATrendRegimeStrategy": "SMATrendRegimeStrategy",
+                            "TrendFollowingRibbonStrategy": "TrendFollowingRibbonStrategy",
                             "ZScoreMeanReversionStrategy": "ZScoreMeanReversionStrategy",
+                            "SMARegimeFilteredZScoreMeanReversionStrategy": "SMARegimeFilteredZScoreMeanReversionStrategy",
+                            "AdaptiveOUKalmanZScoreStrategy": "AdaptiveOUKalmanZScoreStrategy",
+                            "RegimeFilteredAdaptiveOUKalmanZScoreStrategy": "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
                             "InverseTurtleStrategy": "InverseTurtleStrategy",
                         }
                         mapped_name = known_map.get(strategy_name, strategy_name)
 
                         if mapped_name == "SMACrossStrategy":
                             strategy_cls = SMACrossStrategy
+                        elif mapped_name == "SMATrendRegimeStrategy":
+                            strategy_cls = SMATrendRegimeStrategy
+                        elif mapped_name == "TrendFollowingRibbonStrategy":
+                            strategy_cls = TrendFollowingRibbonStrategy
                         elif mapped_name == "ZScoreMeanReversionStrategy":
                             strategy_cls = ZScoreMeanReversionStrategy
+                        elif mapped_name == "SMARegimeFilteredZScoreMeanReversionStrategy":
+                            strategy_cls = SMARegimeFilteredZScoreMeanReversionStrategy
+                        elif mapped_name == "AdaptiveOUKalmanZScoreStrategy":
+                            strategy_cls = AdaptiveOUKalmanZScoreStrategy
+                        elif mapped_name == "RegimeFilteredAdaptiveOUKalmanZScoreStrategy":
+                            strategy_cls = RegimeFilteredAdaptiveOUKalmanZScoreStrategy
                         elif mapped_name == "InverseTurtleStrategy":
                             strategy_cls = InverseTurtleStrategy
                         else:
@@ -5999,7 +6182,8 @@ class DatasetSelectionDialog(DashboardDialog):
         if snapshot_frame is not None:
             self._apply_snapshot(snapshot_frame)
         elif self._catalog_path is not None:
-            self._set_loading_state("Loading dataset status and variants…")
+            self._apply_snapshot(pd.DataFrame())
+            self.loading_label.setText("Refreshing dataset status and variants...")
             self._start_snapshot_worker()
         else:
             self._apply_snapshot(pd.DataFrame())
@@ -6025,8 +6209,10 @@ class DatasetSelectionDialog(DashboardDialog):
         self._snapshot_worker.start()
 
     def _apply_snapshot(self, frame: pd.DataFrame) -> None:
+        checked_dataset_ids = self.selected_datasets() if self.tree.topLevelItemCount() else self._selected_initial
         groups = _dataset_picker_groups(self._datasets, frame=frame)
-        _populate_grouped_dataset_tree(self.tree, groups, checked_dataset_ids=self._selected_initial, checkable=True)
+        _populate_grouped_dataset_tree(self.tree, groups, checked_dataset_ids=checked_dataset_ids, checkable=True)
+        self._apply_filter(self.search_edit.text())
         self._set_loading_state("")
 
     def _on_snapshot_loaded(self, frame: object) -> None:
@@ -6228,7 +6414,8 @@ class DatasetPickerDialog(DashboardDialog):
         if snapshot_frame is not None:
             self._apply_snapshot(snapshot_frame)
         elif self._catalog_path is not None:
-            self._set_loading_state("Loading dataset status and variants…")
+            self._apply_snapshot(pd.DataFrame())
+            self.loading_label.setText("Refreshing dataset status and variants...")
             self._start_snapshot_worker()
         else:
             self._apply_snapshot(pd.DataFrame())
@@ -6252,8 +6439,10 @@ class DatasetPickerDialog(DashboardDialog):
         self._snapshot_worker.start()
 
     def _apply_snapshot(self, frame: pd.DataFrame) -> None:
+        current_dataset_id = self.selected_dataset() if self.tree.topLevelItemCount() else self._selected_dataset
         groups = _dataset_picker_groups(self._datasets, frame=frame)
-        _populate_grouped_dataset_tree(self.tree, groups, current_dataset_id=self._selected_dataset, checkable=False)
+        _populate_grouped_dataset_tree(self.tree, groups, current_dataset_id=current_dataset_id, checkable=False)
+        self._apply_filter(self.search_edit.text())
         self._set_loading_state("")
 
     def _on_snapshot_loaded(self, frame: object) -> None:
@@ -8744,7 +8933,7 @@ class StrategyBlockEditorDialog(DashboardDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self.block_param_inputs: dict[str, QtWidgets.QLineEdit] = {}
+        self.block_param_inputs: dict[str, QtWidgets.QWidget] = {}
         self._refresh_block_list()
         if not self.blocks:
             self._add_block()
@@ -8857,11 +9046,22 @@ class StrategyBlockEditorDialog(DashboardDialog):
             return
         params = dict(spec.get("params") or {})
         values = values or {}
-        for param_name, (_ptype, default) in params.items():
-            edit = QtWidgets.QLineEdit(str(values.get(param_name, default)))
-            edit.textChanged.connect(self._save_current_block_state)
-            self.param_form.addRow(QtWidgets.QLabel(param_name), edit)
-            self.block_param_inputs[param_name] = edit
+        for param_name, (ptype, default) in params.items():
+            options = _strategy_param_dropdown_options(param_name, ptype)
+            if options:
+                combo = QtWidgets.QComboBox()
+                for label, value in options:
+                    combo.addItem(label, value)
+                _set_combo_to_data(combo, values.get(param_name, default))
+                combo.setToolTip(_strategy_param_dropdown_tooltip(param_name, ptype))
+                combo.currentIndexChanged.connect(self._save_current_block_state)
+                widget: QtWidgets.QWidget = combo
+            else:
+                edit = QtWidgets.QLineEdit(str(values.get(param_name, default)))
+                edit.textChanged.connect(self._save_current_block_state)
+                widget = edit
+            self.param_form.addRow(QtWidgets.QLabel(param_name), widget)
+            self.block_param_inputs[param_name] = widget
 
     def _save_current_block_state(self) -> None:
         if self._updating:
@@ -8875,8 +9075,8 @@ class StrategyBlockEditorDialog(DashboardDialog):
         block["budget_weight"] = float(self.block_budget_spin.value())
         block["asset_weights_text"] = self.block_asset_weights_edit.text().strip()
         block["strategy_params"] = {
-            key: edit.text().strip()
-            for key, edit in self.block_param_inputs.items()
+            key: _strategy_param_widget_text(widget)
+            for key, widget in self.block_param_inputs.items()
         }
         block["block_id"] = self._slugify(
             str(block.get("block_id") or block["display_name"]),
@@ -11932,6 +12132,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self._live_deployment_runner_event_timer.setInterval(1000)
         self._live_deployment_runner_event_timer.timeout.connect(self._poll_live_deployment_runner_events)
         self._live_deployment_runner_event_timer.start()
+        self._live_deployment_runner_watchdog_timer = QtCore.QTimer(self)
+        self._live_deployment_runner_watchdog_timer.setInterval(10000)
+        self._live_deployment_runner_watchdog_timer.timeout.connect(self._watch_live_deployment_runner_process)
+        self._live_deployment_runner_watchdog_timer.start()
         self._live_monitor_chart_event_timer = QtCore.QTimer(self)
         self._live_monitor_chart_event_timer.setInterval(1000)
         self._live_monitor_chart_event_timer.timeout.connect(self._poll_live_monitor_chart_events)
@@ -12004,6 +12208,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(1500, self._maybe_start_fundamentals_cache_build)
         if self._live_monitor_chart_service_prewarm_enabled():
             self._live_monitor_chart_service_warm_timer.start(3000)
+        QtCore.QTimer.singleShot(4000, self._watch_live_deployment_runner_process)
         QtCore.QTimer.singleShot(0, lambda: self._restore_download_session_if_available(auto_resume=False))
 
     # -- sections ------------------------------------------------------------
@@ -12115,6 +12320,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _live_monitor_chart_service_prewarm_enabled() -> bool:
         disabled = str(os.getenv("QUANT_DISABLE_LIVE_CHART_SERVICE_PREWARM", "")).strip().lower()
+        if disabled in {"1", "true", "yes", "on"}:
+            return False
+        platform = str(os.getenv("QT_QPA_PLATFORM", "")).strip().lower()
+        return platform != "offscreen"
+
+    @staticmethod
+    def _live_deployment_runner_watchdog_enabled() -> bool:
+        disabled = str(os.getenv("QUANT_DISABLE_LIVE_RUNNER_WATCHDOG", "")).strip().lower()
         if disabled in {"1", "true", "yes", "on"}:
             return False
         platform = str(os.getenv("QT_QPA_PLATFORM", "")).strip().lower()
@@ -12627,13 +12840,23 @@ class DashboardWindow(QtWidgets.QMainWindow):
         settings_form.addRow("Fill On Close", self.fill_on_close_chk)
         self.recalc_on_fill_chk = QtWidgets.QCheckBox()
         self.recalc_on_fill_chk.setChecked(True)
+        self.recalc_on_fill_chk.setToolTip(
+            "Runs strategy after-fill hooks when stops or other pending orders fill.\n"
+            "Strategies that need stop-fill state, including SMA Trend Regime stop re-entry, force this on."
+        )
         settings_form.addRow("Recalc On Fill", self.recalc_on_fill_chk)
         self.allow_short_chk = QtWidgets.QCheckBox()
         self.allow_short_chk.setChecked(True)
         settings_form.addRow("Allow Short", self.allow_short_chk)
         self.use_cache_chk = QtWidgets.QCheckBox()
         self.use_cache_chk.setChecked(False)
-        settings_form.addRow("Use Cache", self.use_cache_chk)
+        self.use_cache_chk.setText("Read cached results")
+        self.use_cache_chk.setToolTip(
+            "When checked, exact prior runs may be loaded instead of recomputed.\n"
+            "Leave this unchecked while editing strategies or framework code.\n"
+            "Unchecked runs still save new results and chart snapshots."
+        )
+        settings_form.addRow("Result Cache", self.use_cache_chk)
         self.prevent_scale_in_chk = QtWidgets.QCheckBox()
         self.prevent_scale_in_chk.setChecked(True)
         settings_form.addRow("Prevent Scale In", self.prevent_scale_in_chk)
@@ -19222,6 +19445,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.live_monitor_chart_lookback_combo.setCurrentIndex(2)
         actions.addWidget(self.live_monitor_chart_lookback_combo)
         self.live_monitor_open_charts_btn = QtWidgets.QPushButton("Open Magellan Charts")
+        self.live_monitor_open_charts_btn.setToolTip("Select a live deployment to open Live Monitor charts.")
         self.live_monitor_open_charts_btn.clicked.connect(self._open_live_monitor_charts)
         actions.addWidget(self.live_monitor_open_charts_btn)
         self.live_monitor_close_charts_btn = QtWidgets.QPushButton("Close Charts")
@@ -25175,7 +25399,11 @@ WantedBy=default.target
     def _live_deployment_strategy_class(strategy_name: str):
         mapping = {
             "SMACrossStrategy": SMACrossStrategy,
+            "SMATrendRegimeStrategy": SMATrendRegimeStrategy,
+            "TrendFollowingRibbonStrategy": TrendFollowingRibbonStrategy,
             "ZScoreMeanReversionStrategy": ZScoreMeanReversionStrategy,
+            "SMARegimeFilteredZScoreMeanReversionStrategy": SMARegimeFilteredZScoreMeanReversionStrategy,
+            "AdaptiveOUKalmanZScoreStrategy": AdaptiveOUKalmanZScoreStrategy,
             "InverseTurtleStrategy": InverseTurtleStrategy,
         }
         return mapping.get(str(strategy_name or "").strip())
@@ -25801,8 +26029,10 @@ WantedBy=default.target
         process = getattr(self, "live_deployment_runner_process", None)
         if process is not None and process.poll() is None:
             return True
-        catalog_path = Path(self.catalog.db_path)
-        live_store_path = Path(self.live_market_store.db_path)
+        if process is not None:
+            self.live_deployment_runner_process = None
+        catalog_path = Path(self.catalog.db_path).expanduser().resolve()
+        live_store_path = Path(self.live_market_store.db_path).expanduser().resolve()
         command = [
             sys.executable,
             "-m",
@@ -25827,6 +26057,36 @@ WantedBy=default.target
         self.live_deployment_runner_process = process
         return True
 
+    def _live_deployment_runner_should_run(self) -> bool:
+        try:
+            deployments = self.catalog.load_deployments()
+        except Exception:
+            deployments = getattr(self, "deployments_frame", pd.DataFrame())
+        if deployments is None or deployments.empty or "status" not in deployments.columns:
+            return False
+        statuses = deployments["status"].fillna("").astype(str).str.strip().str.lower()
+        parent_ids = (
+            deployments["parent_deployment_id"].fillna("").astype(str).str.strip()
+            if "parent_deployment_id" in deployments.columns
+            else pd.Series([""] * len(deployments), index=deployments.index)
+        )
+        return bool(((statuses.isin({"live", "armed"})) & (parent_ids == "")).any())
+
+    def _watch_live_deployment_runner_process(self) -> None:
+        if bool(getattr(self, "_closing", False)):
+            return
+        if not self._live_deployment_runner_watchdog_enabled():
+            return
+        process = getattr(self, "live_deployment_runner_process", None)
+        if process is not None and process.poll() is None:
+            return
+        if process is not None:
+            self.live_deployment_runner_process = None
+        if not self._live_deployment_runner_should_run():
+            return
+        if self._ensure_live_deployment_runner_process() and hasattr(self, "status_label"):
+            self.status_label.setText("Live runner watchdog started the live deployment runner process.")
+
     def _ensure_live_monitor_chart_service_process(self) -> bool:
         process = self.__dict__.get("live_monitor_chart_service_process")
         if process is not None and process.poll() is None:
@@ -25834,8 +26094,8 @@ WantedBy=default.target
         if process is not None:
             self.live_monitor_chart_service_process = None
             self._live_monitor_chart_service_warm_queued = False
-        catalog_path = Path(self.catalog.db_path)
-        live_store_path = Path(self.live_market_store.db_path)
+        catalog_path = Path(self.catalog.db_path).expanduser().resolve()
+        live_store_path = Path(self.live_market_store.db_path).expanduser().resolve()
         command = [
             sys.executable,
             "-m",
@@ -26011,10 +26271,15 @@ WantedBy=default.target
                     self._on_live_deployment_signal_marker(payload)
                 except Exception:
                     pass
+            if event_type == "runner_stopped":
+                self.live_deployment_runner_process = None
             if event_type in {
                 "deployment_armed",
+                "deployment_resumed",
                 "deployment_paused",
                 "deployment_stopped",
+                "runner_started",
+                "runner_stopped",
                 "signal_sent",
                 "signal_evaluated",
                 "signal_duplicate_skipped",
@@ -26608,6 +26873,7 @@ WantedBy=default.target
         if parent_deployments.empty:
             self.live_monitor_summary_label.setText("No deployment monitor state is available yet.")
             self.live_monitor_details.clear()
+            self._update_live_monitor_chart_action_state(None)
             if hasattr(self, "live_monitor_equity_figure"):
                 self._draw_live_monitor_equity_curve(pd.Series(dtype=float))
             return
@@ -26673,6 +26939,35 @@ WantedBy=default.target
         return self._deployment_targets_by_id().get(str(selected.get("target_id", "") or ""), {})
 
     @staticmethod
+    def _live_monitor_chart_block_reason(selected: dict | None) -> str:
+        if not selected:
+            return "Select a live deployment before opening Live Monitor charts."
+        status = str(selected.get("status") or "draft").strip().lower() or "draft"
+        if status == "live":
+            return ""
+        deployment_id = str(selected.get("deployment_id") or "").strip()
+        prefix = f"Deployment {deployment_id[:10]} is" if deployment_id else "The selected deployment is"
+        if status == "armed":
+            return f"{prefix} armed but not live yet. Wait for the runner to report live before opening Live Monitor charts."
+        if status == "paused":
+            return f"{prefix} paused. Resume or arm it until it is live before opening Live Monitor charts."
+        if status == "stopped":
+            return f"{prefix} stopped. Arm it and wait for live status before opening Live Monitor charts."
+        if status in {"error", "failed"}:
+            return f"{prefix} in error. Fix and arm it until it is live before opening Live Monitor charts."
+        return f"{prefix} {status}. It must be live before opening Live Monitor charts."
+
+    def _update_live_monitor_chart_action_state(self, selected: dict | None = None) -> None:
+        button = self.__dict__.get("live_monitor_open_charts_btn")
+        if button is None:
+            return
+        if selected is None:
+            selected = self._selected_live_monitor_row()
+        reason = self._live_monitor_chart_block_reason(selected)
+        button.setEnabled(not bool(reason))
+        button.setToolTip(reason or "Open Live Monitor charts for the selected live deployment.")
+
+    @staticmethod
     def _normalize_external_engine_base_url(value: str) -> str:
         base_url = str(value or "").strip().rstrip("/")
         if not base_url:
@@ -26723,6 +27018,7 @@ WantedBy=default.target
 
     def _refresh_live_monitor_details(self) -> None:
         selected = self._selected_live_monitor_row()
+        self._update_live_monitor_chart_action_state(selected)
         if not selected:
             self.live_monitor_details.clear()
             if hasattr(self, "live_monitor_engine_url_edit"):
@@ -27424,6 +27720,14 @@ WantedBy=default.target
         if not selected:
             QtWidgets.QMessageBox.information(self, "No deployment selected", "Select a deployment first.")
             return
+        block_reason = self._live_monitor_chart_block_reason(selected)
+        if block_reason:
+            self._update_live_monitor_chart_action_state(selected)
+            QtWidgets.QMessageBox.information(self, "Live Monitor Chart Unavailable", block_reason)
+            status_label = self.__dict__.get("status_label")
+            if status_label is not None:
+                status_label.setText(block_reason)
+            return
         if not self._ensure_live_monitor_chart_service_process():
             return
         deployment_id = str(selected.get("deployment_id") or "")
@@ -28118,11 +28422,23 @@ WantedBy=default.target
         bt_settings: Dict[str, float | bool | dict | str],
     ) -> tuple[list[str], bool]:
         issues: list[str] = []
-        supported_strategies = {"SMACrossStrategy", "ZScoreMeanReversionStrategy"}
+        supported_strategies = {
+            "SMACrossStrategy",
+            "SMATrendRegimeStrategy",
+            "TrendFollowingRibbonStrategy",
+            "ZScoreMeanReversionStrategy",
+            "SMARegimeFilteredZScoreMeanReversionStrategy",
+            "AdaptiveOUKalmanZScoreStrategy",
+            "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
+        }
         if strategy_factory.__name__ not in supported_strategies:
             issues.append(
                 f"{strategy_factory.__name__} does not have a vectorized adapter yet. "
-                "Current vectorized support is limited to SMACrossStrategy and ZScoreMeanReversionStrategy."
+                "Current vectorized support is limited to SMACrossStrategy, SMATrendRegimeStrategy, "
+                "TrendFollowingRibbonStrategy, "
+                "ZScoreMeanReversionStrategy, SMARegimeFilteredZScoreMeanReversionStrategy, "
+                "AdaptiveOUKalmanZScoreStrategy, "
+                "and RegimeFilteredAdaptiveOUKalmanZScoreStrategy."
             )
             return issues, False
 
@@ -28137,7 +28453,15 @@ WantedBy=default.target
     ) -> tuple[list[str], bool]:
         issues: list[str] = []
         can_apply_defaults = True
-        supported_strategies = {"SMACrossStrategy", "ZScoreMeanReversionStrategy"}
+        supported_strategies = {
+            "SMACrossStrategy",
+            "SMATrendRegimeStrategy",
+            "TrendFollowingRibbonStrategy",
+            "ZScoreMeanReversionStrategy",
+            "SMARegimeFilteredZScoreMeanReversionStrategy",
+            "AdaptiveOUKalmanZScoreStrategy",
+            "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
+        }
         if not portfolio_strategy_blocks:
             issues.append("No strategy blocks are configured.")
             return issues, False
@@ -29710,6 +30034,60 @@ WantedBy=default.target
                     "target": (float, 1.0),
                 },
             },
+            "SMA Trend Regime": {
+                "class": SMATrendRegimeStrategy,
+                "params": {
+                    "fastest_len": (int, 10),
+                    "fast_len": (int, 20),
+                    "med_len": (int, 30),
+                    "slow_len": (int, 50),
+                    "slowest_len": (int, 200),
+                    "regime_mode": (str, "fastest_slowest"),
+                    "regime_timeframe": (str, ""),
+                    "allow_neutral_bridge": (bool, True),
+                    "enter_on_initial_state": (bool, False),
+                    "exit_on_neutral": (bool, False),
+                    "confirm_slowest_slope": (bool, False),
+                    "slope_lookback": (int, 5),
+                    "min_slope_atr": (float, 0.0),
+                    "use_atr_stop": (bool, True),
+                    "atr_stop_len": (int, 14),
+                    "atr_stop_mult": (float, 3.0),
+                    "atr_stop_update_mode": (str, "Trailing"),
+                    "atr_stop_basis": (str, "HighLow"),
+                    "reenter_after_stop": (bool, True),
+                    "stop_reentry_mode": (str, "Immediate"),
+                    "target": (float, 1.0),
+                },
+            },
+            "Trend Following Ribbon": {
+                "class": TrendFollowingRibbonStrategy,
+                "params": {
+                    "ma_type": (str, "EMA"),
+                    "trend_check_period": (int, 20),
+                    "trend_channel_rate_pct": (float, 1.0),
+                    "use_linear_regression": (bool, True),
+                    "linear_regression_period": (int, 10),
+                    "entry_ribbon_threshold": (int, 14),
+                    "exit_ribbon_threshold": (int, 4),
+                    "regime_timeframe": (str, "1 day"),
+                    "regime_fast_len": (int, 50),
+                    "regime_slow_len": (int, 200),
+                    "use_regime_lockout": (bool, True),
+                    "use_short_atr_trail": (bool, False),
+                    "short_atr_len": (int, 14),
+                    "short_atr_mult": (float, 3.0),
+                    "use_hard_stop_loss": (bool, False),
+                    "hard_stop_loss_pct": (float, 10.0),
+                    "use_price_distance_filter": (bool, True),
+                    "distance_ma_type": (str, "SMA"),
+                    "distance_ma_len": (int, 50),
+                    "distance_norm_mode": (str, "ATR"),
+                    "distance_atr_len": (int, 14),
+                    "min_price_distance": (float, -1.0),
+                    "target": (float, 1.0),
+                },
+            },
             "Inverse Turtle": {
                 "class": InverseTurtleStrategy,
                 "params": {
@@ -29737,12 +30115,100 @@ WantedBy=default.target
                     "target": (float, 1.0),
                 },
             },
+            "SMA Regime Z-Score Mean Reversion": {
+                "class": SMARegimeFilteredZScoreMeanReversionStrategy,
+                "params": {
+                    "enable_longs": (bool, True),
+                    "enable_shorts": (bool, True),
+                    "half_life_lookback": (int, 100),
+                    "half_life_factor": (float, 1.5),
+                    "std_len": (int, 20),
+                    "z_smooth_type": (str, "None"),
+                    "z_smooth_len": (int, 5),
+                    "use_vol_norm": (bool, True),
+                    "vol_type": (str, "ATR"),
+                    "vol_len": (int, 14),
+                    "atr_mult": (float, 1.0),
+                    "long_entry_z": (float, -1.0),
+                    "long_exit_z": (float, 0.0),
+                    "short_entry_z": (float, 1.0),
+                    "short_exit_z": (float, 0.0),
+                    "use_sma_regime_filter": (bool, True),
+                    "exit_on_regime_loss": (bool, True),
+                    "use_hard_stop_loss": (bool, False),
+                    "hard_stop_loss_pct": (float, 10.0),
+                    "regime_timeframe": (str, ""),
+                    "fastest_len": (int, 10),
+                    "fast_len": (int, 20),
+                    "med_len": (int, 30),
+                    "slow_len": (int, 50),
+                    "slowest_len": (int, 200),
+                    "regime_mode": (str, "fastest_slowest"),
+                    "confirm_slowest_slope": (bool, False),
+                    "slope_lookback": (int, 5),
+                    "min_slope_atr": (float, 0.0),
+                    "target": (float, 1.0),
+                },
+            },
+            "Adaptive OU Kalman Z-Score": {
+                "class": AdaptiveOUKalmanZScoreStrategy,
+                "params": {
+                    "ou_lookback": (int, 100),
+                    "half_life_factor": (float, 1.0),
+                    "min_half_life": (float, 2.0),
+                    "max_half_life": (float, 250.0),
+                    "std_half_life_factor": (float, 1.0),
+                    "kalman_process_var_ratio": (float, 0.01),
+                    "ou_mean_pull": (float, 1.0),
+                    "z_smooth_type": (str, "None"),
+                    "z_smooth_len": (int, 3),
+                    "exit_signal_mode": (str, "Level"),
+                    "long_entry_z": (float, -1.0),
+                    "long_exit_z": (float, 0.0),
+                    "target": (float, 1.0),
+                },
+            },
+            "Regime Filtered OU Kalman Z-Score": {
+                "class": RegimeFilteredAdaptiveOUKalmanZScoreStrategy,
+                "params": {
+                    "ou_lookback": (int, 100),
+                    "half_life_factor": (float, 1.0),
+                    "min_half_life": (float, 2.0),
+                    "max_half_life": (float, 250.0),
+                    "std_half_life_factor": (float, 1.0),
+                    "kalman_process_var_ratio": (float, 0.01),
+                    "ou_mean_pull": (float, 1.0),
+                    "z_smooth_type": (str, "None"),
+                    "z_smooth_len": (int, 3),
+                    "exit_signal_mode": (str, "Level"),
+                    "long_entry_z": (float, -1.0),
+                    "long_exit_z": (float, 0.0),
+                    "use_regime_filter": (bool, True),
+                    "regime_timeframe": (str, ""),
+                    "use_bbw_regime": (bool, True),
+                    "use_adx_regime": (bool, True),
+                    "use_er_regime": (bool, True),
+                    "bbw_len": (int, 200),
+                    "bbw_percentile_threshold": (float, 50.0),
+                    "adx_len": (int, 14),
+                    "adx_smoothing_len": (int, 14),
+                    "adx_threshold": (float, 20.0),
+                    "er_len": (int, 14),
+                    "er_threshold": (float, 0.3),
+                    "exit_on_regime_loss": (bool, True),
+                    "use_atr_stop": (bool, True),
+                    "atr_stop_len": (int, 14),
+                    "atr_stop_mult": (float, 2.0),
+                    "atr_stop_update_mode": (str, "Trailing"),
+                    "target": (float, 1.0),
+                },
+            },
         }
         self.strategy_combo.clear()
         for name in self.strategy_specs:
             self.strategy_combo.addItem(name)
         self.strategy_combo.currentTextChanged.connect(self._render_strategy_params)
-        self.param_inputs: Dict[str, QtWidgets.QLineEdit] = {}
+        self.param_inputs: Dict[str, QtWidgets.QWidget] = {}
         self._render_strategy_params(self.strategy_combo.currentText())
 
     def _render_strategy_params(self, name: str) -> None:
@@ -29753,17 +30219,25 @@ WantedBy=default.target
         spec = self.strategy_specs.get(name)
         if not spec:
             return
-        for param, (_, default) in spec["params"].items():
-            edit = QtWidgets.QLineEdit(str(default))
-            edit.setPlaceholderText("comma list or start:end:step (e.g., 5,10,15 or 5:15:5)")
-            edit.setToolTip(
-                "Enter comma-separated values.\n"
-                "Numeric params also support range notation start:end:step.\n"
-                "String params accept literals like None,SMA,EMA.\n"
-                "Boolean params accept true/false."
-            )
-            self.strategy_params_box.addRow(QtWidgets.QLabel(param), edit)
-            self.param_inputs[param] = edit
+        for param, (ptype, default) in spec["params"].items():
+            options = _strategy_param_dropdown_options(param, ptype)
+            if options:
+                combo = QtWidgets.QComboBox()
+                for label, value in options:
+                    combo.addItem(label, value)
+                _set_combo_to_data(combo, default)
+                combo.setToolTip(_strategy_param_dropdown_tooltip(param, ptype))
+                widget: QtWidgets.QWidget = combo
+            else:
+                edit = QtWidgets.QLineEdit(str(default))
+                edit.setPlaceholderText("comma list or start:end:step (e.g., 5,10,15 or 5:15:5)")
+                edit.setToolTip(
+                    "Enter comma-separated values.\n"
+                    "Numeric params also support range notation start:end:step."
+                )
+                widget = edit
+            self.strategy_params_box.addRow(QtWidgets.QLabel(param), widget)
+            self.param_inputs[param] = widget
 
     @staticmethod
     def _parse_strategy_param_value(ptype: type, token: str):
@@ -29788,7 +30262,7 @@ WantedBy=default.target
         grid_params: Dict[str, List] = {}
         errors = []
         for key, (ptype, default) in params_meta.items():
-            text = self.param_inputs[key].text().strip()
+            text = _strategy_param_widget_text(self.param_inputs[key])
             vals: List = []
             tokens = [t.strip() for t in text.split(",")] if text else []
             if not tokens:
@@ -34907,6 +35381,7 @@ class RunChartDialog(DashboardDialog):
 
             # Compute indicators for plotting.
             indicators = self._compute_indicators(run, bars)
+            regime_series = indicators.pop("Choppy Regime", None) if indicators else None
 
             # Load stored trades; do not rerun.
             rc = ResultCatalog(self.catalog_path)
@@ -34921,7 +35396,12 @@ class RunChartDialog(DashboardDialog):
                 trades_df = trades_df[(trades_df["ts"] >= bars.index.min()) & (trades_df["ts"] <= bars.index.max())]
             equity = None
 
-            atr_series = indicators.pop("ATR", None) if indicators else None
+            pane_indicators: Dict[str, pd.Series] = {}
+            if indicators:
+                for pane_name in ("ATR", "Z-Score", "Adaptive Z-Score", "Trend State", "Bull Count", "Bear Count"):
+                    pane_series = indicators.pop(pane_name, None)
+                    if pane_series is not None:
+                        pane_indicators[pane_name] = pane_series
 
             ohlc = bars[["open", "high", "low", "close"]].copy()
             x = np.arange(len(ohlc), dtype=float)
@@ -34929,6 +35409,18 @@ class RunChartDialog(DashboardDialog):
                 [x, ohlc["open"].to_numpy(), ohlc["high"].to_numpy(), ohlc["low"].to_numpy(), ohlc["close"].to_numpy()]
             )
             candlestick_ohlc(ax_price, ohlc_vals, width=0.6, colorup="#27d07d", colordown="#b38cff", alpha=0.7)
+            if regime_series is not None:
+                aligned_regime = pd.to_numeric(regime_series.reindex(bars.index), errors="coerce").fillna(0.0)
+                active = aligned_regime.to_numpy(dtype=float) > 0.5
+                start_idx: int | None = None
+                for idx, is_active in enumerate(active):
+                    if is_active and start_idx is None:
+                        start_idx = idx
+                    elif not is_active and start_idx is not None:
+                        ax_price.axvspan(start_idx - 0.5, idx - 0.5, color="#9ab0d0", alpha=0.16, linewidth=0, zorder=0)
+                        start_idx = None
+                if start_idx is not None:
+                    ax_price.axvspan(start_idx - 0.5, len(active) - 0.5, color="#9ab0d0", alpha=0.16, linewidth=0, zorder=0)
             for name, series in indicators.items():
                 aligned = series.reindex(bars.index)
                 ax_price.plot(x, aligned.to_numpy(), label=name, linewidth=1.0, zorder=1)
@@ -34977,11 +35469,26 @@ class RunChartDialog(DashboardDialog):
             ax_price.set_title("Price & Indicators (pan/zoom enabled)")
             ax_price.grid(alpha=0.12, color="0.3")
 
-            if atr_series is not None:
-                aligned_atr = atr_series.reindex(bars.index)
-                ax_atr.plot(x, aligned_atr.to_numpy(), color="#a28bff", label="ATR", linewidth=1.0)
+            if pane_indicators:
+                pane_colors = {
+                    "ATR": "#a28bff",
+                    "Z-Score": "#a28bff",
+                    "Adaptive Z-Score": "#a28bff",
+                    "Trend State": "#9ab0d0",
+                    "Bull Count": "#27d07d",
+                    "Bear Count": "#ff6b6b",
+                }
+                for pane_name, pane_series in pane_indicators.items():
+                    aligned_pane = pane_series.reindex(bars.index)
+                    ax_atr.plot(
+                        x,
+                        aligned_pane.to_numpy(),
+                        color=pane_colors.get(pane_name, "#a28bff"),
+                        label=pane_name,
+                        linewidth=1.0,
+                    )
                 ax_atr.legend(loc="upper left")
-            ax_atr.set_title("ATR")
+            ax_atr.set_title("Indicators")
             ax_atr.grid(alpha=0.12, color="0.3")
 
             if equity is not None:
@@ -35019,8 +35526,18 @@ class RunChartDialog(DashboardDialog):
     def _strategy_class_static(name: str):
         mapping = {
             "SMACrossStrategy": SMACrossStrategy,
+            "SMA Trend Regime": SMATrendRegimeStrategy,
+            "SMATrendRegimeStrategy": SMATrendRegimeStrategy,
+            "Trend Following Ribbon": TrendFollowingRibbonStrategy,
+            "TrendFollowingRibbonStrategy": TrendFollowingRibbonStrategy,
             "InverseTurtleStrategy": InverseTurtleStrategy,
             "ZScoreMeanReversionStrategy": ZScoreMeanReversionStrategy,
+            "SMA Regime Z-Score Mean Reversion": SMARegimeFilteredZScoreMeanReversionStrategy,
+            "SMARegimeFilteredZScoreMeanReversionStrategy": SMARegimeFilteredZScoreMeanReversionStrategy,
+            "Adaptive OU Kalman Z-Score": AdaptiveOUKalmanZScoreStrategy,
+            "AdaptiveOUKalmanZScoreStrategy": AdaptiveOUKalmanZScoreStrategy,
+            "Regime Filtered OU Kalman Z-Score": RegimeFilteredAdaptiveOUKalmanZScoreStrategy,
+            "RegimeFilteredAdaptiveOUKalmanZScoreStrategy": RegimeFilteredAdaptiveOUKalmanZScoreStrategy,
         }
         return mapping.get(name, SMACrossStrategy)
 
@@ -35063,20 +35580,13 @@ class RunChartDialog(DashboardDialog):
             norm_tf = BacktestEngine._normalize_freq(tf)
             if norm_tf in ("1T", "1min"):
                 bars = duck.load_range(run.dataset_id, start_ts, end_ts)
+            elif RunChartDialog._run_chart_should_use_reference_resample(run):
+                base_start = start_ts - RunChartDialog._resample_warmup_delta(norm_tf)
+                base = duck.load_range(run.dataset_id, base_start, end_ts)
+                bars = RunChartDialog._resample_reference_signal_bars(base, norm_tf)
+                bars = bars[(bars.index >= start_ts) & (bars.index <= end_ts)]
             else:
-                try:
-                    offset = pd.tseries.frequencies.to_offset(norm_tf)
-                    start_buffer = start_ts - offset
-                except Exception:
-                    start_buffer = start_ts
-                base = duck.load_range(run.dataset_id, start_buffer, end_ts)
-                if base.empty:
-                    return None
-                bars = (
-                    base.resample(norm_tf, label="right", closed="right")
-                    .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-                    .dropna()
-                )
+                bars = duck.resample(run.dataset_id, tf)
                 bars = bars[(bars.index >= start_ts) & (bars.index <= end_ts)]
             if bars.index.tz is None:
                 bars.index = bars.index.tz_localize("UTC")
@@ -35085,6 +35595,39 @@ class RunChartDialog(DashboardDialog):
             return bars
         except Exception:
             return None
+
+    @staticmethod
+    def _run_chart_should_use_reference_resample(run: RunRow) -> bool:
+        return str(getattr(run, "engine_impl", "") or "").lower() == "reference"
+
+    @staticmethod
+    def _resample_warmup_delta(norm_tf: str) -> pd.Timedelta:
+        text = str(norm_tf or "").strip().lower()
+        try:
+            return pd.Timedelta(text)
+        except Exception:
+            pass
+        digits = "".join(ch for ch in text if ch.isdigit()) or "1"
+        unit = "".join(ch for ch in text if not ch.isdigit())
+        amount = max(int(digits), 1)
+        if unit in {"d", "day", "days"}:
+            return pd.Timedelta(days=amount)
+        if unit in {"w", "wk", "week", "weeks"}:
+            return pd.Timedelta(weeks=amount)
+        return pd.Timedelta(days=1)
+
+    @staticmethod
+    def _resample_reference_signal_bars(base: pd.DataFrame, norm_tf: str) -> pd.DataFrame:
+        if base is None or base.empty:
+            return pd.DataFrame()
+        agg = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+        return base.resample(norm_tf, label="right", closed="right").agg(agg).dropna()
 
     @staticmethod
     def _load_bars_static(run: RunRow) -> pd.DataFrame | None:
@@ -35149,10 +35692,52 @@ class RunChartDialog(DashboardDialog):
             slow = int(params.get("slow", 30))
             out["SMA Fast"] = bars["close"].rolling(fast).mean()
             out["SMA Slow"] = bars["close"].rolling(slow).mean()
+        elif name == "SMATrendRegimeStrategy":
+            features = compute_sma_trend_regime_features(bars, params)
+            out["SMA Fastest"] = features["fastest_sma"]
+            out["SMA Fast"] = features["fast_sma"]
+            out["SMA Medium"] = features["med_sma"]
+            out["SMA Slow"] = features["slow_sma"]
+            out["SMA Slowest"] = features["slowest_sma"]
+            out["ATR Stop"] = features["atr_stop_price"]
+            out["Trend State"] = features["trend_state"].astype(float)
+        elif name == "TrendFollowingRibbonStrategy":
+            features = compute_trend_following_ribbon_features(bars, params)
+            out["Ribbon MA 5"] = features["ma_5"]
+            out["Ribbon MA 20"] = features["ma_20"]
+            out["Ribbon MA 50"] = features["ma_50"]
+            out["Ribbon MA 100"] = features["ma_100"]
+            out["HTF Fast SMA"] = features["regime_fast_sma"]
+            out["HTF Slow SMA"] = features["regime_slow_sma"]
+            out["Distance MA"] = features["distance_ma"]
+            out["Short ATR Trail"] = features["short_atr_trail_stop"]
+            out["Hard Stop"] = features["hard_stop_loss_price"]
+            out["Bull Count"] = features["bull_count"].astype(float)
+            out["Bear Count"] = features["bear_count"].astype(float)
         elif name == "ZScoreMeanReversionStrategy":
             features = compute_zscore_mean_reversion_features(bars, params)
             out["Half-Life Mean"] = features["half_life_mean"]
             out["Z-Score"] = features["z_score"]
+        elif name == "SMARegimeFilteredZScoreMeanReversionStrategy":
+            features = compute_sma_regime_filtered_zscore_mean_reversion_features(bars, params)
+            out["Half-Life Mean"] = features["half_life_mean"]
+            out["Z-Score"] = features["z_score"]
+            out["Regime SMA Fastest"] = features["sma_fastest"]
+            out["Regime SMA Slowest"] = features["sma_slowest"]
+            out["Hard Stop"] = features["hard_stop_loss_price"]
+            out["Trend State"] = features["sma_regime_state"].astype(float)
+        elif name == "AdaptiveOUKalmanZScoreStrategy":
+            features = compute_adaptive_ou_kalman_zscore_features(bars, params)
+            out["Kalman Mean"] = features["kalman_mean"]
+            out["OU Equilibrium"] = features["ou_equilibrium_mean"]
+            out["Adaptive Z-Score"] = features["z_score"]
+        elif name == "RegimeFilteredAdaptiveOUKalmanZScoreStrategy":
+            features = compute_regime_filtered_adaptive_ou_kalman_zscore_features(bars, params)
+            out["Kalman Mean"] = features["kalman_mean"]
+            out["OU Equilibrium"] = features["ou_equilibrium_mean"]
+            out["ATR Stop"] = features["atr_stop_price"]
+            out["Adaptive Z-Score"] = features["z_score"]
+            out["Choppy Regime"] = features["regime_is_choppy"].astype(float)
         elif name == "InverseTurtleStrategy":
             entry_len = int(params.get("entry_len", 20))
             exit_len = int(params.get("exit_len", 10))
@@ -35188,9 +35773,31 @@ class RunChartDialog(DashboardDialog):
     def _build_snapshot_series_static(run: RunRow, bars: pd.DataFrame) -> tuple[Dict[str, pd.Series], Dict[str, pd.Series], Dict[str, dict]]:
         color_map = {
             "SMA Fast": "#4da3ff",
+            "SMA Fastest": "#27d07d",
+            "SMA Medium": "#f59e0b",
             "SMA Slow": "#ffd166",
+            "SMA Slowest": "#e6e94f",
             "Half-Life Mean": "#4da3ff",
+            "Kalman Mean": "#4da3ff",
+            "OU Equilibrium": "#ffd166",
             "Z-Score": "#a28bff",
+            "Adaptive Z-Score": "#a28bff",
+            "Choppy Regime": "#9ab0d0",
+            "Trend State": "#9ab0d0",
+            "Ribbon MA 5": "#7ee787",
+            "Ribbon MA 20": "#4da3ff",
+            "Ribbon MA 50": "#a28bff",
+            "Ribbon MA 100": "#ff6b6b",
+            "HTF Fast SMA": "#facc15",
+            "HTF Slow SMA": "#f97316",
+            "Regime Fast SMA": "#facc15",
+            "Regime Slow SMA": "#f97316",
+            "Distance MA": "#f8fafc",
+            "Short ATR Trail": "#ff6b6b",
+            "Hard Stop": "#ffcc66",
+            "Bull Count": "#27d07d",
+            "Bear Count": "#ff6b6b",
+            "ATR Stop": "#ff6b6b",
             "Upper": "#27d07d",
             "Lower": "#ff6b6b",
             "Exit Upper": "#7ee787",
@@ -35203,11 +35810,13 @@ class RunChartDialog(DashboardDialog):
         styles: Dict[str, dict] = {}
         for name, series in indicators.items():
             aligned = pd.to_numeric(series.reindex(bars.index), errors="coerce")
-            if name in {"ATR", "Z-Score"}:
+            if name in {"ATR", "Z-Score", "Adaptive Z-Score", "Trend State", "Bull Count", "Bear Count"}:
                 panes[name] = aligned
             else:
                 overlays[name] = aligned
             styles[name] = {"color": color_map.get(name, "#4da3ff"), "line_width": 1.0}
+            if name == "Choppy Regime":
+                styles[name]["render_role"] = "background_band"
         return overlays, panes, styles
 
     def _on_scroll(self, event, ax_price, ax_atr, ax_equity, canvas) -> None:

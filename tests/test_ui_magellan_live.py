@@ -194,6 +194,7 @@ class LiveRunnerProcessBoundaryTests(unittest.TestCase):
         window._selected_live_monitor_row = lambda: {
             "deployment_id": "deploy-1",
             "target_id": "target-1",
+            "status": "live",
             "timeframe": "15m",
         }
         window._deployment_symbol_scope = lambda *_args: (_ for _ in ()).throw(
@@ -226,6 +227,60 @@ class LiveRunnerProcessBoundaryTests(unittest.TestCase):
         self.assertEqual(payload["lookback"], "3mo")
         self.assertTrue(payload["replace_existing"])
         self.assertIn("Queued Live Monitor Magellan chart open", window.status_label.text())
+
+    def test_open_live_monitor_charts_blocks_non_live_deployment_before_queue(self) -> None:
+        queued = []
+        messages = []
+
+        class FakeStatus:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def setText(self, value: str) -> None:
+                self.value = value
+
+            def text(self) -> str:
+                return self.value
+
+        class FakeButton:
+            def __init__(self) -> None:
+                self.enabled = True
+                self.tooltip = ""
+
+            def setEnabled(self, value: bool) -> None:
+                self.enabled = bool(value)
+
+            def setToolTip(self, value: str) -> None:
+                self.tooltip = value
+
+        window = DashboardWindow.__new__(DashboardWindow)
+        window.live_monitor_open_charts_btn = FakeButton()
+        window.status_label = FakeStatus()
+        window._selected_live_monitor_row = lambda: {
+            "deployment_id": "deploy-1",
+            "status": "stopped",
+            "timeframe": "15m",
+        }
+        window._ensure_live_monitor_chart_service_process = lambda: (_ for _ in ()).throw(
+            AssertionError("Inactive deployments must not start the chart service.")
+        )
+        window._queue_live_chart_command = lambda *args, **kwargs: queued.append((args, kwargs))
+
+        from ui_qt_dashboard import QtWidgets
+
+        original_information = QtWidgets.QMessageBox.information
+        QtWidgets.QMessageBox.information = lambda *args, **kwargs: messages.append(args)
+        try:
+            DashboardWindow._open_live_monitor_charts(window)
+        finally:
+            QtWidgets.QMessageBox.information = original_information
+
+        self.assertEqual(queued, [])
+        self.assertFalse(window.live_monitor_open_charts_btn.enabled)
+        self.assertIn("stopped", window.live_monitor_open_charts_btn.tooltip)
+        self.assertTrue(messages)
+        self.assertIn("stopped", messages[0][2])
+        self.assertIn("live status", window.status_label.text())
 
 
 class LiveDeploymentRunnerTests(unittest.TestCase):

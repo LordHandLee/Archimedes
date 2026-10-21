@@ -156,14 +156,12 @@ class GridSearch:
             bars = self.data_loader(timeframe)
             for (start, end) in horizon_list:
                 param_grid = [dict(zip(grid.params.keys(), combo)) for combo in itertools.product(*grid.params.values())]
-                initial_base_execution = timeframe != "1 minutes" and requested_mode != ExecutionMode.VECTORIZED
                 base_config = replace(
                     self.base_config,
                     batch_id=batch_id,
                     timeframe=timeframe,
                     time_horizon_start=start,
                     time_horizon_end=end,
-                    base_execution=initial_base_execution,
                 )
                 resolution = orchestrator.resolve_param_grid(
                     data=bars,

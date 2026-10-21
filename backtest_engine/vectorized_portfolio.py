@@ -8,7 +8,14 @@ import pandas as pd
 
 from .engine import BacktestConfig
 from .metrics import PerformanceMetrics, compute_metrics
-from .sample_strategies import compute_zscore_mean_reversion_features
+from .sample_strategies import (
+    compute_adaptive_ou_kalman_zscore_features,
+    compute_regime_filtered_adaptive_ou_kalman_zscore_features,
+    compute_sma_regime_filtered_zscore_mean_reversion_features,
+    compute_sma_trend_regime_features,
+    compute_trend_following_ribbon_features,
+    compute_zscore_mean_reversion_features,
+)
 from .sizing import (
     POSITION_SIZING_NONE,
     apply_position_sizing_to_weights,
@@ -135,7 +142,7 @@ class _StrategyBlockContext:
 @dataclass(frozen=True)
 class VectorizedPortfolioEngine:
     engine_impl: str = "vectorized_portfolio"
-    engine_version: str = "1"
+    engine_version: str = "2"
     max_gross_exposure: float = 1.0
 
     def supports_strategy_blocks(
@@ -253,7 +260,15 @@ class VectorizedPortfolioEngine:
             support = adapter.supports(config, asset.strategy_cls)
             if not support.supported:
                 return support
-            if asset.strategy_cls.__name__ not in {"SMACrossStrategy", "ZScoreMeanReversionStrategy"}:
+            if asset.strategy_cls.__name__ not in {
+                "SMACrossStrategy",
+                "SMATrendRegimeStrategy",
+                "TrendFollowingRibbonStrategy",
+                "ZScoreMeanReversionStrategy",
+                "SMARegimeFilteredZScoreMeanReversionStrategy",
+                "AdaptiveOUKalmanZScoreStrategy",
+                "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
+            }:
                 return VectorizedSupport(
                     False,
                     f"Strategy {asset.strategy_cls.__name__} has no portfolio intent builder yet.",
@@ -718,7 +733,16 @@ class VectorizedPortfolioEngine:
         strategy_name = asset.strategy_cls.__name__
         if strategy_name == "SMACrossStrategy":
             intent = self._build_sma_intent(asset=asset, data=data, config=config)
-        elif strategy_name == "ZScoreMeanReversionStrategy":
+        elif strategy_name == "SMATrendRegimeStrategy":
+            intent = self._build_sma_trend_regime_intent(asset=asset, data=data, config=config)
+        elif strategy_name == "TrendFollowingRibbonStrategy":
+            intent = self._build_trend_following_ribbon_intent(asset=asset, data=data, config=config)
+        elif strategy_name in {
+            "ZScoreMeanReversionStrategy",
+            "SMARegimeFilteredZScoreMeanReversionStrategy",
+            "AdaptiveOUKalmanZScoreStrategy",
+            "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
+        }:
             intent = self._build_zscore_intent(asset=asset, data=data, config=config)
         else:
             raise RuntimeError(f"Strategy {strategy_name} has no portfolio intent builder.")
@@ -786,6 +810,115 @@ class VectorizedPortfolioEngine:
         scores = np.where(np.abs(candidate_weights) > 0.0, np.abs(raw_score), 0.0)
         return _PortfolioIntent(strategy_weights=strategy_weights, candidate_weights=candidate_weights, scores=scores)
 
+    def _build_sma_trend_regime_intent(
+        self,
+        *,
+        asset: PortfolioAssetSpec,
+        data: pd.DataFrame,
+        config: BacktestConfig,
+    ) -> _PortfolioIntent:
+        params = asset.strategy_params
+        target = abs(float(params.get("target", 1.0)))
+        preferred_weight = float(asset.target_weight) if asset.target_weight is not None else 1.0
+        features = compute_sma_trend_regime_features(data, params)
+        enter_long = features["long_entry_signal"].to_numpy(dtype=bool)
+        enter_short = features["short_entry_signal"].to_numpy(dtype=bool)
+        exit_long = features["long_exit_signal"].to_numpy(dtype=bool)
+        exit_short = features["short_exit_signal"].to_numpy(dtype=bool)
+        if config.allow_short:
+            strategy_weights = self._long_short_weight_series(
+                enter_long=enter_long,
+                exit_long=exit_long,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=target * preferred_weight,
+                short_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._long_short_weight_series(
+                enter_long=enter_long,
+                exit_long=exit_long,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=preferred_weight,
+                short_target=preferred_weight,
+                config=config,
+            )
+        else:
+            long_only_exit = exit_long | enter_short
+            strategy_weights = self._state_weight_series(
+                enter_long,
+                long_only_exit,
+                base_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._state_weight_series(
+                enter_long,
+                long_only_exit,
+                base_target=preferred_weight,
+                config=config,
+            )
+        spread = (
+            (features["fastest_sma"] - features["slowest_sma"]) / data["close"].replace(0.0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan)
+        raw_score = spread.abs().fillna(0.0).to_numpy(dtype=float)
+        scores = np.where(np.abs(candidate_weights) > 0.0, raw_score, 0.0)
+        return _PortfolioIntent(strategy_weights=strategy_weights, candidate_weights=candidate_weights, scores=scores)
+
+    def _build_trend_following_ribbon_intent(
+        self,
+        *,
+        asset: PortfolioAssetSpec,
+        data: pd.DataFrame,
+        config: BacktestConfig,
+    ) -> _PortfolioIntent:
+        params = asset.strategy_params
+        target = abs(float(params.get("target", 1.0)))
+        preferred_weight = float(asset.target_weight) if asset.target_weight is not None else 1.0
+        features = compute_trend_following_ribbon_features(data, params)
+        enter_long = features["long_entry_signal"].to_numpy(dtype=bool)
+        enter_short = features["short_entry_signal"].to_numpy(dtype=bool)
+        exit_long = (features["long_exit_signal"].to_numpy(dtype=bool) & ~enter_short)
+        exit_short = (features["short_exit_signal"].to_numpy(dtype=bool) & ~enter_long)
+        if config.allow_short:
+            strategy_weights = self._long_short_weight_series(
+                enter_long=enter_long,
+                exit_long=exit_long,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=target * preferred_weight,
+                short_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._long_short_weight_series(
+                enter_long=enter_long,
+                exit_long=exit_long,
+                enter_short=enter_short,
+                exit_short=exit_short,
+                long_target=preferred_weight,
+                short_target=preferred_weight,
+                config=config,
+            )
+        else:
+            long_only_exit = exit_long | enter_short
+            strategy_weights = self._state_weight_series(
+                enter_long,
+                long_only_exit,
+                base_target=target * preferred_weight,
+                config=config,
+            )
+            candidate_weights = self._state_weight_series(
+                enter_long,
+                long_only_exit,
+                base_target=preferred_weight,
+                config=config,
+            )
+        raw_score = (
+            (features["bull_count"].astype(float) - features["bear_count"].astype(float)).abs() / 20.0
+        ).fillna(0.0).to_numpy(dtype=float)
+        scores = np.where(np.abs(candidate_weights) > 0.0, raw_score, 0.0)
+        return _PortfolioIntent(strategy_weights=strategy_weights, candidate_weights=candidate_weights, scores=scores)
+
     def _build_zscore_intent(
         self,
         *,
@@ -796,9 +929,18 @@ class VectorizedPortfolioEngine:
         params = asset.strategy_params
         target = abs(float(params.get("target", 1.0)))
         preferred_weight = float(asset.target_weight) if asset.target_weight is not None else 1.0
-        features = compute_zscore_mean_reversion_features(data, params)
+        if asset.strategy_cls.__name__ == "AdaptiveOUKalmanZScoreStrategy":
+            features = compute_adaptive_ou_kalman_zscore_features(data, params)
+        elif asset.strategy_cls.__name__ == "RegimeFilteredAdaptiveOUKalmanZScoreStrategy":
+            features = compute_regime_filtered_adaptive_ou_kalman_zscore_features(data, params)
+        elif asset.strategy_cls.__name__ == "SMARegimeFilteredZScoreMeanReversionStrategy":
+            features = compute_sma_regime_filtered_zscore_mean_reversion_features(data, params)
+        else:
+            features = compute_zscore_mean_reversion_features(data, params)
         enter = features["long_entry_signal"].to_numpy(dtype=bool)
         exit_ = features["long_exit_signal"].to_numpy(dtype=bool)
+        if asset.strategy_cls.__name__ == "SMARegimeFilteredZScoreMeanReversionStrategy" and not config.allow_short:
+            exit_ = exit_ | features["short_entry_signal"].to_numpy(dtype=bool)
         if config.allow_short:
             enter_short = features["short_entry_signal"].to_numpy(dtype=bool)
             exit_short = features["short_exit_signal"].to_numpy(dtype=bool)

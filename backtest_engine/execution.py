@@ -9,7 +9,7 @@ import pandas as pd
 
 from .catalog import ResultCatalog
 from .engine import BacktestConfig, BacktestResult
-from .run_ids import compute_engine_run_id, compute_portfolio_logical_run_id
+from .run_ids import assert_backtest_source_current, compute_engine_run_id, compute_portfolio_logical_run_id
 from .strategy import Strategy
 
 
@@ -226,6 +226,42 @@ class ExecutionOrchestrator:
     _vectorized_portfolio_engine: object | None = field(default=None, init=False, repr=False)
     _last_batch_benchmark: BatchExecutionBenchmark | None = field(default=None, init=False, repr=False)
 
+    @staticmethod
+    def _truthy_param(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @classmethod
+    def _requires_recalc_on_fill(cls, strategy_cls: Type[Strategy], params: Dict) -> bool:
+        return (
+            strategy_cls.__name__ == "SMATrendRegimeStrategy"
+            and cls._truthy_param(params.get("reenter_after_stop", False))
+        )
+
+    @classmethod
+    def _config_for_params(cls, strategy_cls: Type[Strategy], params: Dict, config: BacktestConfig) -> BacktestConfig:
+        if cls._requires_recalc_on_fill(strategy_cls, params) and not bool(config.recalc_on_fill):
+            return replace(config, recalc_on_fill=True)
+        return config
+
+    @classmethod
+    def _config_for_param_grid(
+        cls,
+        strategy_cls: Type[Strategy],
+        param_grid: Sequence[Dict],
+        config: BacktestConfig,
+    ) -> BacktestConfig:
+        if not bool(config.recalc_on_fill) and any(
+            cls._requires_recalc_on_fill(strategy_cls, params) for params in param_grid
+        ):
+            return replace(config, recalc_on_fill=True)
+        return config
+
     def resolve(self, request: ExecutionRequest) -> ExecutionResolution:
         requested_mode = ExecutionMode.from_value(request.requested_execution_mode)
         effective_config = request.config
@@ -233,6 +269,17 @@ class ExecutionOrchestrator:
         vectorized_support = self._get_vectorized_engine().supports(request)
         if requested_mode == ExecutionMode.VECTORIZED:
             if not vectorized_support.supported:
+                vectorized_candidate = self._auto_same_timeframe_candidate(request)
+                if vectorized_candidate is not None:
+                    candidate_support = self._get_vectorized_engine().supports(vectorized_candidate)
+                    if candidate_support.supported:
+                        return ExecutionResolution(
+                            requested_mode=requested_mode,
+                            resolved_mode=ExecutionMode.VECTORIZED,
+                            fallback_reason=None,
+                            effective_config=vectorized_candidate.config,
+                            effective_base_data=vectorized_candidate.base_data,
+                        )
                 raise UnsupportedExecutionModeError(
                     vectorized_support.reason or "Vectorized execution is not available for this request."
                 )
@@ -279,6 +326,10 @@ class ExecutionOrchestrator:
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        assert_backtest_source_current()
+        config = self._config_for_params(request.strategy_cls, request.strategy_params, request.config)
+        if config is not request.config:
+            request = replace(request, config=config)
         resolution = self.resolve(request)
         effective_request = self._apply_resolution(request, resolution)
         if resolution.resolved_mode == ExecutionMode.VECTORIZED:
@@ -329,6 +380,7 @@ class ExecutionOrchestrator:
         )
 
     def execute_portfolio(self, request: PortfolioExecutionRequest) -> PortfolioExecutionResult:
+        assert_backtest_source_current()
         resolution = self.resolve_portfolio(request)
         engine = self._get_vectorized_portfolio_engine()
         construction_config = self._normalize_portfolio_construction_config(request.construction_config)
@@ -528,6 +580,8 @@ class ExecutionOrchestrator:
         workload_type: WorkloadType | str = WorkloadType.OPTIMIZATION_BATCH,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> List[ExecutionResult]:
+        assert_backtest_source_current()
+        config = self._config_for_param_grid(strategy_cls, param_grid, config)
         started = perf_counter()
         requested_mode = ExecutionMode.from_value(requested_execution_mode)
         resolution = self.resolve_param_grid(
@@ -628,6 +682,21 @@ class ExecutionOrchestrator:
         )
         if requested_mode == ExecutionMode.VECTORIZED:
             if not support.supported:
+                vectorized_candidate = self._auto_same_timeframe_grid_candidate(
+                    data=data,
+                    dataset_id=dataset_id,
+                    strategy_cls=strategy_cls,
+                    param_grid=param_grid,
+                    config=config,
+                )
+                if vectorized_candidate is not None:
+                    return ExecutionResolution(
+                        requested_mode=requested_mode,
+                        resolved_mode=ExecutionMode.VECTORIZED,
+                        fallback_reason=None,
+                        effective_config=vectorized_candidate,
+                        effective_base_data=None,
+                    )
                 raise UnsupportedExecutionModeError(
                     support.reason or "Vectorized execution is not available for this parameter grid."
                 )

@@ -14,7 +14,15 @@ import pyarrow as pa
 import pyarrow.feather as feather
 
 from .catalog import ResultCatalog
-from .sample_strategies import compute_zscore_mean_reversion_features
+from .run_ids import backtest_source_fingerprint
+from .sample_strategies import (
+    compute_adaptive_ou_kalman_zscore_features,
+    compute_regime_filtered_adaptive_ou_kalman_zscore_features,
+    compute_sma_regime_filtered_zscore_mean_reversion_features,
+    compute_sma_trend_regime_features,
+    compute_trend_following_ribbon_features,
+    compute_zscore_mean_reversion_features,
+)
 
 
 DEFAULT_SNAPSHOT_ROOT = Path("data/chart_snapshots")
@@ -113,19 +121,23 @@ class ChartSnapshotExporter:
         snapshot_root.mkdir(parents=True, exist_ok=True)
 
         price_bars_df = self._build_price_bars_dataframe(bars)
+        overlays, background_bands = self._split_background_bands(overlays, series_styles or {})
         overlays_df, overlay_order = self._build_series_dataframe(bars, overlays)
+        background_bands_df, background_band_order = self._build_series_dataframe(bars, background_bands)
         panes_df, pane_order = self._build_series_dataframe(bars, panes)
         equity_df = self._build_equity_dataframe(bars, equity_curve)
         trades_out_df = trades_df.copy() if trades_df is not None else pd.DataFrame()
 
         price_bars_path = snapshot_root / "price_bars.feather"
         overlays_path = snapshot_root / "overlays.feather"
+        background_bands_path = snapshot_root / "background_bands.feather"
         panes_path = snapshot_root / "panes.feather"
         equity_path = snapshot_root / "equity.feather"
         trades_path = snapshot_root / "trades.feather"
 
         self._write_feather(price_bars_df, price_bars_path)
         self._write_feather(overlays_df, overlays_path)
+        self._write_feather(background_bands_df, background_bands_path)
         self._write_feather(panes_df, panes_path)
         self._write_feather(equity_df, equity_path)
         if not trades_out_df.empty:
@@ -135,6 +147,7 @@ class ChartSnapshotExporter:
             run=run,
             bars=price_bars_df,
             overlay_order=overlay_order,
+            background_band_order=background_band_order,
             pane_order=pane_order,
             equity_df=equity_df,
             trades_df=trades_out_df,
@@ -143,6 +156,7 @@ class ChartSnapshotExporter:
                 "trades": trades_path.name if not trades_out_df.empty else "",
                 "equity": equity_path.name,
                 "overlays": overlays_path.name,
+                "background_bands": background_bands_path.name,
                 "panes": panes_path.name,
             },
             series_styles=series_styles or {},
@@ -193,7 +207,9 @@ class ChartSnapshotExporter:
         resolved_root.mkdir(parents=True, exist_ok=True)
 
         price_bars_df = self._build_price_bars_dataframe(aligned_bars)
-        overlays_df, overlay_order = self._build_series_dataframe(aligned_bars, overlays or {})
+        overlays, background_bands = self._split_background_bands(overlays or {}, series_styles or {})
+        overlays_df, overlay_order = self._build_series_dataframe(aligned_bars, overlays)
+        background_bands_df, background_band_order = self._build_series_dataframe(aligned_bars, background_bands)
         panes_df, pane_order = self._build_series_dataframe(aligned_bars, panes or {})
         equity_df = pd.DataFrame()
         if equity_curve is not None and not equity_curve.empty:
@@ -210,11 +226,13 @@ class ChartSnapshotExporter:
 
         price_bars_path = resolved_root / "price_bars.feather"
         overlays_path = resolved_root / "overlays.feather"
+        background_bands_path = resolved_root / "background_bands.feather"
         panes_path = resolved_root / "panes.feather"
         equity_path = resolved_root / "equity.feather"
         trades_path = resolved_root / "trades.feather"
         self._write_feather(price_bars_df, price_bars_path)
         self._write_feather(overlays_df, overlays_path)
+        self._write_feather(background_bands_df, background_bands_path)
         self._write_feather(panes_df, panes_path)
         if not equity_df.empty:
             self._write_feather(equity_df, equity_path)
@@ -236,6 +254,7 @@ class ChartSnapshotExporter:
             run=market_run,
             bars=price_bars_df,
             overlay_order=overlay_order,
+            background_band_order=background_band_order,
             pane_order=pane_order,
             equity_df=equity_df,
             trades_df=trades_out_df,
@@ -244,6 +263,7 @@ class ChartSnapshotExporter:
                 "trades": trades_path.name if not trades_out_df.empty else "",
                 "equity": equity_path.name if not equity_df.empty else "",
                 "overlays": overlays_path.name,
+                "background_bands": background_bands_path.name,
                 "panes": panes_path.name,
             },
             series_styles=series_styles or {},
@@ -788,20 +808,44 @@ class ChartSnapshotExporter:
             for name, series in indicator_map.items():
                 display_name = f"{prefix}{name}" if prefix else name
                 aligned = pd.to_numeric(series.reindex(bars.index), errors="coerce")
-                if name in {"ATR", "Z-Score"}:
+                if name in {"ATR", "Z-Score", "Adaptive Z-Score", "Trend State", "Bull Count", "Bear Count"}:
                     panes[display_name] = aligned
                 else:
                     overlays[display_name] = aligned
                 styles[display_name] = {"color": cls._indicator_color(name), "line_width": 1.0}
+                if name == "Choppy Regime":
+                    styles[display_name]["render_role"] = "background_band"
         return overlays, panes, styles
 
     @staticmethod
     def _indicator_color(name: str) -> str:
         return {
             "SMA Fast": "#4da3ff",
+            "SMA Fastest": "#27d07d",
+            "SMA Medium": "#f59e0b",
             "SMA Slow": "#ffd166",
+            "SMA Slowest": "#e6e94f",
             "Half-Life Mean": "#4da3ff",
+            "Kalman Mean": "#4da3ff",
+            "OU Equilibrium": "#ffd166",
             "Z-Score": "#a28bff",
+            "Adaptive Z-Score": "#a28bff",
+            "Choppy Regime": "#9ab0d0",
+            "Trend State": "#9ab0d0",
+            "Ribbon MA 5": "#7ee787",
+            "Ribbon MA 20": "#4da3ff",
+            "Ribbon MA 50": "#a28bff",
+            "Ribbon MA 100": "#ff6b6b",
+            "HTF Fast SMA": "#facc15",
+            "HTF Slow SMA": "#f97316",
+            "Regime Fast SMA": "#facc15",
+            "Regime Slow SMA": "#f97316",
+            "Distance MA": "#f8fafc",
+            "Short ATR Trail": "#ff6b6b",
+            "Hard Stop": "#ffcc66",
+            "Bull Count": "#27d07d",
+            "Bear Count": "#ff6b6b",
+            "ATR Stop": "#ff6b6b",
             "Upper": "#27d07d",
             "Lower": "#ff6b6b",
             "Exit Upper": "#7ee787",
@@ -817,10 +861,52 @@ class ChartSnapshotExporter:
             slow = int(params.get("slow", 30))
             out["SMA Fast"] = bars["close"].rolling(fast).mean()
             out["SMA Slow"] = bars["close"].rolling(slow).mean()
+        elif strategy_name == "SMATrendRegimeStrategy":
+            features = compute_sma_trend_regime_features(bars, dict(params))
+            out["SMA Fastest"] = features["fastest_sma"]
+            out["SMA Fast"] = features["fast_sma"]
+            out["SMA Medium"] = features["med_sma"]
+            out["SMA Slow"] = features["slow_sma"]
+            out["SMA Slowest"] = features["slowest_sma"]
+            out["ATR Stop"] = features["atr_stop_price"]
+            out["Trend State"] = features["trend_state"].astype(float)
+        elif strategy_name == "TrendFollowingRibbonStrategy":
+            features = compute_trend_following_ribbon_features(bars, dict(params))
+            out["Ribbon MA 5"] = features["ma_5"]
+            out["Ribbon MA 20"] = features["ma_20"]
+            out["Ribbon MA 50"] = features["ma_50"]
+            out["Ribbon MA 100"] = features["ma_100"]
+            out["HTF Fast SMA"] = features["regime_fast_sma"]
+            out["HTF Slow SMA"] = features["regime_slow_sma"]
+            out["Distance MA"] = features["distance_ma"]
+            out["Short ATR Trail"] = features["short_atr_trail_stop"]
+            out["Hard Stop"] = features["hard_stop_loss_price"]
+            out["Bull Count"] = features["bull_count"].astype(float)
+            out["Bear Count"] = features["bear_count"].astype(float)
         elif strategy_name == "ZScoreMeanReversionStrategy":
             features = compute_zscore_mean_reversion_features(bars, dict(params))
             out["Half-Life Mean"] = features["half_life_mean"]
             out["Z-Score"] = features["z_score"]
+        elif strategy_name == "SMARegimeFilteredZScoreMeanReversionStrategy":
+            features = compute_sma_regime_filtered_zscore_mean_reversion_features(bars, dict(params))
+            out["Half-Life Mean"] = features["half_life_mean"]
+            out["Z-Score"] = features["z_score"]
+            out["Regime SMA Fastest"] = features["sma_fastest"]
+            out["Regime SMA Slowest"] = features["sma_slowest"]
+            out["Hard Stop"] = features["hard_stop_loss_price"]
+            out["Trend State"] = features["sma_regime_state"].astype(float)
+        elif strategy_name == "AdaptiveOUKalmanZScoreStrategy":
+            features = compute_adaptive_ou_kalman_zscore_features(bars, dict(params))
+            out["Kalman Mean"] = features["kalman_mean"]
+            out["OU Equilibrium"] = features["ou_equilibrium_mean"]
+            out["Adaptive Z-Score"] = features["z_score"]
+        elif strategy_name == "RegimeFilteredAdaptiveOUKalmanZScoreStrategy":
+            features = compute_regime_filtered_adaptive_ou_kalman_zscore_features(bars, dict(params))
+            out["Kalman Mean"] = features["kalman_mean"]
+            out["OU Equilibrium"] = features["ou_equilibrium_mean"]
+            out["ATR Stop"] = features["atr_stop_price"]
+            out["Adaptive Z-Score"] = features["z_score"]
+            out["Choppy Regime"] = features["regime_is_choppy"].astype(float)
         elif strategy_name == "InverseTurtleStrategy":
             entry_len = int(params.get("entry_len", 20))
             exit_len = int(params.get("exit_len", 10))
@@ -880,6 +966,22 @@ class ChartSnapshotExporter:
         return frame, order
 
     @staticmethod
+    def _split_background_bands(
+        overlays: Mapping[str, pd.Series],
+        series_styles: Mapping[str, dict],
+    ) -> tuple[dict[str, pd.Series], dict[str, pd.Series]]:
+        line_overlays: dict[str, pd.Series] = {}
+        background_bands: dict[str, pd.Series] = {}
+        for name, series in dict(overlays or {}).items():
+            style = dict(series_styles.get(name) or series_styles.get(sanitize_series_name(name)) or {})
+            render_role = str(style.get("render_role") or "").strip().lower()
+            if render_role == "background_band":
+                background_bands[name] = series
+            else:
+                line_overlays[name] = series
+        return line_overlays, background_bands
+
+    @staticmethod
     def _build_equity_dataframe(bars: pd.DataFrame, equity_curve: pd.Series) -> pd.DataFrame:
         aligned = pd.to_numeric(equity_curve.reindex(bars.index), errors="coerce").astype(float)
         drawdown = (aligned / aligned.cummax()) - 1.0
@@ -912,6 +1014,7 @@ class ChartSnapshotExporter:
         run,
         bars: pd.DataFrame,
         overlay_order: list[str],
+        background_band_order: list[str],
         pane_order: list[str],
         equity_df: pd.DataFrame,
         trades_df: pd.DataFrame,
@@ -919,7 +1022,18 @@ class ChartSnapshotExporter:
         series_styles: Mapping[str, dict],
     ) -> dict:
         params = json.loads(run.params) if isinstance(run.params, str) else (run.params or {})
-        metrics = run.metrics if isinstance(run.metrics, dict) else {}
+        raw_metrics = getattr(run, "metrics", {})
+        if isinstance(raw_metrics, dict):
+            metrics = raw_metrics
+        elif hasattr(raw_metrics, "as_dict"):
+            metrics = raw_metrics.as_dict()
+        elif isinstance(raw_metrics, str):
+            try:
+                metrics = json.loads(raw_metrics)
+            except Exception:
+                metrics = {}
+        else:
+            metrics = {}
         overlay_styles = {sanitize_series_name(name): style for name, style in series_styles.items()}
         chart_styles = dict(overlay_styles)
         chart_styles.setdefault("equity", {"color": "#4da3ff", "line_width": 1.3})
@@ -929,10 +1043,17 @@ class ChartSnapshotExporter:
             "schema_version": 1,
             "created_at_utc": self._iso_utc(pd.Timestamp.now("UTC")),
             "run_id": str(run.run_id),
+            "logical_run_id": str(getattr(run, "logical_run_id", "") or ""),
+            "source_fingerprint": backtest_source_fingerprint(),
             "dataset_id": str(run.dataset_id),
             "strategy": str(run.strategy),
             "params": params,
             "timeframe": str(run.timeframe),
+            "requested_execution_mode": str(getattr(run, "requested_execution_mode", "") or ""),
+            "resolved_execution_mode": str(getattr(run, "resolved_execution_mode", "") or ""),
+            "engine_impl": str(getattr(run, "engine_impl", "") or ""),
+            "engine_version": str(getattr(run, "engine_version", "") or ""),
+            "fallback_reason": str(getattr(run, "fallback_reason", "") or ""),
             "base_timeframe": "1 minutes",
             "timezone_display": "America/New_York",
             "start_utc": self._iso_utc(run.start),
@@ -945,12 +1066,14 @@ class ChartSnapshotExporter:
                 "bars": int(len(bars)),
                 "trades": int(len(trades_df)),
                 "overlay_series": int(len(overlay_order)),
+                "background_band_series": int(len(background_band_order)),
                 "pane_series": int(len(pane_order)),
                 "equity_points": int(len(equity_df)),
             },
             "chart_layout": {
                 "main_price_series": "candles",
                 "overlay_order": overlay_order,
+                "background_band_order": background_band_order,
                 "pane_order": pane_order,
                 "pane_heights": {
                     "price": 3.0,

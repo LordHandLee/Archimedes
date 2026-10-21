@@ -24,7 +24,11 @@ from .duckdb_store import DuckDBStore
 from .engine import BacktestConfig
 from .live_market import (
     DEFAULT_LIVE_PROVIDER,
+    DEFAULT_STALE_QUOTE_SECONDS,
     LIVE_BAR_TIMEFRAME,
+    US_EQUITY_TOTAL_SESSION_CLOSE,
+    US_EQUITY_TOTAL_SESSION_OPEN,
+    US_EQUITY_TOTAL_SESSION_TIMEZONE,
     InteractiveBrokersRealtimeBarApp,
     InteractiveBrokersRealtimeConfig,
     LiveMarketBar,
@@ -33,14 +37,30 @@ from .live_market import (
     chart_timeframe_to_pandas_rule,
     normalize_chart_timeframe,
     resample_ohlcv,
+    is_us_equity_total_session_open,
     sqlite_error_is_locked,
 )
 from .provider_config import load_provider_settings
-from .sample_strategies import InverseTurtleStrategy, SMACrossStrategy, ZScoreMeanReversionStrategy
+from .sample_strategies import (
+    AdaptiveOUKalmanZScoreStrategy,
+    InverseTurtleStrategy,
+    SMARegimeFilteredZScoreMeanReversionStrategy,
+    SMACrossStrategy,
+    SMATrendRegimeStrategy,
+    TrendFollowingRibbonStrategy,
+    ZScoreMeanReversionStrategy,
+)
 from .sizing import POSITION_SIZING_ANNUAL_VOLATILITY, _annual_vol_rolling_lengths, normalize_position_sizing_model
 
 
 IB_CLIENT_OFFSET_LIVE_DEPLOYMENT = 6000
+STREAM_RECONNECT_BACKOFF_SECONDS = 30.0
+STREAM_NO_BAR_RECONNECT_SECONDS = 180.0
+STREAM_STALE_RECONNECT_SECONDS = max(float(DEFAULT_STALE_QUOTE_SECONDS) * 2.0, 180.0)
+RUNNER_GAP_SYNC_BACKOFF_SECONDS = 60.0
+RUNNER_GAP_SYNC_MAX_LOOKBACK = pd.Timedelta(days=5)
+RUNNER_GAP_SYNC_CLIENT_OFFSET = 1000
+RUNNER_REPLAY_MAX_BARS = 5000
 _DATASET_ID_SOURCE_MARKERS = (
     "massive_interactive_brokers",
     "interactive_brokers",
@@ -313,6 +333,131 @@ def max_runner_evaluation_gap(timeframe: str) -> pd.Timedelta:
     return max(delta * 2, pd.Timedelta(hours=2))
 
 
+def is_expected_runner_session_gap(
+    previous_ts: object,
+    current_ts: object,
+    timeframe: str,
+    *,
+    timezone: str = US_EQUITY_TOTAL_SESSION_TIMEZONE,
+) -> bool:
+    normalized = normalize_chart_timeframe(timeframe)
+    if normalized.endswith("d"):
+        return False
+    prev = _runner_utc_timestamp(previous_ts)
+    current = _runner_utc_timestamp(current_ts)
+    if prev is None or current is None or current <= prev:
+        return False
+    try:
+        prev_local = prev.tz_convert(timezone)
+        current_local = current.tz_convert(timezone)
+    except Exception:
+        return False
+    if current_local.date() <= prev_local.date():
+        return False
+    delta = chart_timeframe_delta(normalized)
+    edge_tolerance = max(delta * 2, pd.Timedelta(minutes=30))
+    prev_close = pd.Timestamp.combine(prev_local.date(), US_EQUITY_TOTAL_SESSION_CLOSE).tz_localize(timezone)
+    current_open = pd.Timestamp.combine(current_local.date(), US_EQUITY_TOTAL_SESSION_OPEN).tz_localize(timezone)
+    prev_at_session_tail = prev_local >= prev_close - edge_tolerance and prev_local < prev_close + delta
+    current_at_session_head = current_local >= current_open - delta and current_local <= current_open + edge_tolerance
+    return bool(prev_at_session_tail and current_at_session_head)
+
+
+def runner_sync_coverage_gap(timeframe: str) -> pd.Timedelta:
+    delta = chart_timeframe_delta(timeframe)
+    normalized = normalize_chart_timeframe(timeframe)
+    if normalized.endswith("d"):
+        return delta * 2
+    return max(delta * 2, pd.Timedelta(minutes=2))
+
+
+def _runner_utc_timestamp(value: object) -> pd.Timestamp | None:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts).tz_convert("UTC")
+
+
+def _runner_extended_market_segments(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    timezone: str = "America/New_York",
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    start_ts = _runner_utc_timestamp(start)
+    end_ts = _runner_utc_timestamp(end)
+    if start_ts is None or end_ts is None or end_ts <= start_ts:
+        return []
+    try:
+        local_start = start_ts.tz_convert(timezone)
+        local_end = end_ts.tz_convert(timezone)
+    except Exception:
+        return [(start_ts, end_ts)]
+    segments: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    day = local_start.normalize()
+    final_day = local_end.normalize()
+    while day <= final_day:
+        if day.dayofweek < 5:
+            segment_start_local = day + pd.Timedelta(hours=4)
+            segment_end_local = day + pd.Timedelta(hours=20)
+            segment_start = max(start_ts, pd.Timestamp(segment_start_local).tz_convert("UTC"))
+            segment_end = min(end_ts, pd.Timestamp(segment_end_local).tz_convert("UTC"))
+            if segment_start < segment_end:
+                segments.append((segment_start.floor("min"), segment_end.floor("min")))
+        day += pd.Timedelta(days=1)
+    return segments
+
+
+def _runner_minute_bars_cover_segment(
+    bars: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    max_gap: pd.Timedelta = pd.Timedelta(minutes=2),
+) -> bool:
+    normalized = normalize_cached_bars(bars)
+    if normalized.empty:
+        return False
+    start_ts = _runner_utc_timestamp(start)
+    end_ts = _runner_utc_timestamp(end)
+    if start_ts is None or end_ts is None:
+        return False
+    start_ts = start_ts.floor("min")
+    end_ts = end_ts.floor("min")
+    if end_ts <= start_ts:
+        return True
+    covered = normalized.loc[(normalized.index >= start_ts) & (normalized.index <= end_ts)]
+    if covered.empty:
+        return False
+    stamps = pd.Index(covered.index).drop_duplicates().sort_values()
+    if pd.Timestamp(stamps[0]).tz_convert("UTC") > start_ts + max_gap:
+        return False
+    if pd.Timestamp(stamps[-1]).tz_convert("UTC") < end_ts - max_gap:
+        return False
+    if len(stamps) <= 1:
+        return (end_ts - start_ts) <= max_gap
+    gaps = pd.Series(stamps).diff().dropna()
+    if gaps.empty:
+        return True
+    return bool(gaps.max() <= max_gap)
+
+
+def _runner_minute_bars_cover_window(
+    bars: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    max_gap: pd.Timedelta = pd.Timedelta(minutes=2),
+) -> bool:
+    segments = _runner_extended_market_segments(start, end)
+    if not segments:
+        return True
+    return all(
+        _runner_minute_bars_cover_segment(bars, segment_start, segment_end, max_gap=max_gap)
+        for segment_start, segment_end in segments
+    )
+
+
 def signal_plan(previous_position: float, target_percent: float) -> list[tuple[str, str, float]]:
     def _sign(value: float) -> int:
         if value > 1e-9:
@@ -338,7 +483,11 @@ def signal_plan(previous_position: float, target_percent: float) -> list[tuple[s
 def strategy_class(strategy_name: str):
     mapping = {
         "SMACrossStrategy": SMACrossStrategy,
+        "SMATrendRegimeStrategy": SMATrendRegimeStrategy,
+        "TrendFollowingRibbonStrategy": TrendFollowingRibbonStrategy,
         "ZScoreMeanReversionStrategy": ZScoreMeanReversionStrategy,
+        "SMARegimeFilteredZScoreMeanReversionStrategy": SMARegimeFilteredZScoreMeanReversionStrategy,
+        "AdaptiveOUKalmanZScoreStrategy": AdaptiveOUKalmanZScoreStrategy,
         "InverseTurtleStrategy": InverseTurtleStrategy,
     }
     return mapping.get(str(strategy_name or "").strip())
@@ -895,8 +1044,17 @@ class RunnerSymbolStream:
         self.error_callback = error_callback
         self.app: InteractiveBrokersRealtimeBarApp | None = None
         self.last_bar_monotonic: float | None = None
+        self.last_connect_monotonic: float | None = None
+        self.last_reconnect_monotonic: float = 0.0
+        self.last_idle_status_monotonic: float = 0.0
+        self.reconnect_count = 0
+        self._stopped = False
 
     def start(self) -> None:
+        self._stopped = False
+        self._connect()
+
+    def _connect(self) -> None:
         if not self.symbol:
             raise ValueError("A ticker symbol is required for live deployment streaming.")
 
@@ -922,15 +1080,79 @@ class RunnerSymbolStream:
             error_callback=lambda message: self.error_callback(self.symbol, message),
         )
         self.app.connect_and_start()
+        self.last_connect_monotonic = time.monotonic()
 
     def poll(self) -> None:
-        if self.app is not None:
-            self.app.flush_stale_partials()
+        if self._stopped:
+            return
+        now = time.monotonic()
+        if self.app is None:
+            if self._should_watchdog_stream():
+                self._reconnect("stream app is not running")
+            return
+        self.app.flush_stale_partials()
+        if not self._should_watchdog_stream():
+            if now - self.last_idle_status_monotonic >= 600.0:
+                self.last_idle_status_monotonic = now
+                self.status_callback(
+                    self.symbol,
+                    f"{self.symbol} live stream idle outside the US equity total session.",
+                )
+            return
+        if self._app_connection_lost():
+            self._reconnect("IBKR API connection is closed")
+            return
+        if self.last_bar_monotonic is None:
+            connected_at = float(self.last_connect_monotonic or now)
+            if now - connected_at >= max(STREAM_NO_BAR_RECONNECT_SECONDS, float(self.config.timeout_seconds) * 2.0):
+                self._reconnect("no real-time bars received after subscription start")
+            return
+        stale_for = now - float(self.last_bar_monotonic)
+        if stale_for >= STREAM_STALE_RECONNECT_SECONDS:
+            self._reconnect(f"no real-time bars for {int(stale_for)}s")
+
+    def _should_watchdog_stream(self) -> bool:
+        return is_us_equity_total_session_open()
+
+    def _app_connection_lost(self) -> bool:
+        app = self.app
+        if app is None:
+            return True
+        try:
+            connection_lost = getattr(app, "connection_lost", None)
+            if callable(connection_lost):
+                return bool(connection_lost())
+            return not bool(app.isConnected())
+        except Exception:
+            return True
+
+    def _reconnect(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self.last_reconnect_monotonic < STREAM_RECONNECT_BACKOFF_SECONDS:
+            return
+        self.last_reconnect_monotonic = now
+        self.reconnect_count += 1
+        self.status_callback(
+            self.symbol,
+            f"{self.symbol} live stream reconnecting ({reason}). Attempt {self.reconnect_count}.",
+        )
+        self._stop_app()
+        self.last_bar_monotonic = None
+        try:
+            self._connect()
+        except Exception as exc:
+            self.error_callback(self.symbol, f"{self.symbol} live stream reconnect failed: {exc}")
+            self.app = None
 
     def stop(self) -> None:
-        if self.app is not None:
-            self.app.stop()
-            self.app = None
+        self._stopped = True
+        self._stop_app()
+
+    def _stop_app(self) -> None:
+        app = self.app
+        self.app = None
+        if app is not None:
+            app.stop()
 
 
 class LiveDeploymentRunnerService:
@@ -942,6 +1164,7 @@ class LiveDeploymentRunnerService:
         self.contexts: dict[str, DeploymentContext] = {}
         self.symbol_index: dict[str, set[str]] = {}
         self.streams: dict[str, RunnerSymbolStream] = {}
+        self.gap_sync_attempts: dict[str, float] = {}
         self.stream_counter = 0
         self.stop_requested = False
 
@@ -970,6 +1193,7 @@ class LiveDeploymentRunnerService:
 
     def run_forever(self) -> None:
         self.emit("runner_started", message=f"Live deployment runner started ({self.runner_id}).", payload={"runner_id": self.runner_id})
+        self.resume_live_deployments()
         while not self.stop_requested:
             self.process_queued_commands()
             for symbol, stream in list(self.streams.items()):
@@ -1026,6 +1250,78 @@ class LiveDeploymentRunnerService:
             finally:
                 self.catalog.finish_deployment_runner_command(command.command_id, error=error)
 
+    def resume_live_deployments(self) -> None:
+        seen: set[str] = set()
+        for row in self.catalog.load_deployments():
+            deployment_id = str(row.deployment_id or "")
+            if not deployment_id or deployment_id in seen:
+                continue
+            status = str(row.status or "").strip().lower()
+            if status != "live":
+                continue
+            if str(row.parent_deployment_id or "").strip():
+                continue
+            seen.add(deployment_id)
+            try:
+                self.resume_deployment(deployment_id)
+            except Exception as exc:
+                self._update_deployment_status_tree(
+                    deployment_id,
+                    status="error",
+                    status_reason=f"Live runner resume failed: {exc}"[:500],
+                    last_error_at=pd.Timestamp.now(tz="UTC").isoformat(),
+                )
+                self.emit(
+                    "deployment_resume_error",
+                    deployment_id=deployment_id,
+                    severity="error",
+                    message=f"Deployment resume failed: {exc}",
+                    payload={"deployment_id": deployment_id, "error": str(exc)},
+                )
+
+    def resume_deployment(self, deployment_id: str) -> None:
+        deployment_id = str(deployment_id or "")
+        if not deployment_id:
+            return
+        if any(
+            deployment_id in {context.deployment_id, context.parent_deployment_id, context.portfolio_id}
+            for context in self.contexts.values()
+        ):
+            return
+        contexts, failures = self.build_contexts(deployment_id)
+        if failures or not contexts:
+            message = "; ".join(failures) if failures else "No executable live deployment contexts were built."
+            raise ValueError(message)
+        conflicts = self.context_conflicts(contexts, deployment_id)
+        if conflicts:
+            raise ValueError("Live context conflict: " + "; ".join(conflicts))
+        for context in contexts:
+            self.contexts[context.context_id] = context
+            self.symbol_index.setdefault(context.symbol, set()).add(context.context_id)
+        if self.config.streams_enabled:
+            for symbol in sorted({context.symbol for context in contexts}):
+                self.start_stream(symbol)
+        timestamp = pd.Timestamp.now(tz="UTC").isoformat()
+        status_reason = ""
+        for row in self.catalog.load_deployments():
+            if str(row.deployment_id or "") == deployment_id:
+                status_reason = str(row.status_reason or "")
+                break
+        self.catalog.update_deployment_status(
+            deployment_id,
+            status="live",
+            status_reason=status_reason,
+            started_at=timestamp,
+        )
+        self.emit(
+            "deployment_resumed",
+            deployment_id=deployment_id,
+            message=f"Deployment resumed across {len(contexts)} strategy leg{'s' if len(contexts) != 1 else ''}.",
+            payload={"contexts": [context.context_id for context in contexts], "symbols": sorted({context.symbol for context in contexts})},
+        )
+        for context in list(contexts):
+            self.replay_context_missed_bars(context, reason="resume")
+
     def arm_deployment(self, deployment_id: str) -> None:
         deployment_id = str(deployment_id or "")
         if not deployment_id:
@@ -1072,7 +1368,116 @@ class LiveDeploymentRunnerService:
             payload={"contexts": [context.context_id for context in contexts], "symbols": sorted(self.symbol_index)},
         )
         for context in list(contexts):
-            self.evaluate_context_now(context)
+            self.replay_context_missed_bars(context, reason="arm")
+
+    def context_last_processed_event_timestamp(self, context: DeploymentContext) -> pd.Timestamp | None:
+        try:
+            with sqlite3.connect(self.catalog.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT payload_json
+                    FROM deployment_runner_events
+                    WHERE deployment_id=?
+                      AND symbol=?
+                      AND event_type IN ('signal_evaluated', 'signal_sent', 'signal_duplicate_skipped')
+                    ORDER BY event_seq DESC
+                    LIMIT 1000
+                    """,
+                    (context.deployment_id, context.symbol),
+                ).fetchall()
+        except Exception:
+            return None
+        for row in rows:
+            payload = _decode_json_dict(row[0] if row else "")
+            ts = _runner_utc_timestamp(payload.get("bar_timestamp_utc"))
+            if ts is not None:
+                return ts
+        return None
+
+    def replay_context_missed_bars(
+        self,
+        context: DeploymentContext,
+        *,
+        reason: str = "resume",
+        now: object | None = None,
+    ) -> None:
+        timeframe = normalize_chart_timeframe(context.timeframe or LIVE_BAR_TIMEFRAME)
+        now_ts = _runner_utc_timestamp(now or pd.Timestamp.now(tz="UTC")) or pd.Timestamp.now(tz="UTC")
+        if not self.sync_context_live_gap_if_needed(context, now_ts):
+            self.emit(
+                "runner_replay_wait",
+                deployment_id=context.deployment_id,
+                context_id=context.context_id,
+                symbol=context.symbol,
+                severity="warning",
+                message=f"{context.symbol} replay is waiting for live data sync before evaluating missed bars.",
+                payload={"symbol": context.symbol, "reason": reason},
+            )
+            return
+        bars = self.load_context_bars(context, record=None)
+        source_bar_index = completed_bar_index(bars, now_ts, timeframe)
+        if source_bar_index is None:
+            return
+        last_event_ts = self.context_last_processed_event_timestamp(context)
+        if last_event_ts is not None:
+            context.last_processed_bar_ts_ns = max(int(context.last_processed_bar_ts_ns or 0), int(last_event_ts.value))
+        completed = normalize_cached_bars(bars.iloc[: int(source_bar_index) + 1])
+        if completed.empty:
+            return
+        if last_event_ts is not None:
+            completed = completed.loc[completed.index > last_event_ts]
+        elif int(context.last_processed_bar_ts_ns or 0) > 0:
+            completed = completed.loc[completed.index.astype("int64") > int(context.last_processed_bar_ts_ns or 0)]
+        else:
+            completed = completed.tail(1)
+        if completed.empty:
+            return
+        total_bars = int(len(completed))
+        if total_bars > RUNNER_REPLAY_MAX_BARS:
+            completed = completed.tail(RUNNER_REPLAY_MAX_BARS)
+            self.emit(
+                "runner_replay_truncated",
+                deployment_id=context.deployment_id,
+                context_id=context.context_id,
+                symbol=context.symbol,
+                severity="warning",
+                message=(
+                    f"{context.symbol} replay limited to the most recent "
+                    f"{RUNNER_REPLAY_MAX_BARS} completed bar(s)."
+                ),
+                payload={"symbol": context.symbol, "requested_bars": total_bars, "replayed_bars": int(len(completed))},
+            )
+        self.emit(
+            "runner_replay_started",
+            deployment_id=context.deployment_id,
+            context_id=context.context_id,
+            symbol=context.symbol,
+            message=f"{context.symbol} replaying {len(completed)} completed bar(s) after live runner {reason}.",
+            payload={
+                "symbol": context.symbol,
+                "reason": reason,
+                "start_bar_timestamp_utc": pd.Timestamp(completed.index[0]).tz_convert("UTC").isoformat(),
+                "end_bar_timestamp_utc": pd.Timestamp(completed.index[-1]).tz_convert("UTC").isoformat(),
+                "bar_count": int(len(completed)),
+            },
+        )
+        delta = chart_timeframe_delta(timeframe)
+        for bar_ts in list(completed.index):
+            evaluation_ts = pd.Timestamp(bar_ts).tz_convert("UTC") + delta
+            self.process_context_bar(context, None, evaluation_ts, context.symbol)
+        self.emit(
+            "runner_replay_finished",
+            deployment_id=context.deployment_id,
+            context_id=context.context_id,
+            symbol=context.symbol,
+            message=f"{context.symbol} replay finished through {pd.Timestamp(completed.index[-1]).tz_convert('UTC').isoformat()}.",
+            payload={
+                "symbol": context.symbol,
+                "reason": reason,
+                "bar_count": int(len(completed)),
+                "end_bar_timestamp_utc": pd.Timestamp(completed.index[-1]).tz_convert("UTC").isoformat(),
+            },
+        )
 
     def deactivate_deployment(self, deployment_id: str, *, status: str = "stopped", update_status: bool = True) -> None:
         root_id = str(deployment_id or "")
@@ -1309,6 +1714,200 @@ class LiveDeploymentRunnerService:
             if context is not None:
                 self.process_context_bar(context, record, evaluation_ts, symbol)
 
+    def context_minute_bars_for_sync(
+        self,
+        context: DeploymentContext,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        symbol = market_symbol_from_dataset_id(context.symbol)
+        frames: list[pd.DataFrame] = []
+        dataset_id = str(context.dataset_id or "").strip()
+        if dataset_id:
+            try:
+                historical = DuckDBStore().load_range(dataset_id, start, end)
+                if historical is not None and not historical.empty:
+                    frames.append(historical)
+            except Exception:
+                pass
+        try:
+            live = self.store.load_recent_bars(symbol, provider=DEFAULT_LIVE_PROVIDER, limit=500000)
+            if live is not None and not live.empty:
+                frames.append(live.loc[(live.index >= start) & (live.index <= end)])
+        except sqlite3.Error:
+            pass
+        if not frames:
+            return pd.DataFrame()
+        return normalize_cached_bars(pd.concat(frames).sort_index())
+
+    def context_live_sync_window(
+        self,
+        context: DeploymentContext,
+        record_ts: object,
+    ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        symbol = market_symbol_from_dataset_id(context.symbol)
+        if not symbol:
+            return None
+        record_utc = _runner_utc_timestamp(record_ts) or pd.Timestamp.now(tz="UTC")
+        now_utc = pd.Timestamp.now(tz="UTC")
+        end = min(record_utc.floor("min"), now_utc.floor("min") - pd.Timedelta(minutes=1))
+        if end <= pd.Timestamp("1970-01-01", tz="UTC"):
+            return None
+        historical_latest: pd.Timestamp | None = None
+        dataset_id = str(context.dataset_id or "").strip()
+        if dataset_id:
+            try:
+                historical = DuckDBStore().load_range(dataset_id, end - RUNNER_GAP_SYNC_MAX_LOOKBACK, end)
+                if historical is not None and not historical.empty:
+                    historical_latest = pd.Timestamp(historical.index[-1]).tz_convert("UTC")
+            except Exception:
+                pass
+        if historical_latest is not None:
+            start = max(
+                historical_latest.floor("min") + pd.Timedelta(minutes=1),
+                end - RUNNER_GAP_SYNC_MAX_LOOKBACK,
+            )
+        else:
+            start = end - RUNNER_GAP_SYNC_MAX_LOOKBACK
+        start = pd.Timestamp(start).tz_convert("UTC").floor("min")
+        if start >= end - pd.Timedelta(minutes=2):
+            return None
+        local = self.context_minute_bars_for_sync(context, start, end)
+        if _runner_minute_bars_cover_window(
+            local,
+            start,
+            end,
+            max_gap=runner_sync_coverage_gap(context.timeframe),
+        ):
+            return None
+        return start, end
+
+    def sync_context_live_gap_if_needed(
+        self,
+        context: DeploymentContext,
+        record_ts: object,
+    ) -> bool:
+        symbol = market_symbol_from_dataset_id(context.symbol)
+        window = self.context_live_sync_window(context, record_ts)
+        if window is None:
+            return True
+        now = time.monotonic()
+        key = f"{context.context_id}:{symbol}"
+        if now - float(self.gap_sync_attempts.get(key, 0.0)) < RUNNER_GAP_SYNC_BACKOFF_SECONDS:
+            self.emit(
+                "data_gap_sync_wait",
+                deployment_id=context.deployment_id,
+                context_id=context.context_id,
+                symbol=symbol,
+                severity="warning",
+                message=f"{symbol} live runner is waiting for IBKR gap sync before evaluating.",
+                payload={"symbol": symbol},
+            )
+            return False
+        self.gap_sync_attempts[key] = now
+        start, end = window
+        self.emit(
+            "data_gap_sync_started",
+            deployment_id=context.deployment_id,
+            context_id=context.context_id,
+            symbol=symbol,
+            message=f"{symbol} syncing missing IBKR bars before live strategy evaluation.",
+            payload={"symbol": symbol, "start": start.isoformat(), "end": end.isoformat()},
+        )
+        try:
+            config = self.build_ib_config(
+                client_offset=self.config.client_offset_base
+                + RUNNER_GAP_SYNC_CLIENT_OFFSET
+                + (abs(hash(symbol)) % 400)
+            )
+            from scripts.fetch_interactive_brokers import fetch_bars
+
+            frames: list[pd.DataFrame] = []
+            for segment_index, (segment_start, segment_end) in enumerate(_runner_extended_market_segments(start, end)):
+                segment_frame = fetch_bars(
+                    symbol,
+                    start=segment_start,
+                    end=segment_end,
+                    history_window="1d",
+                    resolution=LIVE_BAR_TIMEFRAME,
+                    host=config.host,
+                    port=int(config.port),
+                    client_id=int(config.client_id) + int(segment_index),
+                    sec_type=config.sec_type,
+                    exchange=config.exchange,
+                    currency=config.currency,
+                    primary_exchange=config.primary_exchange or None,
+                    what_to_show=config.what_to_show,
+                    use_rth=bool(config.use_rth),
+                    chunk_duration="1d",
+                    pace_seconds=0.5,
+                    timeout_seconds=max(30.0, float(config.timeout_seconds)),
+                    discover_head_timestamp=False,
+                )
+                segment_frame = normalize_cached_bars(segment_frame)
+                if not segment_frame.empty:
+                    segment_frame = segment_frame.loc[
+                        (segment_frame.index >= segment_start) & (segment_frame.index <= segment_end)
+                    ]
+                    if not segment_frame.empty:
+                        frames.append(segment_frame)
+                time.sleep(0.25)
+            frame = normalize_cached_bars(pd.concat(frames).sort_index()) if frames else pd.DataFrame()
+            rows = 0
+            batch: list[LiveMarketBar] = []
+            received_at = pd.Timestamp.now(tz="UTC")
+            for timestamp, row in normalize_cached_bars(frame).iterrows():
+                batch.append(
+                    LiveMarketBar(
+                        symbol=symbol,
+                        timestamp=pd.Timestamp(timestamp).tz_convert("UTC"),
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row.get("volume", 0.0)),
+                        provider=DEFAULT_LIVE_PROVIDER,
+                        timeframe=LIVE_BAR_TIMEFRAME,
+                        received_at=received_at,
+                    )
+                )
+                if len(batch) >= 500:
+                    rows += self.store.upsert_bars(batch)
+                    batch.clear()
+            if batch:
+                rows += self.store.upsert_bars(batch)
+            local = self.context_minute_bars_for_sync(context, start, end)
+            coverage_gap = runner_sync_coverage_gap(context.timeframe)
+            covered = _runner_minute_bars_cover_window(local, start, end, max_gap=coverage_gap)
+            self.emit(
+                "data_gap_sync_finished",
+                deployment_id=context.deployment_id,
+                context_id=context.context_id,
+                symbol=symbol,
+                severity="info" if covered else "warning",
+                message=f"{symbol} synced {rows} IBKR bar(s) before live strategy evaluation.",
+                payload={
+                    "symbol": symbol,
+                    "rows": rows,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "covered": bool(covered),
+                    "max_gap_seconds": float(coverage_gap.total_seconds()),
+                },
+            )
+            return bool(covered)
+        except Exception as exc:
+            self.emit(
+                "data_gap_sync_error",
+                deployment_id=context.deployment_id,
+                context_id=context.context_id,
+                symbol=symbol,
+                severity="error",
+                message=f"{symbol} IBKR gap sync failed; live evaluation skipped: {exc}",
+                payload={"symbol": symbol, "start": start.isoformat(), "end": end.isoformat(), "error": str(exc)},
+            )
+            return False
+
     def load_context_bars(self, context: DeploymentContext, *, record: dict | None = None) -> pd.DataFrame:
         symbol = market_symbol_from_dataset_id(context.symbol)
         timeframe = normalize_chart_timeframe(context.timeframe or LIVE_BAR_TIMEFRAME)
@@ -1441,6 +2040,8 @@ class LiveDeploymentRunnerService:
     ) -> None:
         timeframe = normalize_chart_timeframe(context.timeframe or LIVE_BAR_TIMEFRAME)
         try:
+            if record is not None and not self.sync_context_live_gap_if_needed(context, record_ts):
+                return
             bars = self.load_context_bars(context, record=record)
             source_bar_index = completed_bar_index(bars, record_ts, timeframe)
             if source_bar_index is None:
@@ -1468,7 +2069,7 @@ class LiveDeploymentRunnerService:
                 prev_ts = pd.Timestamp(bars.index[int(source_bar_index) - 1])
                 prev_ts = prev_ts.tz_convert("UTC") if prev_ts.tzinfo else prev_ts.tz_localize("UTC")
                 observed_gap = bar_ts - prev_ts
-                if observed_gap > max_gap:
+                if observed_gap > max_gap and not is_expected_runner_session_gap(prev_ts, bar_ts, timeframe):
                     self.emit(
                         "data_gap_skipped",
                         deployment_id=context.deployment_id,
@@ -1892,13 +2493,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    catalog_path = Path(args.catalog)
+    catalog_path = Path(args.catalog).expanduser().resolve()
+    live_store_path = Path(args.live_store).expanduser().resolve()
     lock_file = acquire_runner_lock(catalog_path)
     if lock_file is None and not args.once:
         return 0
     config = DeploymentRunnerConfig(
         catalog_path=catalog_path,
-        live_store_path=Path(args.live_store),
+        live_store_path=live_store_path,
         poll_interval_seconds=float(args.poll_interval),
         run_once=bool(args.once),
         streams_enabled=not bool(args.no_streams),

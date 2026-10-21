@@ -159,7 +159,16 @@ from .vectorized_portfolio import (
     VectorizedPortfolioEngine,
     VectorizedPortfolioResult,
 )
-from .sample_strategies import InverseTurtleStrategy, SMACrossStrategy, ZScoreMeanReversionStrategy
+from .sample_strategies import (
+    AdaptiveOUKalmanZScoreStrategy,
+    InverseTurtleStrategy,
+    RegimeFilteredAdaptiveOUKalmanZScoreStrategy,
+    SMARegimeFilteredZScoreMeanReversionStrategy,
+    SMACrossStrategy,
+    SMATrendRegimeStrategy,
+    TrendFollowingRibbonStrategy,
+    ZScoreMeanReversionStrategy,
+)
 
 __all__ = [
     "ChartSnapshotArtifact",
@@ -275,8 +284,13 @@ __all__ = [
     "summarize_engine_batch",
     "summarize_engine_runs",
     "SMACrossStrategy",
+    "SMATrendRegimeStrategy",
+    "TrendFollowingRibbonStrategy",
     "InverseTurtleStrategy",
     "ZScoreMeanReversionStrategy",
+    "AdaptiveOUKalmanZScoreStrategy",
+    "RegimeFilteredAdaptiveOUKalmanZScoreStrategy",
+    "SMARegimeFilteredZScoreMeanReversionStrategy",
     "plot_param_heatmap",
     "WalkForwardFoldWindow",
     "WalkForwardPortfolioAssetDefinition",

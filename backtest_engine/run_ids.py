@@ -2,12 +2,84 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Sequence
 
 import pandas as pd
 
 if TYPE_CHECKING:
     from .engine import BacktestConfig
+
+
+_STRATEGY_LOGIC_VERSIONS = {
+    "RegimeFilteredAdaptiveOUKalmanZScoreStrategy": 2,
+    "SMARegimeFilteredZScoreMeanReversionStrategy": 2,
+    "SMACrossStrategy": 2,
+    "SMATrendRegimeStrategy": 5,
+    "TrendFollowingRibbonStrategy": 4,
+}
+
+_SOURCE_FINGERPRINT_FILES = (
+    "backtest_engine/broker.py",
+    "backtest_engine/engine.py",
+    "backtest_engine/execution.py",
+    "backtest_engine/reference_engine.py",
+    "backtest_engine/run_ids.py",
+    "backtest_engine/sample_strategies.py",
+    "backtest_engine/sizing.py",
+    "backtest_engine/strategy.py",
+    "backtest_engine/vectorized_engine.py",
+    "backtest_engine/vectorized_portfolio.py",
+    "backtest_engine/vectorized_strategies.py",
+)
+
+
+def _compute_backtest_source_fingerprint() -> str:
+    root = Path(__file__).resolve().parent.parent
+    digest = hashlib.sha256()
+    for relative_path in _SOURCE_FINGERPRINT_FILES:
+        path = root / relative_path
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except FileNotFoundError:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def backtest_source_fingerprint() -> str:
+    return _compute_backtest_source_fingerprint()
+
+
+def current_backtest_source_fingerprint() -> str:
+    return _compute_backtest_source_fingerprint()
+
+
+IMPORTED_BACKTEST_SOURCE_FINGERPRINT = backtest_source_fingerprint()
+
+
+def backtest_source_is_stale() -> bool:
+    return current_backtest_source_fingerprint() != IMPORTED_BACKTEST_SOURCE_FINGERPRINT
+
+
+def assert_backtest_source_current() -> None:
+    if os.environ.get("BACKTEST_ALLOW_STALE_SOURCE") == "1":
+        return
+    current = current_backtest_source_fingerprint()
+    if current == IMPORTED_BACKTEST_SOURCE_FINGERPRINT:
+        return
+    raise RuntimeError(
+        "Backtest engine source changed after this Python process started. "
+        "Restart the dashboard before running another backtest so strategy logic, "
+        "vectorized adapters, and run IDs all come from the same code. "
+        f"Loaded fingerprint {IMPORTED_BACKTEST_SOURCE_FINGERPRINT}; "
+        f"current files fingerprint {current}."
+    )
 
 
 def compute_logical_run_id(
@@ -21,6 +93,8 @@ def compute_logical_run_id(
     payload = {
         "dataset_id": dataset_id,
         "strategy": strategy,
+        "strategy_logic_version": _STRATEGY_LOGIC_VERSIONS.get(strategy, 1),
+        "source_fingerprint": backtest_source_fingerprint(),
         "params": params,
         "timeframe": config.timeframe,
         "start": str(data.index[0]),
@@ -75,6 +149,7 @@ def compute_portfolio_logical_run_id(
     payload = {
         "dataset_ids": list(dataset_ids),
         "strategy": strategy,
+        "source_fingerprint": backtest_source_fingerprint(),
         "params": params,
         "timeframe": config.timeframe,
         "start": start,

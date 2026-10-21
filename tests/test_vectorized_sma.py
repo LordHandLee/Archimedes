@@ -42,6 +42,15 @@ def _make_bars(periods: int = 240) -> pd.DataFrame:
     return bars
 
 
+def _position_path(trades) -> list[float]:
+    position = 0.0
+    path: list[float] = []
+    for trade in trades:
+        position += float(trade.qty)
+        path.append(position)
+    return path
+
+
 class VectorizedSMATest(unittest.TestCase):
     def setUp(self) -> None:
         self.bars = _make_bars()
@@ -126,6 +135,43 @@ class VectorizedSMATest(unittest.TestCase):
             pass
         else:
             self.assertAlmostEqual(reference.metrics.sharpe, vectorized.metrics.sharpe, places=10)
+        for ref_trade, vec_trade in zip(reference.trades, vectorized.trades):
+            self.assertEqual(ref_trade.side, vec_trade.side)
+            self.assertAlmostEqual(ref_trade.qty, vec_trade.qty, places=10)
+            self.assertAlmostEqual(ref_trade.price, vec_trade.price, places=10)
+            self.assertAlmostEqual(ref_trade.fee, vec_trade.fee, places=10)
+
+    def test_sma_crossover_shorts_when_shorting_enabled(self) -> None:
+        config = replace(self.config, allow_short=True)
+        orchestrator = ExecutionOrchestrator()
+        reference = orchestrator.execute(
+            ExecutionRequest(
+                data=self.bars,
+                base_data=self.bars,
+                dataset_id="sma_short_parity",
+                strategy_cls=SMACrossStrategy,
+                strategy_params=self.params,
+                config=config,
+                requested_execution_mode=ExecutionMode.REFERENCE,
+            )
+        )
+        vectorized = orchestrator.execute(
+            ExecutionRequest(
+                data=self.bars,
+                base_data=self.bars,
+                dataset_id="sma_short_parity",
+                strategy_cls=SMACrossStrategy,
+                strategy_params=self.params,
+                config=config,
+                requested_execution_mode=ExecutionMode.VECTORIZED,
+            )
+        )
+
+        self.assertTrue(any(position < -1e-9 for position in _position_path(reference.trades)))
+        self.assertTrue(any(position < -1e-9 for position in _position_path(vectorized.trades)))
+        self.assertEqual(len(reference.trades), len(vectorized.trades))
+        self.assertTrue(np.allclose(reference.equity_curve.to_numpy(), vectorized.equity_curve.to_numpy(), atol=1e-8))
+        self.assertAlmostEqual(reference.metrics.total_return, vectorized.metrics.total_return, places=10)
         for ref_trade, vec_trade in zip(reference.trades, vectorized.trades):
             self.assertEqual(ref_trade.side, vec_trade.side)
             self.assertAlmostEqual(ref_trade.qty, vec_trade.qty, places=10)
@@ -242,6 +288,36 @@ class VectorizedSMATest(unittest.TestCase):
         self.assertTrue(np.allclose(auto_result.equity_curve.to_numpy(), explicit_vectorized.equity_curve.to_numpy(), atol=1e-8))
         self.assertAlmostEqual(auto_result.metrics.total_return, explicit_vectorized.metrics.total_return, places=10)
 
+    def test_explicit_vectorized_single_run_normalizes_base_execution(self) -> None:
+        bars_5m = self._resample_5m()
+        orchestrator = ExecutionOrchestrator()
+        with_base_flag = orchestrator.execute(
+            ExecutionRequest(
+                data=bars_5m,
+                base_data=self.bars,
+                dataset_id="sma_explicit_5m",
+                strategy_cls=SMACrossStrategy,
+                strategy_params=self.params,
+                config=replace(self.config, timeframe="5 minutes", base_execution=True),
+                requested_execution_mode=ExecutionMode.VECTORIZED,
+            )
+        )
+        same_timeframe = orchestrator.execute(
+            ExecutionRequest(
+                data=bars_5m,
+                base_data=None,
+                dataset_id="sma_explicit_5m",
+                strategy_cls=SMACrossStrategy,
+                strategy_params=self.params,
+                config=replace(self.config, timeframe="5 minutes", base_execution=False),
+                requested_execution_mode=ExecutionMode.VECTORIZED,
+            )
+        )
+        self.assertEqual(with_base_flag.resolved_execution_mode.value, "vectorized")
+        self.assertEqual(with_base_flag.engine_impl, "vectorized")
+        self.assertTrue(np.allclose(with_base_flag.equity_curve.to_numpy(), same_timeframe.equity_curve.to_numpy(), atol=1e-8))
+        self.assertAlmostEqual(with_base_flag.metrics.total_return, same_timeframe.metrics.total_return, places=10)
+
     def test_grid_search_auto_uses_vectorized_for_supported_resampled_5m(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             catalog = ResultCatalog(Path(tmpdir) / "grid.sqlite")
@@ -264,6 +340,34 @@ class VectorizedSMATest(unittest.TestCase):
                     timeframes=["5 minutes"],
                     horizons=[(None, None)],
                     execution_mode=ExecutionMode.AUTO,
+                ),
+                make_heatmap=False,
+            )
+        self.assertEqual(sorted(frame["resolved_execution_mode"].unique().tolist()), ["vectorized"])
+        self.assertEqual(sorted(frame["engine_impl"].unique().tolist()), ["vectorized"])
+
+    def test_grid_search_explicit_vectorized_normalizes_base_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            catalog = ResultCatalog(Path(tmpdir) / "grid.sqlite")
+
+            def loader(tf: str) -> pd.DataFrame:
+                if tf == "1 minutes":
+                    return self.bars
+                return self._resample_5m()
+
+            search = GridSearch(
+                dataset_id="grid_sma",
+                data_loader=loader,
+                strategy_cls=SMACrossStrategy,
+                base_config=replace(self.config, base_execution=True),
+                catalog=catalog,
+            )
+            frame = search.run(
+                GridSpec(
+                    params={"fast": [4], "slow": [18]},
+                    timeframes=["5 minutes"],
+                    horizons=[(None, None)],
+                    execution_mode=ExecutionMode.VECTORIZED,
                 ),
                 make_heatmap=False,
             )

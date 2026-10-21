@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -26,23 +26,31 @@ from .live_deployment_runner import (
     market_symbol_from_dataset_id,
 )
 from .live_market import (
+    DEFAULT_STALE_QUOTE_SECONDS,
     DEFAULT_LIVE_PROVIDER,
     LIVE_BAR_TIMEFRAME,
+    InteractiveBrokersRealtimeConfig,
+    LiveMarketBar,
     LiveMarketDataStore,
+    chart_timeframe_delta,
     chart_timeframe_label,
     compute_chart_indicators,
-    incremental_series_payload,
-    latest_point_series_payload,
     normalize_chart_timeframe,
     resample_ohlcv,
+    is_us_equity_total_session_open,
 )
 from .magellan import MagellanClient
+from .provider_config import load_provider_settings
 
 
 LIVE_MONITOR_MIN_SEED_BARS = 2
 MAGELLAN_LIVE_UPDATE_TIMEOUT_MS = 100
 SERVICE_PREVIEW_INTERVAL_SECONDS = 5.0
+SERVICE_STALE_WARNING_INTERVAL_SECONDS = 60.0
+SERVICE_HISTORICAL_SYNC_MAX_LOOKBACK = pd.Timedelta(days=5)
+SERVICE_HISTORICAL_SYNC_CLIENT_OFFSET = 8500
 DATASET_ERROR_STATUSES = {"error", "failed", "missing", "corrupt"}
+LIVE_MONITOR_CHART_OPEN_STATUS = "live"
 
 
 @dataclass
@@ -72,7 +80,10 @@ class LiveChartSession:
     last_sent_bar_ts_ns: int
     last_sent_bar_index: int
     last_completed_replacement_bar_ts_ns: int
+    bar_index_by_ts_ns: dict[int, int] = field(default_factory=dict)
+    next_live_bar_index: int = 0
     last_preview_update_monotonic: float = 0.0
+    last_stale_warning_monotonic: float = 0.0
 
 
 def _charts_lookback_start(end_ts: pd.Timestamp, lookback: str) -> pd.Timestamp:
@@ -167,6 +178,280 @@ def _empty_trade_marker_frame() -> pd.DataFrame:
             "label",
         ]
     )
+
+
+def _ensure_utc_timestamp(value: object) -> pd.Timestamp | None:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts).tz_convert("UTC")
+
+
+def _extended_market_segments(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    timezone: str = "America/New_York",
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    start_ts = _ensure_utc_timestamp(start)
+    end_ts = _ensure_utc_timestamp(end)
+    if start_ts is None or end_ts is None or end_ts <= start_ts:
+        return []
+    try:
+        local_start = start_ts.tz_convert(timezone)
+        local_end = end_ts.tz_convert(timezone)
+    except Exception:
+        return [(start_ts, end_ts)]
+    segments: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    day = local_start.normalize()
+    final_day = local_end.normalize()
+    while day <= final_day:
+        if day.dayofweek < 5:
+            segment_start_local = day + pd.Timedelta(hours=4)
+            segment_end_local = day + pd.Timedelta(hours=20)
+            segment_start = max(start_ts, pd.Timestamp(segment_start_local).tz_convert("UTC"))
+            segment_end = min(end_ts, pd.Timestamp(segment_end_local).tz_convert("UTC"))
+            if segment_start < segment_end:
+                segments.append((segment_start.floor("min"), segment_end.floor("min")))
+        day += pd.Timedelta(days=1)
+    return segments
+
+
+def _minute_bars_cover_segment(
+    bars: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    max_gap: pd.Timedelta = pd.Timedelta(minutes=2),
+) -> bool:
+    if bars is None or bars.empty:
+        return False
+    start_ts = _ensure_utc_timestamp(start)
+    end_ts = _ensure_utc_timestamp(end)
+    if start_ts is None or end_ts is None:
+        return False
+    start_ts = start_ts.floor("min")
+    end_ts = end_ts.floor("min")
+    if end_ts <= start_ts:
+        return True
+    normalized = _normalize_bars(bars)
+    if normalized.empty:
+        return False
+    covered = normalized.loc[(normalized.index >= start_ts) & (normalized.index <= end_ts)]
+    if covered.empty:
+        return False
+    stamps = pd.Index(covered.index).drop_duplicates().sort_values()
+    if pd.Timestamp(stamps[0]).tz_convert("UTC") > start_ts + max_gap:
+        return False
+    if pd.Timestamp(stamps[-1]).tz_convert("UTC") < end_ts - max_gap:
+        return False
+    if len(stamps) <= 1:
+        return (end_ts - start_ts) <= max_gap
+    gaps = pd.Series(stamps).diff().dropna()
+    if gaps.empty:
+        return True
+    return bool(gaps.max() <= max_gap)
+
+
+def _minute_bars_cover_window(
+    bars: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    max_gap: pd.Timedelta = pd.Timedelta(minutes=2),
+) -> bool:
+    segments = _extended_market_segments(start, end)
+    if not segments:
+        return True
+    return all(
+        _minute_bars_cover_segment(bars, segment_start, segment_end, max_gap=max_gap)
+        for segment_start, segment_end in segments
+    )
+
+
+def _chart_sync_coverage_gap(timeframe: str) -> pd.Timedelta:
+    delta = chart_timeframe_delta(timeframe)
+    normalized = normalize_chart_timeframe(timeframe)
+    if normalized.endswith("d"):
+        return delta * 2
+    return max(delta * 2, pd.Timedelta(minutes=2))
+
+
+def _live_monitor_chart_block_reason(deployment_row: dict) -> str:
+    status = str(deployment_row.get("status") or "draft").strip().lower() or "draft"
+    if status == LIVE_MONITOR_CHART_OPEN_STATUS:
+        return ""
+    deployment_id = str(deployment_row.get("deployment_id") or "").strip()
+    prefix = f"Deployment {deployment_id[:10]} is" if deployment_id else "Deployment is"
+    if status == "armed":
+        return f"{prefix} armed but not live yet. Wait for the runner to report live before opening Live Monitor charts."
+    if status == "paused":
+        return f"{prefix} paused. Resume or arm it until it is live before opening Live Monitor charts."
+    if status == "stopped":
+        return f"{prefix} stopped. Arm it and wait for live status before opening Live Monitor charts."
+    if status in {"error", "failed"}:
+        return f"{prefix} in error. Fix and arm it until it is live before opening Live Monitor charts."
+    return f"{prefix} {status}. It must be live before opening Live Monitor charts."
+
+
+def _completed_bars_for_timeframe(
+    bars: pd.DataFrame,
+    timeframe: str,
+    *,
+    now: object | None = None,
+) -> pd.DataFrame:
+    normalized = _normalize_bars(bars)
+    if normalized.empty:
+        return normalized
+    now_ts = _ensure_utc_timestamp(now or pd.Timestamp.now(tz="UTC"))
+    if now_ts is None:
+        return normalized.iloc[:-1].copy()
+    delta = chart_timeframe_delta(timeframe)
+    completed_mask = normalized.index + delta <= now_ts
+    return normalized.loc[completed_mask].copy()
+
+
+def _bar_index_map_from_bars(bars: pd.DataFrame) -> dict[int, int]:
+    normalized = _normalize_bars(bars)
+    mapping: dict[int, int] = {}
+    for index, timestamp in enumerate(normalized.index):
+        mapping[int(pd.Timestamp(timestamp).tz_convert("UTC").value)] = int(index)
+    return mapping
+
+
+def _extend_strategy_series_to_live_chart_bars(
+    series_map: dict[str, pd.Series],
+    bars: pd.DataFrame,
+) -> dict[str, pd.Series]:
+    normalized = _normalize_bars(bars)
+    if normalized.empty or not series_map:
+        return series_map
+    chart_index = normalized.index
+    extended: dict[str, pd.Series] = {}
+    for name, series in series_map.items():
+        if series is None or series.empty:
+            extended[name] = series
+            continue
+        values = pd.to_numeric(series, errors="coerce")
+        if not isinstance(values.index, pd.DatetimeIndex):
+            extended[name] = values
+            continue
+        utc_index = pd.to_datetime(values.index, utc=True, errors="coerce")
+        valid_index = ~pd.isna(utc_index)
+        if not bool(valid_index.any()):
+            extended[name] = values
+            continue
+        mask = np.asarray(valid_index, dtype=bool)
+        values = pd.Series(
+            values.to_numpy(dtype=float)[mask],
+            index=pd.DatetimeIndex(utc_index[mask]),
+            name=getattr(series, "name", None),
+        ).sort_index()
+        values = values[~values.index.duplicated(keep="last")]
+        aligned = values.reindex(chart_index)
+        finite_values = values[np.isfinite(values.to_numpy(dtype=float))]
+        if not finite_values.empty:
+            last_completed_ts = pd.Timestamp(values.index[-1]).tz_convert("UTC")
+            aligned.loc[aligned.index > last_completed_ts] = float(finite_values.iloc[-1])
+        extended[name] = aligned
+    return extended
+
+
+def _series_update_payload_for_entries(
+    series_map: dict[str, pd.Series],
+    update_entries: Sequence[tuple[int, int, pd.Timestamp, pd.Series]],
+    *,
+    styles: dict[str, dict] | None = None,
+) -> list[dict]:
+    payload: list[dict] = []
+    if not update_entries:
+        return payload
+    styles = styles or {}
+    entry_ts_ns = [int(pd.Timestamp(timestamp).tz_convert("UTC").value) for _source_index, _bar_index, timestamp, _row in update_entries]
+    for name, series in series_map.items():
+        if series is None or series.empty:
+            continue
+        values = pd.to_numeric(series, errors="coerce")
+        values_by_ts_ns: dict[int, float] = {}
+        use_timestamp_index = isinstance(values.index, pd.DatetimeIndex)
+        if use_timestamp_index:
+            index = pd.DatetimeIndex(pd.to_datetime(values.index, utc=True, errors="coerce"))
+            for raw_ts, raw_value in zip(index, values.to_numpy(), strict=False):
+                if pd.isna(raw_ts):
+                    continue
+                try:
+                    value_float = float(raw_value)
+                except Exception:
+                    continue
+                if np.isfinite(value_float):
+                    values_by_ts_ns[int(pd.Timestamp(raw_ts).tz_convert("UTC").value)] = value_float
+        points: list[dict] = []
+        for entry_idx, (source_index, bar_index, timestamp, _row) in enumerate(update_entries):
+            value_float: float | None = None
+            if use_timestamp_index:
+                value_float = values_by_ts_ns.get(entry_ts_ns[entry_idx])
+            elif 0 <= int(source_index) < len(values):
+                try:
+                    value_float = float(values.iloc[int(source_index)])
+                except Exception:
+                    value_float = None
+            if value_float is None or not np.isfinite(value_float):
+                continue
+            points.append(
+                {
+                    "timestamp_utc_ns": str(int(pd.Timestamp(timestamp).tz_convert("UTC").value)),
+                    "bar_index": int(bar_index),
+                    "value": value_float,
+                }
+            )
+        if not points:
+            continue
+        style = styles.get(name, {})
+        item = {"name": name, "points": points}
+        color = str(style.get("color") or "").strip()
+        if color:
+            item["color"] = color
+        payload.append(item)
+    return payload
+
+
+def _latest_value_series_payload_for_entries(
+    series_map: dict[str, pd.Series],
+    update_entries: Sequence[tuple[int, int, pd.Timestamp, pd.Series]],
+    *,
+    styles: dict[str, dict] | None = None,
+) -> list[dict]:
+    payload: list[dict] = []
+    if not update_entries:
+        return payload
+    styles = styles or {}
+    for name, series in series_map.items():
+        if series is None or series.empty:
+            continue
+        aligned = pd.to_numeric(series, errors="coerce").dropna()
+        if aligned.empty:
+            continue
+        try:
+            value_float = float(aligned.iloc[-1])
+        except Exception:
+            continue
+        if not np.isfinite(value_float):
+            continue
+        points = [
+            {
+                "timestamp_utc_ns": str(int(pd.Timestamp(timestamp).tz_convert("UTC").value)),
+                "bar_index": int(bar_index),
+                "value": value_float,
+            }
+            for _source_index, bar_index, timestamp, _row in update_entries
+        ]
+        style = styles.get(name, {})
+        item = {"name": name, "points": points}
+        color = str(style.get("color") or "").strip()
+        if color:
+            item["color"] = color
+        payload.append(item)
+    return payload
 
 
 class LiveMonitorChartService:
@@ -283,6 +568,41 @@ class LiveMonitorChartService:
         row = rows.get(str(target_id or ""))
         return row.__dict__ if row is not None else {}
 
+    @staticmethod
+    def ensure_session_index_state(session: LiveChartSession) -> None:
+        if not isinstance(session.bar_index_by_ts_ns, dict) or not session.bar_index_by_ts_ns:
+            session.bar_index_by_ts_ns = _bar_index_map_from_bars(session.bars)
+        else:
+            session.bar_index_by_ts_ns = {
+                int(key): int(value)
+                for key, value in session.bar_index_by_ts_ns.items()
+                if str(key).strip() and str(value).strip()
+            }
+        next_index = max(session.bar_index_by_ts_ns.values(), default=-1) + 1
+        try:
+            configured_next = int(session.next_live_bar_index)
+        except Exception:
+            configured_next = 0
+        session.next_live_bar_index = max(next_index, configured_next)
+
+    @staticmethod
+    def session_bar_index_for_timestamp(session: LiveChartSession, timestamp: object) -> int:
+        LiveMonitorChartService.ensure_session_index_state(session)
+        ts = _ensure_utc_timestamp(timestamp)
+        if ts is None:
+            return -1
+        key = int(ts.value)
+        existing = session.bar_index_by_ts_ns.get(key)
+        if existing is not None:
+            return int(existing)
+        next_index = max(
+            int(session.next_live_bar_index or 0),
+            max(session.bar_index_by_ts_ns.values(), default=-1) + 1,
+        )
+        session.bar_index_by_ts_ns[key] = int(next_index)
+        session.next_live_bar_index = int(next_index) + 1
+        return int(next_index)
+
     def strategy_contexts_for_symbol(self, deployment_row: dict, symbol: str) -> list[tuple[str | None, str, dict]]:
         cleaned = market_symbol_from_dataset_id(symbol)
         if not cleaned:
@@ -342,6 +662,19 @@ class LiveMonitorChartService:
         selected = self.deployment_row(deployment_id)
         if not selected:
             raise ValueError(f"Deployment {deployment_id} was not found.")
+        block_reason = _live_monitor_chart_block_reason(selected)
+        if block_reason:
+            self.emit(
+                "deployment_chart_open_rejected",
+                deployment_id=deployment_id,
+                severity="warning",
+                message=block_reason,
+                payload={
+                    "deployment_id": deployment_id,
+                    "status": str(selected.get("status") or "draft"),
+                },
+            )
+            raise ValueError(block_reason)
         timeframe = normalize_chart_timeframe(str(payload.get("timeframe") or selected.get("timeframe") or LIVE_BAR_TIMEFRAME))
         lookback = str(payload.get("lookback") or "3mo")
         indicator_ids = list(payload.get("indicator_ids") or [])
@@ -433,6 +766,193 @@ class LiveMonitorChartService:
         candidates.sort(key=lambda item: (item[0], -item[1].value))
         return candidates[0][2]
 
+    def build_ib_config(self, *, client_offset: int = 0) -> InteractiveBrokersRealtimeConfig:
+        settings = load_provider_settings(DEFAULT_LIVE_PROVIDER, catalog=self.catalog)
+
+        def _int_value(value: object, fallback: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return fallback
+
+        def _float_value(value: object, fallback: float) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return fallback
+
+        return InteractiveBrokersRealtimeConfig(
+            host=str(settings.get("host") or os.getenv("IB_HOST", "127.0.0.1")),
+            port=_int_value(settings.get("port") or os.getenv("IB_PORT", "7497"), 7497),
+            client_id=_int_value(settings.get("client_id") or os.getenv("IB_CLIENT_ID", "9301"), 9301) + int(client_offset),
+            primary_exchange=str(settings.get("primary_exchange") or os.getenv("IB_PRIMARY_EXCHANGE", "")),
+            use_rth=False,
+            timeout_seconds=_float_value(settings.get("timeout_seconds"), 15.0),
+        )
+
+    def local_minute_bars_for_sync(
+        self,
+        deployment_row: dict,
+        symbol: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        cleaned = market_symbol_from_dataset_id(symbol)
+        frames: list[pd.DataFrame] = []
+        dataset_id = self.historical_dataset_id_for_symbol(deployment_row, cleaned)
+        if dataset_id:
+            try:
+                historical = DuckDBStore().load_range(dataset_id, start, end)
+                if historical is not None and not historical.empty:
+                    frames.append(historical)
+            except Exception:
+                pass
+        try:
+            live = self.store.load_recent_bars(cleaned, provider=DEFAULT_LIVE_PROVIDER, limit=500000)
+            if live is not None and not live.empty:
+                frames.append(live.loc[(live.index >= start) & (live.index <= end)])
+        except sqlite3.Error:
+            pass
+        if not frames:
+            return pd.DataFrame()
+        return _normalize_bars(pd.concat(frames).sort_index())
+
+    def live_chart_sync_window(
+        self,
+        deployment_row: dict,
+        symbol: str,
+        lookback: str,
+        *,
+        now: pd.Timestamp | None = None,
+    ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        cleaned = market_symbol_from_dataset_id(symbol)
+        if not cleaned:
+            return None
+        now_ts = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+        now_ts = now_ts.tz_convert("UTC") if now_ts.tzinfo else now_ts.tz_localize("UTC")
+        end = now_ts.floor("min") - pd.Timedelta(minutes=1)
+        if end <= pd.Timestamp("1970-01-01", tz="UTC"):
+            return None
+        dataset_id = self.historical_dataset_id_for_symbol(deployment_row, cleaned)
+        historical_latest: pd.Timestamp | None = None
+        if dataset_id:
+            try:
+                dataset = DuckDBStore().load_range(dataset_id, end - SERVICE_HISTORICAL_SYNC_MAX_LOOKBACK, end)
+                if dataset is not None and not dataset.empty:
+                    historical_latest = pd.Timestamp(dataset.index[-1]).tz_convert("UTC")
+            except Exception:
+                pass
+        if historical_latest is not None:
+            start = max(
+                historical_latest.floor("min") + pd.Timedelta(minutes=1),
+                end - SERVICE_HISTORICAL_SYNC_MAX_LOOKBACK,
+            )
+        else:
+            lookback_start = _charts_lookback_start(end, lookback)
+            start = max(pd.Timestamp(lookback_start).tz_convert("UTC"), end - SERVICE_HISTORICAL_SYNC_MAX_LOOKBACK)
+        start = pd.Timestamp(start).tz_convert("UTC").floor("min")
+        if start >= end - pd.Timedelta(minutes=2):
+            return None
+        local = self.local_minute_bars_for_sync(deployment_row, cleaned, start, end)
+        timeframe = normalize_chart_timeframe(str(deployment_row.get("timeframe") or LIVE_BAR_TIMEFRAME))
+        if _minute_bars_cover_window(local, start, end, max_gap=_chart_sync_coverage_gap(timeframe)):
+            return None
+        return start, end
+
+    def sync_live_store_gap_if_needed(
+        self,
+        deployment_row: dict,
+        symbol: str,
+        lookback: str,
+        *,
+        session_id: str,
+        deployment_id: str,
+    ) -> int:
+        cleaned = market_symbol_from_dataset_id(symbol)
+        window = self.live_chart_sync_window(deployment_row, cleaned, lookback)
+        if window is None:
+            return 0
+        start, end = window
+        self.emit(
+            "chart_sync_started",
+            session_id=session_id,
+            deployment_id=deployment_id,
+            symbol=cleaned,
+            message=f"Syncing {cleaned} Live Monitor gap from IBKR before chart refresh.",
+            payload={"symbol": cleaned, "start": start.isoformat(), "end": end.isoformat()},
+        )
+        config = self.build_ib_config(client_offset=SERVICE_HISTORICAL_SYNC_CLIENT_OFFSET + (abs(hash(cleaned)) % 400))
+        from scripts.fetch_interactive_brokers import fetch_bars
+
+        frames: list[pd.DataFrame] = []
+        for segment_index, (segment_start, segment_end) in enumerate(_extended_market_segments(start, end)):
+            segment_frame = fetch_bars(
+                cleaned,
+                start=segment_start,
+                end=segment_end,
+                history_window="1d",
+                resolution=LIVE_BAR_TIMEFRAME,
+                host=config.host,
+                port=int(config.port),
+                client_id=int(config.client_id) + int(segment_index),
+                sec_type=config.sec_type,
+                exchange=config.exchange,
+                currency=config.currency,
+                primary_exchange=config.primary_exchange or None,
+                what_to_show=config.what_to_show,
+                use_rth=bool(config.use_rth),
+                chunk_duration="1d",
+                pace_seconds=0.5,
+                timeout_seconds=max(30.0, float(config.timeout_seconds)),
+                discover_head_timestamp=False,
+            )
+            segment_frame = _normalize_bars(segment_frame)
+            if not segment_frame.empty:
+                segment_frame = segment_frame.loc[
+                    (segment_frame.index >= segment_start) & (segment_frame.index <= segment_end)
+                ]
+                if not segment_frame.empty:
+                    frames.append(segment_frame)
+            time.sleep(0.25)
+        frame = _normalize_bars(pd.concat(frames).sort_index()) if frames else pd.DataFrame()
+        rows = 0
+        batch: list[LiveMarketBar] = []
+        received_at = pd.Timestamp.now(tz="UTC")
+        for timestamp, row in _normalize_bars(frame).iterrows():
+            batch.append(
+                LiveMarketBar(
+                    symbol=cleaned,
+                    timestamp=pd.Timestamp(timestamp).tz_convert("UTC"),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row.get("volume", 0.0)),
+                    provider=DEFAULT_LIVE_PROVIDER,
+                    timeframe=LIVE_BAR_TIMEFRAME,
+                    received_at=received_at,
+                )
+            )
+            if len(batch) >= 500:
+                rows += self.store.upsert_bars(batch)
+                batch.clear()
+        if batch:
+            rows += self.store.upsert_bars(batch)
+        self.emit(
+            "chart_sync_finished",
+            session_id=session_id,
+            deployment_id=deployment_id,
+            symbol=cleaned,
+            message=f"Synced {rows} {cleaned} IBKR bar(s) into the live store before chart refresh.",
+            payload={
+                "symbol": cleaned,
+                "rows": rows,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            },
+        )
+        return rows
+
     def build_bars(self, deployment_row: dict, symbol: str, timeframe: str, lookback: str) -> tuple[pd.DataFrame, str]:
         cleaned = market_symbol_from_dataset_id(symbol)
         frames: list[pd.DataFrame] = []
@@ -470,15 +990,22 @@ class LiveMonitorChartService:
         bars: pd.DataFrame,
         indicator_ids: Sequence[str],
         strategy_contexts: Sequence[tuple[str | None, str, dict]],
+        *,
+        timeframe: str | None = None,
     ) -> tuple[dict[str, pd.Series], dict[str, pd.Series], dict[str, dict]]:
         overlays, panes, styles = compute_chart_indicators(bars, indicator_ids)
+        strategy_bars = _completed_bars_for_timeframe(bars, timeframe or LIVE_BAR_TIMEFRAME)
+        if strategy_bars.empty:
+            return overlays, panes, styles
         try:
             strategy_overlays, strategy_panes, strategy_styles = ChartSnapshotExporter._build_portfolio_asset_strategy_series(
-                bars,
+                strategy_bars,
                 strategy_contexts,
             )
         except Exception:
             return overlays, panes, styles
+        strategy_overlays = _extend_strategy_series_to_live_chart_bars(strategy_overlays, bars)
+        strategy_panes = _extend_strategy_series_to_live_chart_bars(strategy_panes, bars)
         overlays.update(strategy_overlays)
         panes.update(strategy_panes)
         styles.update(strategy_styles)
@@ -496,6 +1023,23 @@ class LiveMonitorChartService:
         selected = self.deployment_row(deployment_id)
         if not selected:
             raise ValueError(f"Deployment {deployment_id} was not found.")
+        block_reason = _live_monitor_chart_block_reason(selected)
+        if block_reason:
+            self.emit(
+                "chart_open_rejected",
+                session_id=session_id,
+                deployment_id=deployment_id,
+                symbol=symbol,
+                severity="warning",
+                message=block_reason,
+                payload={
+                    "session_id": session_id,
+                    "deployment_id": deployment_id,
+                    "symbol": symbol,
+                    "status": str(selected.get("status") or "draft"),
+                },
+            )
+            raise ValueError(block_reason)
         target = self.target_row(str(selected.get("target_id") or ""))
         snapshot = fetch_target_external_snapshot(target) if target else {}
         equity_curve = _equity_curve_series_from_points(snapshot.get("equity_curve"))
@@ -542,6 +1086,32 @@ class LiveMonitorChartService:
                 },
             )
             opened_cached = True
+        if bool(payload.get("sync_before_open", True)):
+            try:
+                rows = self.sync_live_store_gap_if_needed(
+                    selected,
+                    symbol,
+                    lookback,
+                    session_id=session_id,
+                    deployment_id=deployment_id,
+                )
+                if rows > 0 and self.magellan is not None and opened_cached:
+                    self.magellan.send_live_update(
+                        session_id,
+                        title=f"{symbol} {chart_timeframe_label(timeframe)}",
+                        status_text=f"Synced {rows} IBKR bar(s); refreshing chart.",
+                        timeout_ms=MAGELLAN_LIVE_UPDATE_TIMEOUT_MS,
+                    )
+            except Exception as exc:
+                self.emit(
+                    "chart_sync_error",
+                    session_id=session_id,
+                    deployment_id=deployment_id,
+                    symbol=symbol,
+                    severity="warning",
+                    message=f"{symbol} Live Monitor gap sync failed; opening best available chart: {exc}",
+                    payload={"session_id": session_id, "symbol": symbol, "error": str(exc)},
+                )
         bars, note = self.build_bars(selected, symbol, timeframe, lookback)
         if bars.empty:
             raise ValueError(note)
@@ -551,7 +1121,12 @@ class LiveMonitorChartService:
                 f"Waiting for at least {LIVE_MONITOR_MIN_SEED_BARS} completed {chart_timeframe_label(timeframe)} bars."
             )
         strategy_contexts = self.strategy_contexts_for_symbol(selected, symbol)
-        overlays, panes, styles = self.indicator_series(bars, indicator_ids, strategy_contexts)
+        overlays, panes, styles = self.indicator_series(
+            bars,
+            indicator_ids,
+            strategy_contexts,
+            timeframe=timeframe,
+        )
         artifact = self.exporter.export_market_snapshot(
             symbol=symbol,
             timeframe=timeframe,
@@ -603,6 +1178,8 @@ class LiveMonitorChartService:
             last_sent_bar_ts_ns=int(pd.Timestamp(bars.index[-1]).tz_convert("UTC").value),
             last_sent_bar_index=int(len(bars) - 1),
             last_completed_replacement_bar_ts_ns=int(pd.Timestamp(completed_bars.index[-1]).tz_convert("UTC").value),
+            bar_index_by_ts_ns=_bar_index_map_from_bars(bars),
+            next_live_bar_index=int(len(bars)),
         )
         self.emit(
             "chart_opened",
@@ -665,38 +1242,110 @@ class LiveMonitorChartService:
         bars, _note = self.build_bars(session.selected, session.symbol, session.timeframe, session.lookback)
         if bars.empty or len(bars) < LIVE_MONITOR_MIN_SEED_BARS:
             return
+        self.ensure_session_index_state(session)
         latest_ts = pd.Timestamp(bars.index[-1]).tz_convert("UTC")
         latest_ts_ns = int(latest_ts.value)
         now = time.monotonic()
+        self._emit_stale_warning_if_needed(session, latest_ts, now)
         if latest_ts_ns <= int(session.last_sent_bar_ts_ns) and now - session.last_preview_update_monotonic < SERVICE_PREVIEW_INTERVAL_SECONDS:
             return
-        session.bars = bars.copy()
-        live_index = int(len(bars) - 1)
-        latest_bar = bars.iloc[-1]
-        overlays, panes, styles = self.indicator_series(bars, session.indicator_ids, session.strategy_contexts)
+        update_entries: list[tuple[int, int, pd.Timestamp, pd.Series]] = []
+        last_sent_ts_ns = int(session.last_sent_bar_ts_ns or 0)
+        for source_index, (timestamp, row) in enumerate(bars.iterrows()):
+            timestamp = pd.Timestamp(timestamp).tz_convert("UTC")
+            ts_ns = int(timestamp.value)
+            if ts_ns <= last_sent_ts_ns:
+                continue
+            bar_index = self.session_bar_index_for_timestamp(session, timestamp)
+            if bar_index < 0:
+                continue
+            update_entries.append((int(source_index), int(bar_index), timestamp, row))
+        if not update_entries:
+            if latest_ts_ns != last_sent_ts_ns:
+                session.bars = bars.copy()
+                return
+            latest_bar_index = self.session_bar_index_for_timestamp(session, latest_ts)
+            if latest_bar_index < 0:
+                return
+            update_entries.append((int(len(bars) - 1), int(latest_bar_index), latest_ts, bars.iloc[-1]))
+        overlays, panes, styles = self.indicator_series(
+            bars,
+            session.indicator_ids,
+            session.strategy_contexts,
+            timeframe=session.timeframe,
+        )
+        bar_payload = [
+            {
+                "timestamp_utc_ns": str(int(timestamp.value)),
+                "bar_index": int(bar_index),
+                "open": float(row.get("open") or 0.0),
+                "high": float(row.get("high") or 0.0),
+                "low": float(row.get("low") or 0.0),
+                "close": float(row.get("close") or 0.0),
+                "volume": float(row.get("volume") or 0.0),
+            }
+            for _source_index, bar_index, timestamp, row in update_entries
+        ]
         self.magellan.send_live_update(
             session.session_id,
             title=f"{session.symbol} {chart_timeframe_label(session.timeframe)}",
             status_text=f"{session.symbol} live chart updated.",
-            bars=[
-                {
-                    "timestamp_utc_ns": str(latest_ts_ns),
-                    "bar_index": live_index,
-                    "open": float(latest_bar.get("open") or 0.0),
-                    "high": float(latest_bar.get("high") or 0.0),
-                    "low": float(latest_bar.get("low") or 0.0),
-                    "close": float(latest_bar.get("close") or 0.0),
-                    "volume": float(latest_bar.get("volume") or 0.0),
-                }
-            ],
-            overlay_series=incremental_series_payload(overlays, bar_index=live_index, timestamp=latest_ts, styles=styles),
-            pane_series=incremental_series_payload(panes, bar_index=live_index, timestamp=latest_ts, styles=styles),
-            equity_series=latest_point_series_payload({"equity": session.equity_curve}, bar_index=live_index, timestamp=latest_ts),
+            bars=bar_payload,
+            overlay_series=_series_update_payload_for_entries(overlays, update_entries, styles=styles),
+            pane_series=_series_update_payload_for_entries(panes, update_entries, styles=styles),
+            equity_series=_latest_value_series_payload_for_entries({"equity": session.equity_curve}, update_entries),
             timeout_ms=MAGELLAN_LIVE_UPDATE_TIMEOUT_MS,
         )
-        session.last_sent_bar_ts_ns = latest_ts_ns
-        session.last_sent_bar_index = live_index
+        session.bars = bars.copy()
+        _source_index, last_bar_index, last_timestamp, _row = update_entries[-1]
+        session.last_sent_bar_ts_ns = int(pd.Timestamp(last_timestamp).tz_convert("UTC").value)
+        session.last_sent_bar_index = int(last_bar_index)
         session.last_preview_update_monotonic = now
+
+    def _emit_stale_warning_if_needed(
+        self,
+        session: LiveChartSession,
+        latest_ts: pd.Timestamp,
+        now_monotonic: float,
+    ) -> None:
+        if not is_us_equity_total_session_open():
+            return
+        if now_monotonic - session.last_stale_warning_monotonic < SERVICE_STALE_WARNING_INTERVAL_SECONDS:
+            return
+        now_utc = pd.Timestamp.now(tz="UTC")
+        stale_after = max(
+            chart_timeframe_delta(session.timeframe) + pd.Timedelta(seconds=float(DEFAULT_STALE_QUOTE_SECONDS)),
+            pd.Timedelta(seconds=float(DEFAULT_STALE_QUOTE_SECONDS) * 2.0),
+        )
+        stale_for = now_utc - pd.Timestamp(latest_ts).tz_convert("UTC")
+        if stale_for < stale_after:
+            return
+        session.last_stale_warning_monotonic = now_monotonic
+        seconds = max(0, int(stale_for.total_seconds()))
+        message = f"{session.symbol} live chart data is stale; latest bar is {seconds}s old."
+        self.emit(
+            "chart_data_stale",
+            session_id=session.session_id,
+            deployment_id=session.deployment_id,
+            symbol=session.symbol,
+            severity="warning",
+            message=message,
+            payload={
+                "session_id": session.session_id,
+                "symbol": session.symbol,
+                "timeframe": session.timeframe,
+                "latest_bar_utc": pd.Timestamp(latest_ts).tz_convert("UTC").isoformat(),
+                "stale_for_seconds": seconds,
+                "stale_after_seconds": int(stale_after.total_seconds()),
+            },
+        )
+        if self.magellan is not None:
+            self.magellan.send_live_update(
+                session.session_id,
+                title=f"{session.symbol} {chart_timeframe_label(session.timeframe)}",
+                status_text=message,
+                timeout_ms=MAGELLAN_LIVE_UPDATE_TIMEOUT_MS,
+            )
 
     def consume_runner_events(self) -> None:
         events = self.catalog.load_deployment_runner_events(after_seq=int(self.last_runner_event_seq or 0), limit=500)
@@ -721,6 +1370,17 @@ class LiveMonitorChartService:
                     continue
                 marker = self.signal_trade_marker(payload, session.bars)
                 if marker:
+                    try:
+                        marker_ts_ns = int(marker.get("timestamp_utc_ns") or 0)
+                    except Exception:
+                        marker_ts_ns = 0
+                    if marker_ts_ns > 0:
+                        stable_bar_index = self.session_bar_index_for_timestamp(
+                            session,
+                            pd.to_datetime(marker_ts_ns, unit="ns", utc=True, errors="coerce"),
+                        )
+                        if stable_bar_index >= 0:
+                            marker["bar_index"] = int(stable_bar_index)
                     self.send_trade_marker(session, marker)
 
     @staticmethod
@@ -737,8 +1397,19 @@ class LiveMonitorChartService:
         except Exception:
             return None
         action = str(payload.get("action") or "").strip().upper()
-        side = str(payload.get("side") or "").strip().upper()
-        marker_side = "buy" if side == "LONG" and action == "ENTRY" else "sell"
+        position_side = str(payload.get("side") or "").strip().upper()
+        if action == "ENTRY":
+            marker_side = "buy"
+            event_type = "entry"
+            marker_color = "#22c55e"
+        elif action == "EXIT":
+            marker_side = "sell"
+            event_type = "exit"
+            marker_color = "#ef4444"
+        else:
+            marker_side = "sell" if position_side == "SHORT" else "buy"
+            event_type = action.lower() or "signal"
+            marker_color = "#22c55e" if marker_side == "buy" else "#ef4444"
         override = dict(payload.get("position_size_override") or {})
         qty = override.get("target_qty")
         if qty in (None, ""):
@@ -746,15 +1417,24 @@ class LiveMonitorChartService:
                 qty = float(override.get("target_notional") or 0.0) / float(payload.get("price") or 0.0)
             except Exception:
                 qty = 0.0
+        try:
+            qty_abs = abs(float(qty or 0.0))
+        except Exception:
+            qty_abs = 0.0
+        signed_qty = qty_abs if marker_side == "buy" else -qty_abs
         return {
             "timestamp_utc_ns": str(int(timestamp.value)),
             "bar_index": bar_index,
             "side": marker_side,
-            "qty": float(qty or 0.0),
+            "qty": signed_qty,
+            "quantity": signed_qty,
             "price": float(payload.get("price") or 0.0),
-            "event": action.lower() or "signal",
-            "event_type": action.lower() or "signal",
-            "label": f"{action} {side}".strip(),
+            "event": event_type,
+            "event_type": event_type,
+            "action": action,
+            "position_side": position_side,
+            "color": marker_color,
+            "label": f"{action} {position_side}".strip(),
         }
 
     def send_trade_marker(self, session: LiveChartSession, marker: dict) -> None:
@@ -817,14 +1497,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
-    catalog_path = Path(args.catalog)
+    catalog_path = Path(args.catalog).expanduser().resolve()
+    live_store_path = Path(args.live_store).expanduser().resolve()
     lock_file = acquire_service_lock(catalog_path)
     if lock_file is None and not args.once:
         return 0
     service = LiveMonitorChartService(
         LiveChartServiceConfig(
             catalog_path=catalog_path,
-            live_store_path=Path(args.live_store),
+            live_store_path=live_store_path,
             poll_interval_seconds=float(args.poll_interval),
             run_once=bool(args.once),
             magellan_enabled=not bool(args.no_magellan),

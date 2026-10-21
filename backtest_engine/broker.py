@@ -364,8 +364,7 @@ class Broker:
             return qty
         equity = max(self._mark_to_market(adj_price), 0.0)
         max_gross = equity * effective_max_gross_leverage(self)
-        current_long_notional = max(self.position_qty, 0.0) * adj_price
-        allowed_short_qty = max(max_gross - current_long_notional, 0.0) / adj_price
+        allowed_short_qty = max(max_gross, 0.0) / adj_price
         if requested_short_qty <= allowed_short_qty:
             return qty
         target_new_qty = -allowed_short_qty

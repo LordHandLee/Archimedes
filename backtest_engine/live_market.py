@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -38,6 +39,9 @@ DEFAULT_WATCHLIST_SYMBOLS = ("SPY", "QQQ", "AAPL", "MSFT", "NVDA")
 DEFAULT_LIVE_PROVIDER = "interactive_brokers"
 LIVE_BAR_TIMEFRAME = "1m"
 DEFAULT_STALE_QUOTE_SECONDS = 90
+US_EQUITY_TOTAL_SESSION_TIMEZONE = "America/New_York"
+US_EQUITY_TOTAL_SESSION_OPEN = dt.time(4, 0)
+US_EQUITY_TOTAL_SESSION_CLOSE = dt.time(20, 0)
 CHART_TIMEFRAME_OPTIONS: tuple[tuple[str, str], ...] = (
     ("1 Minute", "1m"),
     ("5 Minutes", "5m"),
@@ -166,6 +170,29 @@ def normalize_chart_timeframe(value: str | None) -> str:
     }
     compact = text.replace(" ", "")
     return aliases.get(text, aliases.get(compact, compact))
+
+
+def is_us_equity_total_session_open(
+    now: object | None = None,
+    *,
+    timezone: str = US_EQUITY_TOTAL_SESSION_TIMEZONE,
+) -> bool:
+    """Return True during the broad US equity premarket/RTH/after-hours session."""
+    if now is None:
+        ts = pd.Timestamp.now(tz=timezone)
+    else:
+        ts = pd.to_datetime(now, utc=False, errors="coerce")
+        if pd.isna(ts):
+            return False
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(timezone)
+        else:
+            ts = ts.tz_convert(timezone)
+    if int(ts.weekday()) >= 5:
+        return False
+    session_time = ts.time()
+    return US_EQUITY_TOTAL_SESSION_OPEN <= session_time < US_EQUITY_TOTAL_SESSION_CLOSE
 
 
 def chart_timeframe_label(value: str | None) -> str:
@@ -871,6 +898,7 @@ class InteractiveBrokersRealtimeBarApp(EWrapper, EClient):
         self.status_callback = status_callback
         self.error_callback = error_callback
         self._connected = threading.Event()
+        self._connection_closed = threading.Event()
         self._req_id_base = int(config.client_id) * 1000 + 7000
         self._req_symbols: dict[int, str] = {}
         self._partials: dict[int, dict[str, object]] = {}
@@ -920,9 +948,25 @@ class InteractiveBrokersRealtimeBarApp(EWrapper, EClient):
     def nextValidId(self, orderId: int) -> None:  # noqa: N802
         self._connected.set()
 
+    def connectionClosed(self) -> None:  # noqa: N802
+        self._connection_closed.set()
+        if self.status_callback:
+            self.status_callback("Interactive Brokers API socket connection closed.")
+
+    def connection_lost(self) -> bool:
+        try:
+            connected = bool(self.isConnected())
+        except Exception:
+            connected = False
+        return self._connection_closed.is_set() or not connected
+
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):  # noqa: N802
         code = int(errorCode)
         text = str(errorString or "")
+        if code == 1100:
+            self._connection_closed.set()
+        elif code in {1101, 1102}:
+            self._connection_closed.clear()
         if code in {2103, 2104, 2105, 2106, 2107, 2108, 2158}:
             if self.status_callback:
                 self.status_callback(text)
@@ -977,6 +1021,8 @@ class InteractiveBrokersRealtimeBarApp(EWrapper, EClient):
     def connect_and_start(self) -> None:
         if not self.symbols:
             raise ValueError("At least one symbol is required for Interactive Brokers live data.")
+        self._connected.clear()
+        self._connection_closed.clear()
         self.connect(self.config.host, int(self.config.port), int(self.config.client_id))
         self._thread = threading.Thread(target=self.run, daemon=True)
         self._thread.start()
